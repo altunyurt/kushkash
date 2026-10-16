@@ -51,6 +51,7 @@ if _HAS_FA:
 _WORK: dict = {}
 _SYNC = os.environ.get("KUSHKASH_SYNC", "0") == "1"   # debug: serialize host/device around every step
 _CHECK = os.environ.get("KUSHKASH_CHECK", "")        # debug: log file; checks layer 0 against torch
+_SL_STRICT = 64                                       # prefill steps per engine with a synchronous seq_lens check
 _check_calls = [0]
 
 
@@ -81,6 +82,8 @@ class _PinnedRing:
         if self.used[i] and self.gpu:
             self.events[i].synchronize()              # previous copy from this buffer has run
         buf = self.bufs[i]
+        if n > buf.numel():                           # grow (this slot's last copy has completed)
+            buf = self.bufs[i] = torch.empty(max(n, 2 * buf.numel()), dtype=torch.int32, pin_memory=self.gpu)
         buf[:n].numpy()[:] = arr
         res = out[:n].copy_(buf[:n], non_blocking=True) if out is not None else buf[:n].to(self.device, non_blocking=True)
         if self.gpu:
@@ -93,7 +96,7 @@ class _PinnedRing:
 
 class KushAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list] = ["auto", "float16", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list] = ["auto"]           # the backend owns the format (KUSHKASH_BITS)
     forward_includes_kv_cache_update: bool = True
 
     @staticmethod
@@ -164,19 +167,46 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        if getattr(vllm_config, "speculative_config", None) is not None:
+            raise NotImplementedError("kushkash backend does not support speculative decoding")
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
         sched = vllm_config.scheduler_config
         max_reqs = sched.max_num_seqs
-        max_jobs = max_reqs + sched.max_num_batched_tokens // PAGE + 1
+        # jobs = sum over prefill rows of pages touched <= tokens // PAGE + 2 per row (a chunk can start and end
+        # mid-page); the ring also grows if a step ever needs more
+        max_jobs = 2 * max_reqs + sched.max_num_batched_tokens // PAGE + 1
         self._tail_idx = torch.zeros(max_reqs, dtype=torch.int32, device=device)   # persistent (CUDA graphs)
         self._ring = _PinnedRing(32, max(max_reqs, max_jobs), device)
+        self._sl_bad = torch.zeros((), dtype=torch.bool, device=device)   # host bound != device seq_lens seen
+        self._sl_checks = 0                                                 # prefill steps checked
+        self._builds = 0                                                    # all steps (flag read cadence)
+
+    def _check_seq_lens(self, host: np.ndarray, dev: torch.Tensor) -> None:
+        """The prefill path takes history lengths from vLLM's host copy of seq_lens (documented by vLLM 0.31 as
+        exact for prefill rows); the kernels use the device copy. Whether they agree is a property of the vLLM
+        version, not of the data, so the first _SL_STRICT prefill steps of every engine compare them
+        synchronously and abort before attention runs on a mismatch. Later prefill steps compare on the device
+        (no sync) into a sticky flag that build() reads every 256 steps of any kind, which bounds, but does not
+        close, the window if a mismatch first appears later. KUSHKASH_CHECK keeps every step synchronous."""
+        host_t = self._ring.to_device(host.astype(np.int32))
+        self._sl_checks += 1
+        if _CHECK or self._sl_checks <= _SL_STRICT:
+            if not torch.equal(host_t, dev):
+                raise RuntimeError(f"kushkash: vLLM's host seq_lens {host.tolist()} differ from the device seq_lens "
+                                   f"{dev.tolist()} for prefill rows; this vLLM version is not supported")
+            return
+        self._sl_bad.logical_or_((host_t != dev).any())
 
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> KushMetadata:
         cam = common_attn_metadata
         if cam.req_idx is None:
             raise RuntimeError("kushkash needs vLLM's model runner V2 (unset VLLM_USE_V2_MODEL_RUNNER=0)")
+        self._builds += 1
+        if self._builds % 256 == 0 and self._sl_checks > _SL_STRICT and bool(self._sl_bad):
+            raise RuntimeError("kushkash: vLLM's host seq_lens differed from the device seq_lens for prefill rows "
+                               "in an earlier step; this vLLM version is not supported")
         nd, n_pre, _, _ = split_decodes_and_prefills(cam, decode_threshold=1)
         n = cam.num_reqs
         tail_idx = self._ring.to_device(np.asarray(cam.req_idx[:n], dtype=np.int32), self._tail_idx)
@@ -185,8 +215,11 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
                           num_actual_tokens=cam.num_actual_tokens, num_decodes=nd, num_reqs=n)
         if n_pre:
             qsl = cam.query_start_loc_cpu[:n + 1].numpy()
+            # exact for prefill rows (vLLM 0.31 contract; optimistic only for async spec-decode rows,
+            # which this backend rejects); decode rows below use device seq_lens only
             sl = (cam.seq_lens_cpu_upper_bound[:n] if cam.seq_lens_cpu_upper_bound is not None
                   else cam.seq_lens[:n].cpu()).numpy()
+            self._check_seq_lens(sl[nd:n], cam.seq_lens[nd:n])
             jobs = [(i, p) for i in range(nd, n) for p in pages_touched(int(sl[i] - (qsl[i + 1] - qsl[i])), int(sl[i]))]
             js = np.fromiter((j[0] for j in jobs), dtype=np.int32, count=len(jobs))
             jp = np.fromiter((j[1] for j in jobs), dtype=np.int32, count=len(jobs))
@@ -226,7 +259,9 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
             ("ALiBi", alibi_slopes is not None), ("sliding window", sliding_window is not None),
             ("logits soft-cap", bool(logits_soft_cap)), ("attention sinks", kwargs.get("sinks") is not None),
             ("cross-layer KV sharing", kv_sharing_target_layer_name is not None),
-            (f"attention type {attn_type}", attn_type != AttentionType.DECODER)] if bad]
+            (f"attention type {attn_type}", attn_type != AttentionType.DECODER),
+            (f"kv_cache_dtype={kv_cache_dtype} (use auto; choose 4/8 bits with KUSHKASH_BITS)",
+             kv_cache_dtype != "auto")] if bad]
         if unsupported:
             raise NotImplementedError("kushkash backend does not support " + ", ".join(unsupported))
         self.num_heads, self.head_size, self.scale = num_heads, head_size, float(scale)

@@ -180,3 +180,35 @@ def test_generate_matches_hf_generate(kind):
     # chunked prefill: later chunks see quantized history -> shape / sanity only
     got = kk.generate(model, ids, 10, bits=4, prefill_chunk=40, eos_token_id=int(ref[0, 92]))
     assert got.shape[0] == 2 and got.shape[1] <= 100
+
+
+def test_forward_without_cache_raises():
+    """The attention function never reuses a cache from an earlier forward."""
+    model = kk.enable(_tiny("llama"))
+    ids = torch.randint(0, 256, (1, 10))
+    with torch.no_grad():
+        model(ids, past_key_values=kk.KushHFCache(model.config), use_cache=True)
+        with pytest.raises(RuntimeError, match="KushHFCache"):
+            model(ids, use_cache=False)
+
+
+def test_cuda_init_failure_reports_the_error(monkeypatch):
+    """A failing cuInit surfaces as the CUDA error, not as recursion through the error-string lookup."""
+    import ctypes
+    from kushkash import _cuda
+
+    class FakeLib:
+        def cuInit(self, flags):
+            return 100                                               # CUDA_ERROR_NO_DEVICE
+
+        def cuGetErrorString(self, rc, out):
+            ctypes.cast(out, ctypes.POINTER(ctypes.c_char_p))[0] = b"no CUDA-capable device is detected"
+            return 0
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda name: FakeLib())
+    _cuda._lib.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="cuInit: CUDA error 100 .no CUDA-capable device"):
+            _cuda._lib()
+    finally:
+        _cuda._lib.cache_clear()

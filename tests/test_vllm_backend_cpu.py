@@ -114,3 +114,85 @@ def test_backend_mixed_steps(bits, fa, monkeypatch):
             lens[r] = int(sl[i])
             n = lens[r]
             assert torch.equal(impl.tail_k[slot_of[r], :, :n % PAGE], exact[r][0][:, n // PAGE * PAGE:])
+
+
+def test_rejects_unsupported_configs(monkeypatch):
+    cfg = make_cfg(max_seqs=4, max_len=256)
+    monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
+    with pytest.raises(NotImplementedError, match="kv_cache_dtype"):
+        kb.KushAttentionImpl(4, 64, 0.125, num_kv_heads=2, kv_cache_dtype="fp8")
+    spec = make_cfg(max_seqs=4, max_len=256)
+    spec.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    with pytest.raises(NotImplementedError, match="speculative"):
+        kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], spec, torch.device("cpu"))
+    assert kb.KushAttentionBackend.supported_kv_cache_dtypes == ["auto"]
+
+
+def _cam(qlens, ctxs, W=8, upper=None):
+    """CommonAttentionMetadata for prefill rows with the given chunk lengths and cached history."""
+    qsl = np.concatenate([[0], np.cumsum(qlens)]).astype(np.int32)
+    sl = np.array([c + q for c, q in zip(ctxs, qlens)], dtype=np.int32)
+    n, N = len(qlens), int(qsl[-1])
+    bt = torch.arange(n * W, dtype=torch.int32).view(n, W)
+    return CommonAttentionMetadata(
+        query_start_loc=torch.from_numpy(qsl), query_start_loc_cpu=torch.from_numpy(qsl),
+        seq_lens=torch.from_numpy(sl), num_reqs=n, num_actual_tokens=N, max_query_len=max(qlens),
+        max_seq_len=int(sl.max()), block_table_tensor=bt, slot_mapping=torch.zeros(N, dtype=torch.int64),
+        seq_lens_cpu_upper_bound=torch.from_numpy(sl if upper is None else upper), req_idx=np.arange(n))
+
+
+def test_job_list_worst_case(monkeypatch):
+    """Every prefill row straddling a page boundary: 2 jobs per row, more than tokens // 32 + rows."""
+    cfg = make_cfg(max_seqs=8, max_len=256)
+    cfg.scheduler_config.max_num_batched_tokens = 16
+    b = kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], cfg, torch.device("cpu"))
+    md = b.build(0, _cam([2] * 8, [31] * 8))
+    assert md.job_seq.numel() == 16
+    assert md.job_seq.tolist() == [i for i in range(8) for _ in range(2)]
+    assert md.job_page.tolist() == [0, 1] * 8
+
+
+def test_pinned_ring_grows():
+    ring = kb._PinnedRing(2, 4, torch.device("cpu"))
+    for n in (3, 10, 40, 5):
+        assert ring.to_device(np.arange(n, dtype=np.int32)).tolist() == list(range(n))
+
+
+BAD = np.array([16, 7], dtype=np.int32)                                # host bound != device seq_lens (15, 7)
+
+
+def test_host_seq_len_mismatch_strict_phase():
+    """Default settings: a mismatch in the first prefill steps aborts the build, before attention runs."""
+    b = kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], make_cfg(max_seqs=4, max_len=256), torch.device("cpu"))
+    b.build(0, _cam([5, 7], [10, 0]))                                 # consistent: fine
+    with pytest.raises(RuntimeError, match="seq_lens"):
+        b.build(0, _cam([5, 7], [10, 0], upper=BAD))
+
+
+def test_host_seq_len_mismatch_sampled_phase(monkeypatch):
+    """After the strict phase: detected at the next 256-step read even if only decode steps follow."""
+    monkeypatch.setattr(kb, "_SL_STRICT", 2)
+    b = kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], make_cfg(max_seqs=4, max_len=256), torch.device("cpu"))
+    for _ in range(2):
+        b.build(0, _cam([5, 7], [10, 0]))
+    b.build(0, _cam([5, 7], [10, 0], upper=BAD))                      # step 3: recorded on the device flag
+    with pytest.raises(RuntimeError, match="earlier step"):
+        for _ in range(256):
+            b.build(0, _cam([1, 1], [40, 9]))                         # decode-only steps
+
+
+@pytest.mark.parametrize("dtype,ok", [("auto", True), ("fp8", False)])
+def test_built_by_vllm_attention_layer(dtype, ok, monkeypatch):
+    """vLLM's own Attention layer constructs the impl (kv_cache_dtype as vLLM passes it)."""
+    pytest.importorskip("einops")
+    from vllm.config import CacheConfig, DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.attention.attention import Attention
+    monkeypatch.setattr(kb, "get_current_vllm_config", lambda: make_cfg(max_seqs=4, max_len=256))
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
+        build = lambda: Attention(4, 64, 0.125, num_kv_heads=2, cache_config=CacheConfig(cache_dtype=dtype),
+                                  prefix="model.layers.0.self_attn.attn", attn_backend=kb.KushAttentionBackend)
+        if ok:
+            assert build().impl.kv_cache_dtype == "auto"
+        else:
+            with pytest.raises(NotImplementedError, match="kv_cache_dtype"):
+                build()

@@ -47,11 +47,13 @@ def run_one(a):
         extra = {"kv_cache_dtype": "auto", "attention_backend": "CUSTOM"}
     llm = LLM(model=a.model, max_model_len=a.max_len, gpu_memory_utilization=a.mem,
               enable_prefix_caching=False, enable_chunked_prefill=True, max_num_batched_tokens=a.batched_tokens,
+              **({"max_num_seqs": a.max_num_seqs} if a.max_num_seqs else {}),
               quantization=a.quantization, seed=0, disable_log_stats=False, **extra)   # stats: preemptions etc.
     cc = llm.llm_engine.vllm_config.cache_config
     log(f"engine ready: KV capacity {cc.kv_cache_size_tokens} tokens")
     res = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "kv_tokens": cc.kv_cache_size_tokens,
-           "attn_block": cc.effective_attention_block_size}
+           "attn_block": cc.effective_attention_block_size,
+           "max_num_seqs": llm.llm_engine.vllm_config.scheduler_config.max_num_seqs}
 
     rng = random.Random(0)
     if not a.only_throughput:
@@ -108,14 +110,13 @@ def run_one(a):
     d = {k: m1.get(k, 0) - m0.get(k, 0) for k in m1}
     steps = d.get("vllm:iteration_tokens_total:count", 0)
     res["preemptions"] = int(d.get("vllm:num_preemptions", 0))
-    res["recomputed_prompt_tokens"] = int(d.get("vllm:prompt_tokens", 0) - a.tp_n * a.tp_len)
     res["steps"] = int(steps)
     res["ms_per_step"] = round(1000 * dt / steps, 1) if steps else None
     busy = [r for r in running if r > 0]
     res["mean_running"] = round(sum(busy) / len(busy), 1) if busy else None
     res["max_running"] = max(running, default=None)
     log(f"   steps {res['steps']}, {res['ms_per_step']} ms/step, running mean {res['mean_running']} / max "
-        f"{res['max_running']}, preemptions {res['preemptions']}, recomputed prompt tokens {res['recomputed_prompt_tokens']}")
+        f"{res['max_running']}, preemptions {res['preemptions']}")
     res["throughput_total_tok_s"] = round(a.tp_n * (a.tp_len + a.tp_out) / dt, 1)
     res["throughput_out_tok_s"] = round(a.tp_n * a.tp_out / dt, 1)
     log(f"   {res['throughput_out_tok_s']} output tok/s, {res['throughput_total_tok_s']} total tok/s")
@@ -130,6 +131,8 @@ def main():
     ap.add_argument("--max-len", type=int, default=17408)
     ap.add_argument("--mem", type=float, default=0.90)
     ap.add_argument("--batched-tokens", type=int, default=256, help="prefill chunk (small = cache-heavy ppl)")
+    ap.add_argument("--max-num-seqs", type=int, default=None,
+                    help="vLLM max_num_seqs for all configs; per config: --kv auto@17,kush4@56")
     ap.add_argument("--quantization", default=None, help="weights, e.g. bitsandbytes / awq for small GPUs")
     ap.add_argument("--passkey-trials", type=int, default=10)
     ap.add_argument("--tp-n", type=int, default=64)
@@ -145,8 +148,11 @@ def main():
     if a.one:
         return run_one(a)
     rows, kvs = [], a.kv.split(",")
-    for i, kv in enumerate(kvs, 1):
-        log(f"=== config {i}/{len(kvs)}: kv_cache_dtype={kv} ===")
+    base_seqs = a.max_num_seqs
+    for i, spec in enumerate(kvs, 1):
+        kv, _, seqs = spec.partition("@")
+        a.max_num_seqs = int(seqs) if seqs else base_seqs
+        log(f"=== config {i}/{len(kvs)}: kv_cache_dtype={kv}" + (f", max_num_seqs={a.max_num_seqs}" if a.max_num_seqs else "") + " ===")
         free = wait_gpu_free()
         log(f"GPU free memory at start: {free:.2f} GiB")
         cmd = [sys.executable, "-u", __file__, "--one", "--kv", kv] + [
@@ -171,7 +177,7 @@ def main():
             log(f"{kv}: FAILED (exit {p.returncode}); last output:\n" + "".join(tail))
     if rows:
         keys = ["kv", "kv_tokens", "ppl_chunked", "passkey_8k", "passkey_16k", "throughput_total_tok_s",
-                "throughput_out_tok_s", "mean_running", "ms_per_step", "preemptions", "recomputed_prompt_tokens"]
+                "throughput_out_tok_s", "mean_running", "ms_per_step", "preemptions", "max_num_seqs"]
         print("\n| " + " | ".join(keys) + " |\n|" + "---|" * len(keys))
         for r in rows:
             print("| " + " | ".join(str(r.get(k, "")) for k in keys) + " |")

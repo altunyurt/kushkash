@@ -2,7 +2,7 @@
 from .cache import KushCache, MemoryStats, PAGE
 
 __all__ = ["KushCache", "MemoryStats", "PAGE", "KushHFCache", "enable", "generate", "build"]
-__version__ = "0.3.5"
+__version__ = "0.3.6"
 
 
 def __getattr__(name):                      # transformers is optional: import on demand
@@ -24,4 +24,6 @@ def build(device: str = "cpu", head_dim: int = 128, bits: int = 4, group: int = 
         import torch
         from ._build import GpuConfig, gpu_modules
         from ._cuda import arch
-        gpu_modules(GpuConfig(head_dim, bits, group, dtype, arch(torch.device(device).index or 0)))
+        dev = torch.device(device)
+        gpu_modules(GpuConfig(head_dim, bits, group, dtype,
+                              arch(dev.index if dev.index is not None else torch.cuda.current_device())))

@@ -65,7 +65,7 @@ def _cache(cache: Int64, bs: Int64, hs: Int64, tail_k: Int64, tail_idx: Int64,
 def _quantize_k_page[D: Int, BITS: Int](ka: F32P, sa: Int, kb_src: F32P, skb: Int, split: Int, rec: I8P):
     """K of one page (per-channel ranges), W channels per SIMD op. Token row t < split comes
     from ka + t*sa (the tail), the rest from kb_src + (t - split)*skb.
-    Same arithmetic as the GPU _quantize_k_page (kush/quant.mojo)."""
+    Same arithmetic (kush/quant.mojo) as the GPU _quantize_k_page (kush/gpu.mojo)."""
     comptime DC = row_bytes[D, BITS]()
     comptime NCH = D if BITS == 8 else D // 2
     var kc = rec

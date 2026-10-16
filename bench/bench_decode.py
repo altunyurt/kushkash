@@ -1,5 +1,5 @@
-"""Decode-attention microbenchmark through the Python API (same shapes as the earlier Mojo
-harness): kushkash int4 / int8 vs FlashInfer paged fp16 / fp8 (if installed).
+"""Decode-attention microbenchmark through the Python API: kushkash int4 / int8 vs FlashInfer
+paged fp16 / fp8 (if installed). D=128, 8 kv heads, 4 q heads per kv head.
     python bench/bench_decode.py            # pip install flashinfer-python for baselines
 'eager' = one Python call per step (includes launch overhead); 'graph' = the same call
 replayed from a CUDA graph (kernel time only)."""

@@ -14,9 +14,11 @@ How it plugs in
       - a multi-token chunk on top of history (chunked prefill / multi-turn): fused SDPA over
         the history, one dequantized page-block at a time, plus the exact chunk (causal),
         merged by log-sum-exp; then quantize the chunk. Extra memory is bounded (~512 MB)
-        regardless of context length.
+        regardless of context length, as long as torch provides fused SDPA with LSE (else a warning).
 """
 from __future__ import annotations
+
+import threading
 
 import torch
 import torch.nn.functional as F
@@ -26,7 +28,7 @@ from transformers.cache_utils import Cache, CacheLayerMixin
 from .cache import KushCache
 
 NAME = "kushkash"
-_active: list = [None]          # the KushHFCache whose update() ran last (HF: update -> attention)
+_active = threading.local()     # per thread: the KushHFCache whose update() just ran (HF calls update, then attention)
 
 
 class _KushLayer(CacheLayerMixin):
@@ -100,7 +102,7 @@ class KushHFCache(Cache):
             self.kv = KushCache(self.num_layers, H, self.num_q_heads, D, batch_size=B, bits=self.bits,
                                 device=key_states.device, dtype=key_states.dtype, max_length=self.max_length)
         self.layers[layer_idx].is_initialized = True
-        _active[0] = self
+        _active.cache = self
         return key_states, value_states
 
     def memory(self):
@@ -120,7 +122,8 @@ def _sdpa(q, k, v, scale):
 
 def kush_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
     """transformers attention function. query [B, Hq, T, D]; key/value: the new chunk [B, Hkv, T, D]."""
-    cache: KushHFCache | None = _active[0]
+    cache: KushHFCache | None = getattr(_active, "cache", None)
+    _active.cache = None                      # consumed: one update() per attention call, no stale reuse
     if cache is None or cache.kv is None:
         raise RuntimeError("kushkash attention needs past_key_values=KushHFCache(...) (and use_cache=True)")
     kv, layer = cache.kv, module.layer_idx
@@ -140,7 +143,9 @@ def kush_attention(module, query, key, value, attention_mask, scaling=None, drop
 
 
 def kush_mask(batch_size, q_length, kv_length, *args, attention_mask=None, **kwargs):
-    """No mask is materialized (the kernels are causal by construction). Rejects padding."""
+    """No mask is materialized (the kernels are causal by construction). Rejects padded prompts: checked
+    on multi-token calls, so a padded batch fails at prefill. Single-token decode calls are not re-checked
+    (that would cost a GPU sync per token and break CUDA graphs)."""
     if attention_mask is not None and q_length > 1 and attention_mask.dim() == 2 and not bool(attention_mask.all()):
         raise NotImplementedError("kushkash: padded batches are not supported; batch equal-length prompts")
     return None

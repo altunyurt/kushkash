@@ -30,6 +30,9 @@ class MemoryStats:
 
     @property
     def ratio(self) -> float:
+        """fp16 bytes / bytes used, incl. the exact K tails (a full 32-token page per sequence and layer,
+        allocated up front). int4, D=128: 512 n / (4736 ceil(n/32) + 8192) per head and layer, i.e. < 1 below
+        ~25 tokens, ~2x at 64-96, ~3.2x at 1k, approaching the page ratio (3.46x; int8 1.86x)."""
         used = self.quantized_bytes + self.tail_bytes
         return self.fp16_bytes / used if used else float("nan")
 

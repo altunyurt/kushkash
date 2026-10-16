@@ -28,7 +28,7 @@ def _lib() -> ctypes.CDLL:
             continue
     else:
         raise RuntimeError("libcuda not found (NVIDIA driver required for the GPU path)")
-    _check(lib.cuInit(0), "cuInit")
+    _check(lib.cuInit(0), "cuInit", lib)
     u = ctypes.c_uint
     lib.cuLaunchKernel.argtypes = [ctypes.c_void_p, u, u, u, u, u, u, u, ctypes.c_void_p, ctypes.c_void_p,
                                    ctypes.c_void_p]
@@ -36,10 +36,10 @@ def _lib() -> ctypes.CDLL:
     return lib
 
 
-def _check(rc: int, what: str) -> None:
+def _check(rc: int, what: str, lib: ctypes.CDLL | None = None) -> None:
     if rc != 0:
         msg = ctypes.c_char_p()
-        _lib().cuGetErrorString(rc, ctypes.byref(msg))
+        (lib or _lib()).cuGetErrorString(rc, ctypes.byref(msg))   # lib: called from _lib() itself
         raise RuntimeError(f"{what}: CUDA error {rc} ({msg.value.decode() if msg.value else '?'})")
 
 

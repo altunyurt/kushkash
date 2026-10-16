@@ -1,55 +1,99 @@
 # kushkash
 
-Paged **int4 / int8 KV cache** with a **fused decode-attention kernel** written in Mojo.
-NVIDIA GPU (sm_75+, tensor cores on sm_80+) and CPU. Drop-in **vLLM attention backend**
-(plugin, no fork), drop-in `Cache` for Hugging Face transformers, and a framework-agnostic API.
+kushkash is a compressed KV cache for LLM inference. It stores the attention keys and values in 4-bit or
+8-bit form instead of 16-bit, and includes the attention kernels that read that compressed cache directly,
+without first unpacking it into a full-size copy.
 
-- **3.46× smaller** KV than fp16 at int4 (1.86× at int8), head_dim 128.
-- **Faster decode attention**: 1.4–2.0× vs FlashInfer fp8 (L4, RTX PRO 6000 Blackwell), 1.3–2.1× vs FlashInfer fp16 (A100).
-- **Accuracy**: int4 Δppl ≤ +0.12 on Llama-3.2-1B / Qwen2.5-1.5B / Qwen2.5-7B; passkey 6/6 at 8k and 16k. That includes Qwen2.x, where fp8 KV collapses (vLLM fp8 on Qwen2.5-7B: ppl 289 vs 6.00).
+The kernels are written in [Mojo](https://www.modular.com/mojo) and run on NVIDIA GPUs and on CPUs. You can
+use kushkash in three ways:
 
----
+- as an **attention backend for vLLM**, installed as a plugin (no fork, no patches);
+- as a **cache for Hugging Face transformers**, in place of the default `DynamicCache`;
+- as a small **Python API** you can wire into your own inference code.
 
-## Install
+## Why use it
+
+During generation, the KV cache grows with every token of every request, and on most GPUs it is what limits
+how many requests you can serve at once and how long their contexts can be. kushkash stores each token in
+about a third of the memory a 16-bit cache needs (int4), or about half (int8). In practice that means:
+
+- **more requests in flight** on the same GPU, which raises throughput when you serve many requests at once;
+- **longer contexts** before you run out of memory;
+- **less memory traffic per decode step**, because the attention kernel reads the small cache instead of a
+  large one.
+
+The format is designed to keep accuracy close to a 16-bit cache, including on models whose keys have large
+per-channel offsets (for example Qwen2.x), where plain 8-bit float caches can lose a lot of quality. See
+[How it works](#how-it-works) for details.
+
+It helps most when the KV cache is your bottleneck: many concurrent requests, long prompts, long outputs. With
+only a few short requests, model weights dominate memory and time, and you will see little difference.
+
+## Requirements
+
+- Python 3.10 or newer, PyTorch 2.5 or newer.
+- The Mojo compiler and MAX libraries from pip (`mojo`, `max-core`). They are installed as dependencies.
+- For GPU use: an NVIDIA GPU of compute capability 7.5 or newer (Turing and later; tensor cores are used on
+  8.0 and newer) and the NVIDIA driver. No CUDA toolkit or `nvcc` is needed.
+- For the vLLM backend: vLLM 0.31.x.
+- For the Hugging Face integration: transformers 5.0 or newer.
+
+## Installation
 
 ```bash
-pip install "kushkash[hf] @ file:///path/to/kushkash"     # or: pip install -e ".[hf,test]"
+git clone <this repository> kushkash
+cd kushkash
+pip install -e ".[vllm]"      # vLLM backend
+pip install -e ".[hf]"        # Hugging Face integration
+pip install -e ".[hf,test]"   # plus what the test suite needs
 ```
 
-Requirements:
-- Python ≥ 3.10, torch ≥ 2.5, `mojo` ≥ 1.1, `max-core` ≥ 26.6. These are pip packages; no conda needed.
-- GPU: an NVIDIA driver (`libcuda`). No CUDA toolkit or nvcc is needed.
-
-Kernels compile on first use and are cached in `~/.cache/kushkash` (override with `KUSHKASH_CACHE`):
-- CPU library: about 10 s, once.
-- GPU: about 10 s per (head_dim, bits, GQA group, dtype, GPU arch).
-
-To pre-build: `kushkash.build("cuda", head_dim=128, bits=4, group=7, dtype="bfloat16")`.
-
-## Quickstart (vLLM 0.31.x)
-
-```bash
-pip install -e ".[vllm]"                       # registers the vllm.general_plugins entry point
-vllm serve Qwen/Qwen2.5-7B-Instruct --attention-backend CUSTOM          # int4 (default)
-KUSHKASH_BITS=8 vllm serve Qwen/Qwen2.5-7B-Instruct --attention-backend CUSTOM
-```
+The kernels are compiled the first time they are used. That takes about ten seconds per configuration (head
+size, bit width, GPU model, ...) and the results are cached in `~/.cache/kushkash` (set `KUSHKASH_CACHE` to put
+them elsewhere). To compile ahead of time:
 
 ```python
-LLM(model="Qwen/Qwen2.5-7B-Instruct", attention_backend="CUSTOM")       # offline API
+import kushkash
+kushkash.build("cuda", head_dim=128, bits=4, group=7, dtype="bfloat16")   # group = query heads per KV head
+kushkash.build("cpu")
 ```
 
-- `kv_cache_dtype` stays `auto`. The backend publishes its page size to vLLM (`customize_spec`), so vLLM's own
-  block manager, capacity numbers (`KV cache size … tokens`) and scheduler see the compressed pages.
-- Pages are vLLM blocks of 32 tokens (block size is picked automatically). Prefix caching, chunked prefill,
-  preemption (recompute) and FULL CUDA graphs for decode batches work through vLLM's own machinery.
-- Requirements / limits: vLLM 0.31.x with model runner V2 (the default on CUDA), NVIDIA GPU, decoder-only full
-  attention, head_dim 64/128/256, fp16/bf16 models. Not supported: speculative decoding, sliding window,
-  ALiBi, soft-cap, sinks, MLA, cross-layer KV sharing (explicit errors).
-- Extra memory: the exact K of the page being filled, per running request and layer
-  (`max_num_seqs × layers × Hkv × 32 × D × 2` bytes; 235 MB for a 7B model at 256 sequences), allocated
-  before vLLM's memory profiling, so the KV pool is sized around it. V needs no side buffer (see below).
+## Using it with vLLM
 
-## Quickstart (Hugging Face)
+Installing the package registers a vLLM plugin. Select the backend with `--attention-backend CUSTOM`:
+
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct --attention-backend CUSTOM                    # 4-bit cache
+KUSHKASH_BITS=8 vllm serve Qwen/Qwen2.5-7B-Instruct --attention-backend CUSTOM    # 8-bit cache
+```
+
+Or from Python:
+
+```python
+from vllm import LLM
+llm = LLM(model="Qwen/Qwen2.5-7B-Instruct", attention_backend="CUSTOM")
+```
+
+Things to know:
+
+- **Leave `kv_cache_dtype` at its default (`auto`).** The backend decides the format; choose 4 or 8 bits with
+  the `KUSHKASH_BITS` environment variable. Other values are rejected with an error.
+- **vLLM sees the real cache size.** The backend tells vLLM how many bytes a cached token takes, so vLLM's own
+  memory planning, its "KV cache size: N tokens" log line and its scheduler all work with the compressed size.
+  The block size is fixed at 32 tokens and set automatically.
+- **Set `max_num_seqs` to what actually fits.** Because the cache holds many more tokens, vLLM's default
+  `max_num_seqs` can admit more requests than will fit once they all reach full length; vLLM then pauses some
+  of them and later recomputes their work (preemption). A good starting point is
+  `max_num_seqs ≈ (KV cache size in tokens) / (prompt length + output length)`. A smaller value also gives the
+  cache a little more memory, because kushkash keeps a small exact buffer per request slot (see below).
+- **Supported features:** chunked prefill, prefix caching, preemption, CUDA graphs (full graphs for steps that
+  only decode; steps that also process prompts run in piecewise mode), and `torch.compile`.
+- **Requirements and limits:** vLLM 0.31.x with its default model runner, NVIDIA GPUs, decoder-only models with
+  full attention, head size 64, 128 or 256, and fp16 or bf16 weights. The backend refuses to start (with a clear
+  error) for speculative decoding, sliding-window attention, ALiBi, logit soft-capping, attention sinks, MLA
+  models and cross-layer KV sharing.
+
+## Using it with Hugging Face transformers
 
 ```python
 import torch, kushkash
@@ -58,183 +102,168 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 name = "Qwen/Qwen2.5-7B-Instruct"
 tok = AutoTokenizer.from_pretrained(name)
 model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16, device_map="cuda")
-kushkash.enable(model)                                   # validate + select "kushkash" attention
+kushkash.enable(model)                                  # checks the model and selects kushkash attention
 
 inputs = tok("The capital of France is", return_tensors="pt").to("cuda")
-cache = kushkash.KushHFCache(model.config, bits=4)       # replaces DynamicCache
+cache = kushkash.KushHFCache(model.config, bits=4)      # use instead of DynamicCache
 out = model.generate(**inputs, past_key_values=cache, max_new_tokens=64)
-print(tok.decode(out[0]), cache.memory())
+print(tok.decode(out[0]))
+print(cache.memory())                                   # how much memory the cache uses
 ```
 
-How each step is computed:
-
-| Step | What runs |
-|---|---|
-| Prefill, empty cache | Exact SDPA over the prompt, then the prompt is bulk-quantized (`kush_write`) |
-| Decode, 1 token | `kush_append` writes the token, then the fused paged decode kernel reads the quantized pages directly |
-| Multi-token chunk over history (chunked prefill, multi-turn) | Fused SDPA over the history one dequantized page-block at a time, plus the exact chunk (causal), merged by log-sum-exp; extra memory bounded (~512 MB) at any context length. Then the chunk is quantized |
-
-### Fast path: `kushkash.generate` (CUDA graphs)
+For faster generation, `kushkash.generate` runs the prompt in chunks and then captures a whole decode step
+(every layer) as a CUDA graph, so each new token costs one graph replay instead of many small kernel launches:
 
 ```python
 tokens = kushkash.generate(model, inputs.input_ids, max_new_tokens=256, bits=4,
                            prefill_chunk=1024, eos_token_id=tok.eos_token_id)
 ```
 
-- Chunked prefill, then the **whole decode step** (every layer: projections, MLP, `kush_append`, fused attention) is captured once as a CUDA graph and replayed. Removes Python and per-kernel launch overhead.
-- `cuda_graph="auto"` (default): the graph is kept only if a replay is >10% faster than an eager step. When the GPU (not Python) is the bottleneck, e.g. large batches or 4-bit weights, a graph gains nothing and costs memory (T4, 7B nf4, batch 16: +2.1 GiB). Capture that runs out of memory falls back to eager.
-- Greedy or temperature / top-k sampling; equal-length batches.
-- `model.generate` keeps working (eager, no graph).
+By default (`cuda_graph="auto"`) it keeps the graph only if replaying it is clearly faster than running the
+step normally, and falls back to normal execution if capturing the graph runs out of memory. It supports greedy
+decoding and temperature / top-k sampling.
 
-## Low-level API (any framework)
+Limits of the Hugging Face integration:
+
+- **All sequences in a batch must have the same length.** Padded batches are rejected when the prompt is
+  processed. Single-token decode steps are not re-checked (that would slow down every token), so do not feed
+  padded inputs to decode steps directly.
+- One `KushHFCache` per generation. Every forward pass that uses kushkash attention must pass the cache as
+  `past_key_values` with `use_cache=True`; otherwise it raises an error.
+
+## Using the Python API directly
+
+`KushCache` works with plain tensors and has no dependency on transformers or vLLM:
 
 ```python
+import torch
 from kushkash import KushCache
+
 kv = KushCache(num_layers=28, num_kv_heads=4, num_q_heads=28, head_dim=128,
                batch_size=8, bits=4, device="cuda", dtype=torch.bfloat16)
-kv.write(layer, k, v)          # k, v: [B, Hkv, T, D]; T == 1 -> append kernel, T > 1 -> bulk fill
-o = kv.attend(layer, q)        # q: [B, Hq, D] -> [B, Hq, D]   (q head i uses kv head i // G)
-kv.attend_chunk(layer, q, k, v) # T queries over history + chunk (causal), bounded memory
-kv.freeze(max_tokens); kv.advance(1)   # CUDA-graph mode: pre-mapped pages, fixed split-K
-kv.dequantize(layer)           # reference K, V [B, Hkv, n, D] (testing)
-kv.memory(); kv.reset()
+
+kv.write(layer, k, v)             # append tokens; k, v: [batch, kv_heads, new_tokens, head_dim]
+out = kv.attend(layer, q)         # one decode step; q: [batch, q_heads, head_dim]
+out = kv.attend_chunk(layer, q, k, v)   # several new tokens attending to the cache plus themselves
+kv.dequantize(layer)              # the stored K and V as regular tensors (for testing)
+kv.memory()                       # memory statistics
+kv.reset()                        # drop all tokens, keep the allocated memory
+kv.freeze(max_tokens); kv.advance(1)    # helpers for capturing decode steps in CUDA graphs
 ```
 
-## Support matrix
+`memory().ratio` compares the cache's size with what a 16-bit cache would need. It counts the exact buffer
+for the page currently being filled, which is allocated in full up front (32 tokens of keys per sequence and
+layer). For int4 at head size 128 the ratio is therefore below 1 for the first ~25 tokens, about 2× around
+64–96 tokens, about 3.2× at 1,000 tokens, and approaches the format's 3.46× for longer sequences.
+
+## Supported configurations
 
 | | GPU | CPU |
 |---|---|---|
-| head_dim | 64, 128, 256 | 64, 128, 256 |
-| bits | 4, 8 | 4, 8 |
-| GQA group G = Hq / Hkv | any. Tensor cores need head_dim % 128 == 0, G ≤ 8 and sm_80+; otherwise the CUDA-core kernel runs | any |
-| dtype (q / k / v / out) | fp16, bf16, fp32 | any (computed in fp32) |
-| arch | sm_75+ (exact-arch PTX, sm_80 fallback) | x86-64 / arm64 SIMD |
+| Head size | 64, 128, 256 | 64, 128, 256 |
+| Cache bits | 4, 8 | 4, 8 |
+| Query heads per KV head | Tensor-core kernel: head size 128 or 256, up to 8 query heads per KV head, compute capability 8.0+. Otherwise a CUDA-core kernel, limited by shared memory to 54 (head size 64), 29 (128) or 15 (256) | any |
+| Input / output dtype | fp16, bf16, fp32 (with fp32 on the tensor-core kernel, the attention math itself runs in fp16 with fp32 accumulation) | any; computed in fp32 |
+| Hardware | NVIDIA compute capability 7.5+ | x86-64 (other CPUs that Mojo supports are untested) |
 
-## Cache format
+## How it works
 
-`kushkash/kush/quant.mojo` is the single source of truth. The GPU and CPU write bit-identical pages, which is tested.
+**Pages.** The cache is split into pages of 32 tokens, one page per layer, KV head and block of tokens. Each
+page is a single contiguous record holding the quantized keys, the quantized values and their scales:
 
-**Page**
-- Holds P = 32 tokens of one (layer, kv head).
-- Codes are asymmetric: `x ≈ s·c + b`, with `c ∈ [-2^(bits-1), 2^(bits-1)-1]`.
-- `s` and `b` are stored as fp16, and codes are computed against the rounded values.
+```
+[ K codes | V codes | K scales | K offsets | V scales | V offsets ]
+```
 
-**Scales and biases**
-- **K**: `s, b` per channel over the page's tokens. This absorbs the per-channel offsets and outliers (Qwen's k_proj bias) that break fp8.
-- **V**: `s, b` per token over the channels.
+For head size 128 at 4 bits, one page takes 4,736 bytes, or 148 bytes per token per KV head, compared with 512
+bytes for a 16-bit cache (3.46× smaller). At 8 bits it is 276 bytes (1.86× smaller). The same record layout is
+used for vLLM's cache blocks and for the Hugging Face cache, so both share the same kernels.
 
-**Byte layout: one record per (page, kv head)**
-- `[ kq: 32×DC int8 | vq: 32×DC int8 | ks: D fp16 | kb: D fp16 | vs: 32 fp16 | vb: 32 fp16 ]`, DC = D (int8) or D/2 (int4).
-  D=128 int4: 4736 B per 32 tokens = 148 B per token per head (fp16: 512).
-- int4 packing: byte j = dim j (low nibble) | dim j + D/2 (high nibble).
-- The same record is vLLM's `[block][head]` cell (layout LBHNC) and an HF pool row `[pages, Hkv, RB]`; kernels take
-  `(cache, block_stride, head_stride)` and a `block_table`, so both integrations share every kernel.
-- V is quantized per token, so each V row is written straight to its final place in the record (bit-identical
-  to quantizing the whole page at once). K is quantized per channel over the page, so the K of the page being
-  filled stays exact in a tail (model dtype), selected per sequence by `tail_idx`, and is quantized the moment
-  the page fills. Decode reads the partial page as exact K + quantized V.
+**Quantization.** Every value is stored as `x ≈ scale · code + offset`, with the scale and offset kept in fp16.
 
-## Kernel design (`kushkash/kush/gpu.mojo`, `cpu.mojo`)
+- **Keys** get one scale and offset *per channel* for each page. Key vectors often have a few channels that are
+  always large or shifted (a known property of models such as Qwen2.x); per-channel ranges absorb that instead
+  of letting those channels blow up the error for all the others.
+- **Values** get one scale and offset *per token*.
 
-**Dequantization**
-- No dequantized K/V is ever written to memory.
-- K scale is folded into q once per page. K bias becomes one dot product per page.
-- V scale is folded into the softmax weights. V bias becomes one scalar per head.
+**The page being filled.** Because key ranges are computed over a full page, the keys of the newest, not yet
+full page are kept exactly (in the model's dtype) in a small per-request buffer and are quantized as soon as
+the page fills. Values have per-token ranges, so each new value is written straight into its final place in
+the page. The extra buffer costs `max_num_seqs × layers × kv_heads × 32 × head_size × 2` bytes in vLLM
+(about 235 MB for Qwen2.5-7B with 256 request slots); vLLM sizes the rest of the cache around it.
 
-**Code → float**
-- fp32: `prmt` places the byte under exponent `0x4B`, then one FADD.
-- fp16: `prmt` with `0x64`, then a packed half2 subtract (2 values per op, exact).
+**Attention kernels.**
 
-**Tensor-core decode**
-- QKᵀ uses `mma.m16n8k16` with q heads as rows.
-- The contraction over D is permuted so each lane's B fragment is one 32-bit word of its K row.
-- PV is computed as Oᵀ = Vᵀ·Pᵀ: Pᵀ comes straight from the S accumulators, Vᵀ through `ldmatrix.trans` from a padded (conflict-free) shared page.
+- *Decode* (one new token per request): a fused Mojo kernel reads the compressed pages and the exact buffer and
+  computes attention directly, without writing unpacked keys or values to memory. Scales are folded into the
+  query and the softmax weights, so most of the unpacking is a byte shuffle and one addition. On compute
+  capability 8.0+ GPUs the kernel uses tensor cores; long sequences are split across several thread blocks and
+  combined at the end.
+- *Writes*: small kernels append decode tokens and write whole prompt chunks, quantizing pages as they fill.
+- *Prompt chunks that follow earlier context* (chunked prefill, multi-turn): the earlier context is unpacked
+  one block of pages at a time with PyTorch and combined with the new chunk using PyTorch's fused attention.
+  This keeps the extra memory bounded (about 512 MB) regardless of context length, as long as PyTorch provides
+  a fused attention kernel that returns log-sum-exp values; if it does not, kushkash warns and falls back to
+  a plain implementation whose memory grows with the context. Prompts with no earlier context use
+  FlashAttention in vLLM, or PyTorch's attention in the Hugging Face integration.
 
-**Memory pipeline**
-- The whole page is in flight using 16-byte loads; int4 prefetches the next page into registers.
-- Softmax is online at page granularity.
-- Split-K across blocks with a combine kernel.
-- The warp-merge scratch is aliased onto the V staging buffer.
-
-**Comptime specialization**
-- Everything is specialized on (D, bits, G, warps, dtype).
-- All loops over heads, dims and tiles are unrolled, and there are no register spills (checked at build).
-
-**CPU**
-- Same format, SIMD width = native.
-- Codes are unpacked once per row and shared by the G heads.
-- Parallelized over (sequence, kv head).
-
-## Performance (decode attention, D=128, Hkv=8, G=4; µs per layer-step)
-
-| GPU | S × N | kush int4 | kush int8 | FlashInfer fp8 | FlashInfer fp16 |
-|---|---|---|---|---|---|
-| L4 | 1 × 128k | **648** | 1139 | 1163 | 2121 |
-| L4 | 16 × 16k | **1279** | 2306 | 2459 | 4279 |
-| L4 | 64 × 4k | **1276** | 2301 | 2586 | 4556 |
-| A100-80GB | 1 × 128k | **266** | 309 | (no fp8 HW) | 349 |
-| A100-80GB | 16 × 16k | **352** | 429 | — | 746 |
-| A100-80GB | 64 × 4k | **346** | 421 | — | 702 |
-| RTX PRO 6000 (Blackwell) | 1 × 128k | **139** | 220 | 195 | 361 |
-| RTX PRO 6000 (Blackwell) | 16 × 16k | **234** | 412 | 370 | 707 |
-| RTX PRO 6000 (Blackwell) | 64 × 4k | **229** | 406 | 374 | 710 |
-
-Notes:
-- These are kernel-only times, measured with the standalone Mojo harness. Through Python, run `bench/bench_decode.py`: its "graph" column is comparable to this table, and its "eager" column adds launch overhead.
-- int8 is about 10% slower than FlashInfer fp8 on Blackwell.
-- H100/B200 results: Unknown.
+The CPU kernels use the same format and the same arithmetic as the GPU kernels: given the same inputs, both
+produce byte-for-byte identical pages (this is tested).
 
 ## Tests and benchmarks
 
 ```bash
-pytest tests/test_cpu.py      # anywhere: bit-exact codes, kernel vs reference, HF generate (tiny models)
-pytest tests/test_ragged.py   # anywhere: vLLM-style ragged/mixed batches through the kernel layer vs ground truth
-pytest tests/test_vllm_backend_cpu.py  # vLLM 0.31 importable: backend builder + impl on CPU vs reference
-pytest tests/test_gpu.py      # NVIDIA GPU: GPU == CPU pages, decode vs reference (dims/bits/G/dtypes/split-K), HF
-pytest tests/test_vllm_gpu.py -s       # NVIDIA GPU + vLLM: serving end to end (passkey, CUDA graphs, prefix cache)
-python bench/vllm_compare.py --model Qwen/Qwen2.5-7B-Instruct --kv auto,turboquant_4bit_nc,kush4
-python bench/bench_decode.py  # kernel us + GB/s vs FlashInfer (pip install flashinfer-python)
-python bench/bench_e2e.py --model Qwen/Qwen2.5-1.5B-Instruct --batch 4 --prompt 8192 --new 128   # T4-sized
+pytest tests/test_cpu.py                # runs anywhere: format, kernels vs a reference, HF generation (tiny models)
+pytest tests/test_ragged.py             # runs anywhere: vLLM-style mixed batches against ground truth
+pytest tests/test_vllm_backend_cpu.py   # needs vLLM importable: the vLLM backend driven on CPU
+pytest tests/test_gpu.py                # NVIDIA GPU: GPU vs CPU pages, decode vs reference, HF on GPU
+pytest tests/test_vllm_gpu.py -s       # NVIDIA GPU + vLLM: end-to-end serving (passkey retrieval, prefix caching)
+python tests/test_vllm_gpu.py           # same, once per vLLM execution mode (eager, compiled, CUDA graphs, ...)
 ```
 
----
+Benchmarks (all print their results; nothing is uploaded anywhere):
 
-## What is in v0.3
+```bash
+# vLLM: KV capacity, perplexity, passkey retrieval and throughput for several cache types
+python bench/vllm_compare.py --kv auto,kush4,kush8
+python bench/vllm_compare.py --kv auto,kush4@64 --only-throughput --tp-n 256 --tp-len 2048 --tp-out 2048 --batched-tokens 8192
 
-- **Mojo kernels** (one record layout for every integration)
-  - GPU: `kush_append` (decode-step writes), `kush_write` (ragged multi-token writes, job per sequence page),
-    `kush_decode_tc` (tensor cores), `kush_decode` (CUDA cores), `kush_combine` (split-K).
-  - CPU: `kush_cpu_append`, `kush_cpu_write`, `kush_cpu_decode`. Pages bit-identical to the GPU's.
-- **vLLM backend** (`kushkash.vllm`): plugin entry point, `--attention-backend CUSTOM`, compressed page sizing,
-  ragged mixed batches, chunked prefill over quantized history, prefix caching, FULL CUDA graphs for decode.
-- **Hugging Face**: `KushHFCache`, `enable()`, `kushkash.generate` (chunked prefill + CUDA-graph decode).
-- **Shared Python layer** (`kushkash._ops`): kernel launcher (ctypes libcuda on torch's stream), page-block
-  history attention with log-sum-exp merging (bounded memory), torch reference dequantization.
-- **Tests**: CPU suites (format bit-exactness, ragged vLLM-style batches vs ground truth, the vLLM backend's
-  builder + impl driven with vLLM 0.31 classes), GPU suites, vLLM end-to-end, benchmarks.
+# vLLM's own memory accounting for one configuration
+python bench/mem_probe.py kush4
 
-## What is left out of v0.3 (deliberately)
+# Hugging Face: tokens/s and memory against DynamicCache
+python bench/bench_e2e.py --model Qwen/Qwen2.5-1.5B-Instruct --batch 4 --prompt 8192 --new 128
 
-- **Speculative decoding** in vLLM (verify rows would work; rollback across a just-completed page would not).
-- **Fused Mojo prefill/extend kernel.** Prefill rows with history dequantize page-blocks in torch per request
-  (first chunks use flash-attn varlen). Bounded memory; per-row Python loop.
-- **Model coverage**: sliding window / hybrid, soft-cap, ALiBi, sinks, MLA, cross-attention, KV sharing.
-- **vLLM model runner V1** (no stable request index for tail slots), AMD / Apple GPUs.
-- **H100/B200-specific paths** (wgmma, TMA). The sm_90/sm_100 PTX is the sm_80 algorithm.
+# decode-attention kernel time (optionally against FlashInfer: pip install flashinfer-python)
+python bench/bench_decode.py
+```
 
-## What a complete drop-in KV-cache solution still needs
+In `vllm_compare.py`, `--kv` takes a comma-separated list of configurations: vLLM's own `kv_cache_dtype`
+values (such as `auto` or `fp8`) and `kush4` / `kush8` for this backend. Add `@N` to set `max_num_seqs` for one
+configuration (for example `kush4@64`).
 
-1. **Measured parity on vLLM's own benchmarks** (this release adds the backend; numbers come next).
-2. **Fused prefill/extend kernel** over quantized pages (prefix-cache hits, chunked prefill, spec-decode verify).
-3. **Speculative decoding**: keep the tail until the next page starts, so rollback is exact.
-4. **K tail inside the KV pool** instead of a per-request side buffer (V already is; K needs 2× a record).
-5. **SGLang backend**; vLLM version matrix in CI (the plugin API is not stable across minors).
-6. **Coverage**: sliding window, MLA, head_dim 80/96; Hopper/Blackwell-specific kernels.
+Debugging switches for the vLLM backend: `KUSHKASH_CHECK=<log file>` compares layer 0 against a plain PyTorch
+reference and logs the error (slow); `KUSHKASH_SYNC=1` synchronizes the GPU after every step.
 
-## Scope check: is this still a KV cache?
+## Project layout
 
-Yes. kushkash is a KV-cache storage format, its writer kernels, and the decode-attention kernel that reads it, and nothing beyond that:
-- It has no scheduler, sampler, model runner or serving loop.
-- The attention kernel is not scope creep. A compressed cache is only useful if attention consumes it without decompressing to memory. vLLM's fp8 cache works the same way: it is only readable by its own attention backends.
+```
+kushkash/
+  kush/quant.mojo      cache format: quantization math and page layout
+  kush/gpu.mojo        GPU kernels: append, write, decode (tensor-core and CUDA-core), split-K combine
+  kush/cpu.mojo        CPU kernels with the same format
+  _build.py            compiles the kernels on first use and caches them
+  _cuda.py, _cpu.py    load and launch the compiled kernels
+  _ops.py              kernel wrapper shared by both integrations, plus the PyTorch helpers
+  cache.py             KushCache (framework-independent API)
+  hf.py, _generate.py  Hugging Face integration
+  vllm/                vLLM plugin and attention backend
+tests/                 test suites (see above)
+bench/                 benchmarks (see above)
+```
 
-The accurate label is **"KV-cache format + attention backend."** The vLLM backend stays inside that boundary.
+## What kushkash is not
+
+kushkash is a cache format plus the kernels that write and read it. It does not schedule requests, sample
+tokens or run models; vLLM or transformers do that. The attention kernels are part of it because a compressed
+cache is only useful if attention can read it without first unpacking it into a full-size copy.

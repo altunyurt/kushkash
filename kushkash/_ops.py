@@ -15,10 +15,12 @@ Tensor conventions
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 
 PAGE = 32
+_warned_math = [False]
 
 
 def record_bytes(head_dim: int, bits: int) -> int:
@@ -165,6 +167,10 @@ def attn_lse(q, k, v, causal: bool, scale: float):
             o, lse = torch.ops.aten._scaled_dot_product_flash_attention_for_cpu(q, k, v, 0.0, causal, scale=scale)
         return o.float(), lse[..., :T].float()
     except RuntimeError:
+        if not _warned_math[0]:
+            _warned_math[0] = True
+            warnings.warn("kushkash: fused SDPA with LSE unavailable; falling back to math attention "
+                          "(materializes the T x N score matrix: prefill memory is no longer bounded)")
         s = (q.float() @ k.float().transpose(-1, -2)) * scale
         if causal:
             s = s.masked_fill(torch.ones(T, k.shape[2], dtype=torch.bool, device=q.device).triu(1), float("-inf"))
