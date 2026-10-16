@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kushkash"
+version = "0.3.5"
+description = "Paged int4/int8 KV cache with fused Mojo decode attention (CUDA + CPU), drop-in for vLLM and Hugging Face transformers"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.5", "mojo>=1.1", "max-core>=26.6"]
+
+[project.optional-dependencies]
+hf = ["transformers>=5.0"]
+vllm = ["vllm>=0.31,<0.32"]
+test = ["pytest", "transformers>=5.0"]
+
+[project.entry-points."vllm.general_plugins"]
+kushkash = "kushkash.vllm:register"
+
+[tool.setuptools]
+packages = ["kushkash", "kushkash.vllm"]
+
+[tool.setuptools.package-data]
+kushkash = ["kush/*.mojo"]
