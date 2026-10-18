@@ -10,9 +10,12 @@ Per step (decodes first, guaranteed by reorder_batch_threshold = 1):
                 fused Mojo decode kernel reads pages + K tail. CUDA-graph safe (FULL graphs
                 for uniform single-token decode batches).
   prefill rows: attention over [quantized history + exact chunk] (flash-attn varlen when no
-                row has history; else per row: history dequantized page-block by page-block
-                + log-sum-exp merge), then kush_write stores V rows, quantizes completed K
-                pages and stashes the unfinished K page.
+                row has history; else, by default, history pages dequantized and packed with
+                the exact K tail and the chunk into one flash-attn varlen call for all prefill
+                rows; KUSHKASH_PREFILL=loop, no flash-attn, or a step over KUSHKASH_PACK_MB:
+                per row, history dequantized page-block by page-block + log-sum-exp merge),
+                then kush_write stores V rows, quantizes completed K pages and stashes the
+                unfinished K page.
 V is quantized per token, so every V row goes straight into its final place in the block.
 K is quantized per channel over a page, so the unfinished page's K lives in a per-layer
 tail [slots, Hkv, 32, D] in the model dtype (lossless), indexed by vLLM's stable
@@ -41,7 +44,8 @@ from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_availa
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
-from kushkash._ops import PAGE, Ops, as_records, cached_kv, history_attention, pages_touched, record_bytes
+from kushkash._ops import (PAGE, Ops, as_records, cached_kv, dequant_records, history_attention, pages_touched,
+                           record_bytes)
 
 _HAS_FA = is_flash_attn_varlen_func_available()
 if _HAS_FA:
@@ -53,6 +57,47 @@ _SYNC = os.environ.get("KUSHKASH_SYNC", "0") == "1"   # debug: serialize host/de
 _CHECK = os.environ.get("KUSHKASH_CHECK", "")        # debug: log file; checks layer 0 against torch
 _SL_STRICT = 64                                       # prefill steps per engine with a synchronous seq_lens check
 _check_calls = [0]
+
+
+def _prefill_mode() -> str:
+    mode = os.environ.get("KUSHKASH_PREFILL", "packed")
+    if mode not in ("loop", "packed"):
+        raise ValueError("KUSHKASH_PREFILL must be loop or packed")
+    return mode
+
+
+def _pack_bytes() -> int:
+    """Upper bound on the packed K + V buffer of one layer; larger steps take the loop path."""
+    return int(os.environ.get("KUSHKASH_PACK_MB", "1024")) << 20
+
+
+def _ranges(lengths: np.ndarray) -> np.ndarray:
+    """concat(arange(l) for l in lengths), vectorized."""
+    total = int(lengths.sum())
+    starts = np.cumsum(lengths) - lengths
+    return np.arange(total, dtype=np.int64) - np.repeat(starts, lengths)
+
+
+@dataclass
+class _Pack:
+    """One flash-attn varlen call over all prefill rows of a step. Per row the keys are packed
+    contiguously as [full history pages, dequantized | partial page: exact K tail, dequantized V |
+    the new chunk, exact]; flash-attn's causal mask is bottom-right aligned, so the chunk's queries
+    see the whole history and themselves causally."""
+    total_k: int                      # packed key rows
+    max_q: int
+    max_k: int
+    cu_q: torch.Tensor                # (rows + 1,) int32
+    cu_k: torch.Tensor                # (rows + 1,) int32
+    page_row: torch.Tensor            # (P,) block-table row of each full history page
+    page_idx: torch.Tensor            # (P,) logical page index
+    page_dst: torch.Tensor            # (P * 32,) packed position of each of their tokens
+    tail_row: torch.Tensor            # (R,) rows whose history ends mid-page
+    tail_page: torch.Tensor           # (R,) that partial page (its V rows are in the record)
+    tail_slot: torch.Tensor           # (R,) K tail slot
+    tail_src: torch.Tensor            # (t,) flat index into [R * 32] tail tokens
+    tail_dst: torch.Tensor            # (t,) packed position
+    new_dst: torch.Tensor             # (prefill tokens,) packed position of each chunk token
 
 
 def _bits() -> int:
@@ -161,6 +206,7 @@ class KushMetadata(AttentionMetadata):
     fresh_runs: list | None = None
     hist_rows: list | None = None
     n_splits: int | None = None       # decode split-K factor, computed once per step (shared by all layers)
+    pack: _Pack | None = None         # packed prefill mode (default) and some prefill row has history
 
 
 class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
@@ -186,6 +232,42 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
         self._sl_pending = False                                            # readback issued, not yet read
         self._sl_checks = 0                                                 # prefill steps checked
         self._builds = 0                                                    # all steps (flag read cadence)
+        self._packed = _prefill_mode() == "packed" and _HAS_FA
+        self._arange = torch.arange(PAGE, dtype=torch.int64, device=device)
+
+    @staticmethod
+    def _pack_plan(nd: int, n: int, sl: np.ndarray, qlens: np.ndarray, req: np.ndarray):
+        """Host side of _Pack: (scalars, int32 arrays to upload). Rows nd..n-1 are the prefill rows."""
+        seg = sl[nd:n].astype(np.int64)                     # packed keys per row = history + chunk
+        ql = qlens.astype(np.int64)
+        ctx = seg - ql
+        base = np.cumsum(seg) - seg
+        cu_k = np.concatenate([[0], np.cumsum(seg)])
+        full, rem = ctx // PAGE, ctx % PAGE
+        rows = np.arange(nd, n, dtype=np.int64)
+        page_row = np.repeat(rows, full)
+        page_idx = _ranges(full)
+        page_dst0 = np.repeat(base, full) + page_idx * PAGE
+        m = rem > 0
+        rr = rem[m]
+        tok = _ranges(rr)
+        tail_src = np.repeat(np.arange(int(m.sum()), dtype=np.int64), rr) * PAGE + tok
+        tail_dst = np.repeat(base[m] + full[m] * PAGE, rr) + tok
+        new_dst = np.repeat(base + ctx, ql) + _ranges(ql)
+        scalars = (int(cu_k[-1]), int(ql.max()), int(seg.max()))
+        return scalars, (cu_k, page_row, page_idx, page_dst0, rows[m], full[m], req[rows[m]], tail_src, tail_dst,
+                         new_dst)
+
+    def _pack_tensors(self, scalars, v, qd: torch.Tensor, nd: int, n: int) -> _Pack:
+        """Device side of _Pack from the uploaded int32 views (index_copy / index_select want int64)."""
+        cu_k, page_row, page_idx, page_dst0, tail_row, tail_page, tail_slot, tail_src, tail_dst, new_dst = v
+        L = lambda t: t.long()
+        return _Pack(total_k=scalars[0], max_q=scalars[1], max_k=scalars[2],
+                     cu_q=qd[nd:n + 1] - qd[nd:nd + 1], cu_k=cu_k,
+                     page_row=L(page_row), page_idx=L(page_idx),
+                     page_dst=(L(page_dst0)[:, None] + self._arange).flatten(),
+                     tail_row=L(tail_row), tail_page=L(tail_page), tail_slot=L(tail_slot),
+                     tail_src=L(tail_src), tail_dst=L(tail_dst), new_dst=L(new_dst))
 
     def _check_seq_lens(self, host: np.ndarray, host_t: torch.Tensor, dev: torch.Tensor) -> None:
         """The prefill path takes history lengths from vLLM's host copy of seq_lens (documented by vLLM 0.31 as
@@ -245,16 +327,23 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
             jobs = [(i, p) for i in range(nd, n) for p in pages_touched(int(sl[i] - (qsl[i + 1] - qsl[i])), int(sl[i]))]
             js = np.fromiter((j[0] for j in jobs), dtype=np.int32, count=len(jobs))
             jp = np.fromiter((j[1] for j in jobs), dtype=np.int32, count=len(jobs))
-            # one host->device copy for everything this step needs; slices of a fresh device tensor are never
-            # rewritten under a reader
-            nj, o = len(jobs), n + n_pre
-            up = self._ring.to_device(np.concatenate([req, sl[nd:n].astype(np.int32), js, jp]))
-            tail_idx = self._tail_idx[:n].copy_(up[:n])
-            self._check_seq_lens(sl[nd:n], up[n:o], cam.seq_lens[nd:n])
-            md.qsl_cpu, md.seq_lens_cpu, md.req_idx = qsl, sl, req
-            md.job_seq, md.job_page = up[o:o + nj], up[o + nj:o + 2 * nj]
             qlens = qsl[nd + 1:n + 1] - qsl[nd:n]
             fresh = sl[nd:n] == qlens
+            pack = self._pack_plan(nd, n, sl, qlens, req) if self._packed and not fresh.all() else None
+            # one host->device copy for everything this step needs; slices of a fresh device tensor are never
+            # rewritten under a reader
+            parts = [req, sl[nd:n].astype(np.int32), js, jp] + (list(pack[1]) if pack else [])
+            up = self._ring.to_device(np.concatenate(parts).astype(np.int32, copy=False))
+            views, o = [], 0
+            for a in parts:
+                views.append(up[o:o + len(a)])
+                o += len(a)
+            tail_idx = self._tail_idx[:n].copy_(views[0])
+            self._check_seq_lens(sl[nd:n], views[1], cam.seq_lens[nd:n])
+            md.qsl_cpu, md.seq_lens_cpu, md.req_idx = qsl, sl, req
+            md.job_seq, md.job_page = views[2], views[3]
+            if pack:
+                md.pack = self._pack_tensors(pack[0], views[4:], cam.query_start_loc, nd, n)
             md.fresh_runs, md.hist_rows = [], []
             i = nd
             while i < n:
@@ -423,6 +512,12 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
     def _prefill(self, ops, q, k, v, out, kv_cache, md, N) -> None:
         qsl = md.qsl_cpu
         kw = {} if self.fa_version is None else {"fa_version": self.fa_version}
+        p = md.pack
+        if p is not None and 2 * p.total_k * self.num_kv_heads * self.head_size * k.element_size() <= _pack_bytes():
+            self._prefill_packed(q, k, v, out, kv_cache, md, kw)
+            ops.write(k, v, md.query_start_loc, md.seq_lens, md.tail_idx, md.job_seq, md.job_page, kv_cache,
+                      md.block_table, self.tail_k)
+            return
         for r0, r1, mq, cu in md.fresh_runs:          # no history: exact causal attention over the chunk
             a, b = int(qsl[r0]), int(qsl[r1])
             flash_attn_varlen_func(q=q[a:b], k=k[a:b], v=v[a:b], cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=mq,
@@ -439,3 +534,25 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
                 out[a:b] = o[0].transpose(0, 1)
         ops.write(k, v, md.query_start_loc, md.seq_lens, md.tail_idx, md.job_seq, md.job_page, kv_cache,
                   md.block_table, self.tail_k)
+
+    def _prefill_packed(self, q, k, v, out, kv_cache, md, kw) -> None:
+        """All prefill rows in one flash-attn varlen call over packed [history | K tail | chunk] keys (see _Pack).
+        Reads the cache before this step's write, like the loop path."""
+        p, Hk, D = md.pack, self.num_kv_heads, self.head_size
+        a, b = int(md.qsl_cpu[md.num_decodes]), int(md.qsl_cpu[md.num_reqs])
+        kp = k.new_empty(p.total_k, Hk, D)
+        vp = v.new_empty(p.total_k, Hk, D)
+        rec, bt = as_records(kv_cache), md.block_table
+        if p.page_row.numel():                        # full history pages: dequantized K and V
+            hk, hv = dequant_records(rec[bt[p.page_row, p.page_idx].long()], D, self.bits, k.dtype)   # [P, Hk, 32, D]
+            kp.index_copy_(0, p.page_dst, hk.transpose(1, 2).reshape(-1, Hk, D))
+            vp.index_copy_(0, p.page_dst, hv.transpose(1, 2).reshape(-1, Hk, D))
+        if p.tail_row.numel():                        # partial page: exact K from the tail, V from the record
+            tv = dequant_records(rec[bt[p.tail_row, p.tail_page].long()], D, self.bits, k.dtype)[1]
+            tk = self.tail_k[p.tail_slot]                                                         # [R, Hk, 32, D]
+            kp.index_copy_(0, p.tail_dst, tk.transpose(1, 2).reshape(-1, Hk, D).index_select(0, p.tail_src).to(k.dtype))
+            vp.index_copy_(0, p.tail_dst, tv.transpose(1, 2).reshape(-1, Hk, D).index_select(0, p.tail_src))
+        kp.index_copy_(0, p.new_dst, k[a:b])
+        vp.index_copy_(0, p.new_dst, v[a:b])
+        flash_attn_varlen_func(q=q[a:b], k=kp, v=vp, cu_seqlens_q=p.cu_q, cu_seqlens_k=p.cu_k, max_seqlen_q=p.max_q,
+                               max_seqlen_k=p.max_k, softmax_scale=self.scale, causal=True, out=out[a:b], **kw)

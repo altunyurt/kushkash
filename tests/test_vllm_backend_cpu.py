@@ -27,19 +27,25 @@ def make_cfg(max_seqs, max_len):
 
 
 def fake_flash(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, softmax_scale, causal, out):
-    """flash_attn_varlen_func stand-in (causal, GQA) for the CPU test of the fresh-run path."""
+    """flash_attn_varlen_func stand-in (GQA, causal mask bottom-right aligned like flash-attn) for CPU tests."""
     g = q.shape[1] // k.shape[1]
-    cu = cu_seqlens_q.tolist()
-    for a, b in zip(cu[:-1], cu[1:]):
-        out[a:b] = F.scaled_dot_product_attention(q[a:b].transpose(0, 1), k[a:b].transpose(0, 1).repeat_interleave(g, 0),
-                                                  v[a:b].transpose(0, 1).repeat_interleave(g, 0), is_causal=causal,
+    cq, ck = cu_seqlens_q.tolist(), cu_seqlens_k.tolist()
+    for a, b, c, d in zip(cq[:-1], cq[1:], ck[:-1], ck[1:]):
+        mask = torch.ones(b - a, d - c, dtype=torch.bool).tril(diagonal=(d - c) - (b - a)) if causal else None
+        out[a:b] = F.scaled_dot_product_attention(q[a:b].transpose(0, 1), k[c:d].transpose(0, 1).repeat_interleave(g, 0),
+                                                  v[c:d].transpose(0, 1).repeat_interleave(g, 0), attn_mask=mask,
                                                   scale=softmax_scale).transpose(0, 1)
 
 
-@pytest.mark.parametrize("fa", [False, True])
+@pytest.mark.parametrize("fa,mode", [(False, "loop"), (True, "loop"), (True, "packed"), (True, "packed-fallback")])
 @pytest.mark.parametrize("bits", [4, 8])
-def test_backend_mixed_steps(bits, fa, monkeypatch):
+def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
+    """loop: history rows per row with LSE merges; packed: all prefill rows in one (fake) flash-attn varlen call;
+    packed-fallback: packed mode with a zero byte budget, so every step falls back to the loop path."""
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
+    monkeypatch.setenv("KUSHKASH_PREFILL", mode.split("-")[0])
+    if mode == "packed-fallback":
+        monkeypatch.setenv("KUSHKASH_PACK_MB", "0")
     if fa:                                                            # fresh runs -> (fake) flash-attn varlen
         monkeypatch.setattr(kb, "_HAS_FA", True)
         monkeypatch.setattr(kb, "flash_attn_varlen_func", fake_flash, raising=False)
@@ -50,6 +56,9 @@ def test_backend_mixed_steps(bits, fa, monkeypatch):
     impl = kb.KushAttentionImpl(H * G, D, D ** -0.5, num_kv_heads=H)
     impl.fa_version = None
     builder = kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], cfg, torch.device("cpu"))
+    packed_calls = []
+    orig_packed = impl._prefill_packed
+    impl._prefill_packed = lambda *a, **kw: packed_calls.append(1) or orig_packed(*a, **kw)
     C = record_bytes(D, bits) // PAGE
     kv_cache = torch.zeros(n_blocks, H * PAGE * C + 64, dtype=torch.uint8)[:, :H * PAGE * C].view(n_blocks, H, PAGE, C)
     free = list(range(n_blocks)); random.Random(0).shuffle(free)
@@ -114,6 +123,7 @@ def test_backend_mixed_steps(bits, fa, monkeypatch):
             lens[r] = int(sl[i])
             n = lens[r]
             assert torch.equal(impl.tail_k[slot_of[r], :, :n % PAGE], exact[r][0][:, n // PAGE * PAGE:])
+    assert bool(packed_calls) == (mode == "packed")                   # the packed path ran (and only when asked)
 
 
 def test_rejects_unsupported_configs(monkeypatch):

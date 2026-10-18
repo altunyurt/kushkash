@@ -58,9 +58,13 @@ def reference():
     return run("auto")
 
 
-@pytest.mark.parametrize("bits,eager,prefix", [(8, False, False), (4, False, False), (4, True, True)])
-def test_vllm_backend(reference, bits, eager, prefix):
-    r = run("kush", eager=eager, prefix=prefix, bits=bits)
+@pytest.mark.parametrize("bits,eager,prefix,prefill", [(8, False, False, "loop"), (4, False, False, "loop"),
+                                                       (4, True, True, "loop"), (4, False, True, "packed"),
+                                                       (4, True, True, "packed")])
+def test_vllm_backend(reference, bits, eager, prefix, prefill):
+    """Prompts are longer than the 512-token prefill budget: later chunks read the quantized history (loop or packed
+    path), and the prefix-cache repeats start from cached history too."""
+    r = run("kush", eager=eager, prefix=prefix, bits=bits, env_extra={"KUSHKASH_PREFILL": prefill})
     hits = sum(k in t for k, t in zip(r["keys"] + r["keys"][:2], r["texts"]))
     assert hits >= 7, r["texts"]                                   # passkey retrieval through the cache
     assert r["texts"][6:] == r["texts"][:2]                         # deterministic (and prefix-cache consistent)

@@ -41,12 +41,14 @@ only a few short requests, model weights dominate memory and time, and you will 
 ## Installation
 
 ```bash
-git clone <this repository> kushkash
-cd kushkash
-pip install -e ".[vllm]"      # vLLM backend
-pip install -e ".[hf]"        # Hugging Face integration
-pip install -e ".[hf,test]"   # plus what the test suite needs
+pip install kushkash             # core package (CPU)
+pip install "kushkash[vllm]"     # vLLM backend
+pip install "kushkash[hf]"       # Hugging Face integration
+pip install "kushkash[hf,test]"  # plus what the test suite needs
 ```
+
+From a source checkout, `pip install -e ".[vllm]"` works too, but prefer the wheel: an editable install is a
+`.pth` finder and is shadowed when Python runs from a directory that contains a folder named `kushkash`.
 
 The kernels are compiled the first time they are used. That takes about ten seconds per configuration (head
 size, bit width, GPU model, ...) and the results are cached in `~/.cache/kushkash` (set `KUSHKASH_CACHE` to put
@@ -86,6 +88,11 @@ Things to know:
   of them and later recomputes their work (preemption). A good starting point is
   `max_num_seqs ≈ (KV cache size in tokens) / (prompt length + output length)`. A smaller value also gives the
   cache a little more memory, because kushkash keeps a small exact buffer per request slot (see below).
+- **Prompt chunks that follow cached history** (chunked prefill of long prompts, prefix-cache hits) attend to
+  the quantized cache. The history of all of a step's prompt rows is dequantized into one temporary buffer per
+  layer and attended with a single flash-attention call. The buffer is capped at `KUSHKASH_PACK_MB` MiB per layer
+  (default 1024); larger steps, and `KUSHKASH_PREFILL=loop`, handle each request separately instead (slower, less
+  temporary memory).
 - **Supported features:** chunked prefill, prefix caching, preemption, CUDA graphs (full graphs for steps that
   only decode; steps that also process prompts run in piecewise mode), and `torch.compile`.
 - **Requirements and limits:** vLLM 0.31.x with its default model runner, NVIDIA GPUs, decoder-only models with
