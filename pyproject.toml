@@ -1,13 +1,29 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "kushkash"
-version = "0.3.6"
+version = "0.3.7"     # keep in sync with kushkash/__init__.py
 description = "Paged int4/int8 KV cache with fused Mojo decode attention (CUDA + CPU), drop-in for vLLM and Hugging Face transformers"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Özgür Altunyurt" }]
+keywords = ["kv cache", "quantization", "int4", "int8", "vllm", "transformers", "mojo", "cuda", "llm inference"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = ["torch>=2.5", "mojo>=1.1", "max-core>=26.6"]
 
 [project.optional-dependencies]
@@ -15,11 +31,14 @@ hf = ["transformers>=5.0"]
 vllm = ["vllm>=0.31,<0.32"]
 test = ["pytest", "transformers>=5.0"]
 
+[project.urls]
+Homepage = "https://github.com/altunyurt/kushkash"
+Repository = "https://github.com/altunyurt/kushkash"
+Issues = "https://github.com/altunyurt/kushkash/issues"
+
 [project.entry-points."vllm.general_plugins"]
 kushkash = "kushkash.vllm:register"
 
 [tool.setuptools]
-packages = ["kushkash", "kushkash.vllm"]
-
-[tool.setuptools.package-data]
-kushkash = ["kush/*.mojo"]
+# kush holds the Mojo sources (no .py files); listing it keeps setuptools from warning
+packages = ["kushkash", "kushkash.vllm", "kushkash.kush"]
