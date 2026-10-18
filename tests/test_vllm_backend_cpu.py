@@ -196,3 +196,55 @@ def test_built_by_vllm_attention_layer(dtype, ok, monkeypatch):
         else:
             with pytest.raises(NotImplementedError, match="kv_cache_dtype"):
                 build()
+
+
+def test_one_upload_per_step():
+    """Each build() does exactly one host->device copy: decode-only and mixed prefill steps alike."""
+    b = kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], make_cfg(max_seqs=4, max_len=256), torch.device("cpu"))
+    calls = []
+    orig = b._ring.to_device
+    b._ring.to_device = lambda arr, out=None: calls.append(arr.shape[0]) or orig(arr, out)
+    b.build(0, _cam([1, 1], [40, 9]))                                 # decode-only
+    md = b.build(0, _cam([1, 5, 7], [40, 10, 0]))                     # 1 decode + 2 prefill rows
+    assert len(calls) == 2
+    assert md.tail_idx.tolist() == [0, 1, 2] and md.tail_idx.data_ptr() == b._tail_idx.data_ptr()
+    assert md.job_seq.tolist() == [1, 2] and md.job_page.tolist() == [0, 0]
+
+
+def test_fresh_run_cu_seqlens_from_device(monkeypatch):
+    """cu_seqlens of a fresh run are sliced from the device query_start_loc (no upload)."""
+    monkeypatch.setattr(kb, "_HAS_FA", True)
+    b = kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], make_cfg(max_seqs=4, max_len=256), torch.device("cpu"))
+    md = b.build(0, _cam([5, 7, 3, 4], [0, 0, 10, 0]))
+    (r0, r1, mq, cu), (s0, s1, _, cu2) = md.fresh_runs
+    assert (r0, r1, mq, cu.tolist(), cu.dtype) == (0, 2, 7, [0, 5, 12], torch.int32)
+    assert (s0, s1, cu2.tolist()) == (3, 4, [0, 4]) and md.hist_rows == [2]
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.done = False
+
+    def record(self):
+        self.done = False
+
+    def query(self):
+        return self.done
+
+
+def test_sampled_flag_async_readback(monkeypatch):
+    """GPU-style sampled phase: the 256-step read only issues a non-blocking copy; the mismatch is raised at the
+    first build after that copy has completed, never by waiting on it."""
+    monkeypatch.setattr(kb, "_SL_STRICT", 1)
+    b = kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], make_cfg(max_seqs=4, max_len=256), torch.device("cpu"))
+    ev = b._sl_event = _FakeEvent()
+    b.build(0, _cam([5, 7], [10, 0]))
+    b.build(0, _cam([5, 7], [10, 0], upper=BAD))                      # recorded on the flag
+    while b._builds < 255:
+        b.build(0, _cam([1, 1], [40, 9]))
+    b.build(0, _cam([1, 1], [40, 9]))                                 # step 256: readback issued, no raise
+    assert b._sl_pending
+    b.build(0, _cam([1, 1], [40, 9]))                                 # copy still in flight: no raise
+    ev.done = True
+    with pytest.raises(RuntimeError, match="earlier step"):
+        b.build(0, _cam([1, 1], [40, 9]))

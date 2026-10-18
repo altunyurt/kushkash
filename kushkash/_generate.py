@@ -82,13 +82,29 @@ def generate(model, input_ids: torch.Tensor, max_new_tokens: int, *, bits: int =
     static_pos = torch.zeros(B, 1, dtype=torch.long, device=dev)
     graph, static_logits, side = None, None, torch.cuda.Stream(dev) if use_graph else None
     done = torch.zeros(B, dtype=torch.bool, device=dev)
+    # EOS stop test without a per-token sync: on CUDA `done` is copied to pinned memory asynchronously and
+    # read once that copy has finished (a step or two later); rows already done keep emitting EOS meanwhile
+    gpu_done = eos.numel() and dev.type == "cuda"
+    done_host = torch.zeros(B, dtype=torch.bool, pin_memory=True) if gpu_done else None
+    done_ev = torch.cuda.Event() if gpu_done else None
+    done_pending = False
     out, n = [tok], T0
     eager_ms, graph_ms = None, []
     for i in range(1, max_new_tokens):
         if eos.numel():
             done |= torch.isin(tok, eos)
-            if bool(done.all()):
-                break
+            if not gpu_done:
+                if bool(done.all()):
+                    break
+            else:
+                if done_pending and done_ev.query():
+                    done_pending = False
+                    if bool(done_host.all()):
+                        break
+                if not done_pending:
+                    done_host.copy_(done, non_blocking=True)
+                    done_ev.record()
+                    done_pending = True
         static_ids.copy_(tok.view(B, 1))
         static_pos.fill_(n)
         if graph is not None:

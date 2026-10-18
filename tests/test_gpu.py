@@ -141,3 +141,22 @@ def test_generate_graph_auto_reports():
     assert out.shape == (1, 2120)
     assert st["eager_step_ms"] is not None and st["prefill_history_attn_s"] > 0
     assert st["graph"] == (st["graph_step_ms"] is not None and st["graph_step_ms"] <= 0.9 * st["eager_step_ms"])
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_generate_eos_async_stop(graph):
+    """EOS stop without a per-token sync: tokens match the run without EOS up to the first EOS, everything after it
+    is EOS, and generation stops early (a step or two after EOS, once the async readback lands)."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+    cfg = LlamaConfig(vocab_size=512, hidden_size=512, intermediate_size=1024, num_hidden_layers=2,
+                      num_attention_heads=8, num_key_value_heads=2, head_dim=64)
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(cfg).to("cuda", torch.float16).eval()
+    ids = torch.randint(0, 512, (1, 100), device="cuda")
+    ref = kk.generate(model, ids, 60, bits=4, cuda_graph=graph)
+    eos = int(ref[0, 100 + 10])
+    k = next(i for i in range(100, 160) if int(ref[0, i]) == eos)       # first EOS position
+    out = kk.generate(model, ids, 60, bits=4, cuda_graph=graph, eos_token_id=eos)
+    assert torch.equal(out[:, :k + 1], ref[:, :k + 1])
+    assert bool((out[0, k + 1:] == eos).all())
+    assert out.shape[1] < ref.shape[1]                                 # stopped early

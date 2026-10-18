@@ -177,19 +177,24 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
         # mid-page); the ring also grows if a step ever needs more
         max_jobs = 2 * max_reqs + sched.max_num_batched_tokens // PAGE + 1
         self._tail_idx = torch.zeros(max_reqs, dtype=torch.int32, device=device)   # persistent (CUDA graphs)
-        self._ring = _PinnedRing(32, max(max_reqs, max_jobs), device)
+        # one upload per step: [req_idx | prefill seq_lens | job_seq | job_page]; the ring grows if ever needed
+        self._ring = _PinnedRing(32, 2 * max_reqs + 2 * max_jobs, device)
+        gpu = device.type == "cuda"
         self._sl_bad = torch.zeros((), dtype=torch.bool, device=device)   # host bound != device seq_lens seen
+        self._sl_host = torch.zeros((), dtype=torch.bool, pin_memory=gpu)  # async readback of _sl_bad
+        self._sl_event = torch.cuda.Event() if gpu else None
+        self._sl_pending = False                                            # readback issued, not yet read
         self._sl_checks = 0                                                 # prefill steps checked
         self._builds = 0                                                    # all steps (flag read cadence)
 
-    def _check_seq_lens(self, host: np.ndarray, dev: torch.Tensor) -> None:
+    def _check_seq_lens(self, host: np.ndarray, host_t: torch.Tensor, dev: torch.Tensor) -> None:
         """The prefill path takes history lengths from vLLM's host copy of seq_lens (documented by vLLM 0.31 as
         exact for prefill rows); the kernels use the device copy. Whether they agree is a property of the vLLM
         version, not of the data, so the first _SL_STRICT prefill steps of every engine compare them
         synchronously and abort before attention runs on a mismatch. Later prefill steps compare on the device
-        (no sync) into a sticky flag that build() reads every 256 steps of any kind, which bounds, but does not
-        close, the window if a mismatch first appears later. KUSHKASH_CHECK keeps every step synchronous."""
-        host_t = self._ring.to_device(host.astype(np.int32))
+        (no sync) into a sticky flag; every 256 steps of any kind build() copies the flag to the host without
+        blocking and reads it once that copy has finished, which bounds, but does not close, the window if a
+        mismatch first appears later. KUSHKASH_CHECK keeps every step synchronous. host_t: `host` on the device."""
         self._sl_checks += 1
         if _CHECK or self._sl_checks <= _SL_STRICT:
             if not torch.equal(host_t, dev):
@@ -198,20 +203,38 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
             return
         self._sl_bad.logical_or_((host_t != dev).any())
 
+    def _poll_seq_lens_flag(self) -> None:
+        """Sampled-phase read of the sticky mismatch flag, without stalling the host on the GPU."""
+        if self._sl_checks <= _SL_STRICT:
+            return
+        bad = False
+        if self._sl_pending and self._sl_event.query():          # an earlier readback has landed
+            self._sl_pending, bad = False, bool(self._sl_host)
+        if not bad and self._builds % 256 == 0:
+            if self._sl_event is None:                             # CPU: plain read
+                bad = bool(self._sl_bad)
+            elif not self._sl_pending:
+                self._sl_host.copy_(self._sl_bad, non_blocking=True)
+                self._sl_event.record()
+                self._sl_pending = True
+        if bad:
+            raise RuntimeError("kushkash: vLLM's host seq_lens differed from the device seq_lens for prefill rows "
+                               "in an earlier step; this vLLM version is not supported")
+
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False) -> KushMetadata:
         cam = common_attn_metadata
         if cam.req_idx is None:
             raise RuntimeError("kushkash needs vLLM's model runner V2 (unset VLLM_USE_V2_MODEL_RUNNER=0)")
         self._builds += 1
-        if self._builds % 256 == 0 and self._sl_checks > _SL_STRICT and bool(self._sl_bad):
-            raise RuntimeError("kushkash: vLLM's host seq_lens differed from the device seq_lens for prefill rows "
-                               "in an earlier step; this vLLM version is not supported")
+        self._poll_seq_lens_flag()
         nd, n_pre, _, _ = split_decodes_and_prefills(cam, decode_threshold=1)
         n = cam.num_reqs
-        tail_idx = self._ring.to_device(np.asarray(cam.req_idx[:n], dtype=np.int32), self._tail_idx)
+        req = np.asarray(cam.req_idx[:n], dtype=np.int32)
+        if not n_pre:                                 # decode-only: straight into the persistent buffer
+            tail_idx = self._ring.to_device(req, self._tail_idx)
         md = KushMetadata(seq_lens=cam.seq_lens, query_start_loc=cam.query_start_loc,
-                          block_table=cam.block_table_tensor, tail_idx=tail_idx,
+                          block_table=cam.block_table_tensor, tail_idx=None,
                           num_actual_tokens=cam.num_actual_tokens, num_decodes=nd, num_reqs=n)
         if n_pre:
             qsl = cam.query_start_loc_cpu[:n + 1].numpy()
@@ -219,13 +242,17 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
             # which this backend rejects); decode rows below use device seq_lens only
             sl = (cam.seq_lens_cpu_upper_bound[:n] if cam.seq_lens_cpu_upper_bound is not None
                   else cam.seq_lens[:n].cpu()).numpy()
-            self._check_seq_lens(sl[nd:n], cam.seq_lens[nd:n])
             jobs = [(i, p) for i in range(nd, n) for p in pages_touched(int(sl[i] - (qsl[i + 1] - qsl[i])), int(sl[i]))]
             js = np.fromiter((j[0] for j in jobs), dtype=np.int32, count=len(jobs))
             jp = np.fromiter((j[1] for j in jobs), dtype=np.int32, count=len(jobs))
-            md.qsl_cpu, md.seq_lens_cpu, md.req_idx = qsl, sl, np.asarray(cam.req_idx[:n])
-            md.job_seq = self._ring.to_device(js)     # fresh tensors: never rewritten under a reader
-            md.job_page = self._ring.to_device(jp)
+            # one host->device copy for everything this step needs; slices of a fresh device tensor are never
+            # rewritten under a reader
+            nj, o = len(jobs), n + n_pre
+            up = self._ring.to_device(np.concatenate([req, sl[nd:n].astype(np.int32), js, jp]))
+            tail_idx = self._tail_idx[:n].copy_(up[:n])
+            self._check_seq_lens(sl[nd:n], up[n:o], cam.seq_lens[nd:n])
+            md.qsl_cpu, md.seq_lens_cpu, md.req_idx = qsl, sl, req
+            md.job_seq, md.job_page = up[o:o + nj], up[o + nj:o + 2 * nj]
             qlens = qsl[nd + 1:n + 1] - qsl[nd:n]
             fresh = sl[nd:n] == qlens
             md.fresh_runs, md.hist_rows = [], []
@@ -235,12 +262,14 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
                     j = i
                     while j < n and fresh[j - nd]:
                         j += 1
-                    cu = self._ring.to_device((qsl[i:j + 1] - qsl[i]).astype(np.int32))
+                    qd = cam.query_start_loc                  # cu_seqlens from the device copy: no upload
+                    cu = qd[i:j + 1] - qd[i:i + 1]
                     md.fresh_runs.append((i, j, int(qlens[i - nd:j - nd].max()), cu))
                     i = j
                 else:
                     md.hist_rows.append(i)
                     i += 1
+        md.tail_idx = tail_idx
         return md
 
 
