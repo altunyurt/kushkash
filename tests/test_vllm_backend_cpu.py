@@ -1,6 +1,7 @@
 """The vLLM backend's builder + impl driven on CPU (fp32 model, CPU Mojo kernels) with
 hand-built vLLM metadata: ragged mixed batches, decodes first, scattered blocks, padded
-block-table rows, request-state tail slots. Needs vLLM 0.31 importable (no GPU).
+block-table rows, request-state tail slots. Needs vLLM 0.31 importable (no GPU; on a machine with one, CUDA
+is hidden from these tests so the impl allocates its K tail on the CPU like everything else).
 Run: python -m pytest tests/test_vllm_backend_cpu.py -q"""
 import random
 from types import SimpleNamespace
@@ -17,6 +18,17 @@ import kushkash.vllm.backend as kb  # noqa: E402
 from kushkash._ops import PAGE, as_records, cached_kv, record_bytes  # noqa: E402
 
 torch.manual_seed(0)
+
+
+@pytest.fixture(autouse=True)
+def _cpu_only(monkeypatch):
+    """Same behaviour on CPU-only and GPU machines:
+    - KushAttentionImpl puts its K tail on CUDA whenever a GPU is visible; the CPU kernels would then write
+      through a device pointer (illegal memory access, and the error sticks to the process).
+    - With vLLM's flash-attn installed, the backend would call its CUDA-only kernel on CPU tensors. Tests that
+      want the flash-attn paths set _HAS_FA and the CPU stand-in (fake_flash) themselves."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(kb, "_HAS_FA", False)
 
 
 def make_cfg(max_seqs, max_len):
@@ -132,9 +144,9 @@ def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
             assert torch.equal(impl.tail_k[slot_of[r], :, :n % PAGE], exact[r][0][:, n // PAGE * PAGE:])
     assert bool(packed_calls) == (mode in ("packed", "packed-sliced"))  # the packed path ran (and only when asked)
     if mode == "packed-sliced":
-        # page slices are <= 2 records (the partial-page read is one record per row, <= n_req); at most one
-        # partial-page read per call, so more than 2 calls per packed call means history was split into slices
-        assert max(dq_calls) <= max(2, n_req) and len(dq_calls) > 2 * len(packed_calls)
+        # page slices are <= 2 records; the partial-page read is one record per row (<= n_req). The exact slice
+        # count is checked structurally in test_packed_slicing_is_exact
+        assert dq_calls and max(dq_calls) <= max(2, n_req)
 
 
 def test_rejects_unsupported_configs(monkeypatch):
@@ -286,3 +298,99 @@ def test_pack_plan_skipped_over_budget(monkeypatch):
         md = b.build(0, cam)
         assert (md.pack is not None) == packed
     assert sizes[0] > sizes[1] == 2 + 2 + 2 * len(md.job_seq)           # no plan payload when skipped
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_packed_slices_exact(bits, monkeypatch):
+    """Structural slice count: 330 cached tokens = 10 full pages + a 10-token partial page; a 1 MiB budget gives
+    2-page slices (H=2, D=64, fp32: 32 KiB per page of K + V), so the packed step dequantizes exactly 5 page slices
+    of 2 records plus one partial-page read of 1 record, and matches the dequantized-history reference."""
+    monkeypatch.setenv("KUSHKASH_BITS", str(bits))
+    monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
+    monkeypatch.setenv("KUSHKASH_PACK_MB", "1")
+    monkeypatch.setattr(kb, "_HAS_FA", True)
+    monkeypatch.setattr(kb, "flash_attn_varlen_func", fake_flash, raising=False)
+    monkeypatch.setattr(kb, "get_flash_attn_version", lambda **kw: None, raising=False)
+    H, G, D, W = 2, 2, 64, 16
+    cfg = make_cfg(max_seqs=2, max_len=W * PAGE)
+    monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
+    impl = kb.KushAttentionImpl(H * G, D, D ** -0.5, num_kv_heads=H)
+    impl.fa_version = None
+    builder = kb.KushMetadataBuilder(SimpleNamespace(num_kv_heads=H, head_size=D), ["l0"], cfg, torch.device("cpu"))
+    C = record_bytes(D, bits) // PAGE
+    kv_cache = torch.zeros(W, H, PAGE, C, dtype=torch.uint8)
+    table = torch.arange(W, dtype=torch.int32).view(1, W)
+    dq = []
+    orig_dq = kb.dequant_records
+    monkeypatch.setattr(kb, "dequant_records", lambda *a, **kw: dq.append(a[0].shape[0]) or orig_dq(*a, **kw))
+
+    def step(ctx, ql):
+        qsl = np.array([0, ql], dtype=np.int32)
+        sl = np.array([ctx + ql], dtype=np.int32)
+        cam = CommonAttentionMetadata(
+            query_start_loc=torch.from_numpy(qsl), query_start_loc_cpu=torch.from_numpy(qsl),
+            seq_lens=torch.from_numpy(sl), num_reqs=1, num_actual_tokens=ql, max_query_len=ql,
+            max_seq_len=ctx + ql, block_table_tensor=table, slot_mapping=torch.zeros(ql, dtype=torch.int64),
+            seq_lens_cpu_upper_bound=torch.from_numpy(sl), req_idx=np.array([1]))
+        md = builder.build(0, cam)
+        q, k, v = torch.randn(ql, H * G, D), torch.randn(ql, H, D), torch.randn(ql, H, D)
+        hk, hv = cached_kv(as_records(kv_cache), table, ctx, impl.tail_k[1:2], D, bits, torch.float32)
+        out = torch.zeros(ql, H * G * D)
+        impl.forward(SimpleNamespace(layer_name="x"), q.view(ql, -1), k.view(ql, -1), v.view(ql, -1), kv_cache, md,
+                     output=out)
+        K, V = torch.cat([hk[0], k.transpose(0, 1)], 1), torch.cat([hv[0], v.transpose(0, 1)], 1)
+        mask = torch.ones(ql, ctx + ql, dtype=torch.bool).tril(diagonal=ctx)
+        ref = F.scaled_dot_product_attention(q.transpose(0, 1), K.repeat_interleave(G, 0), V.repeat_interleave(G, 0),
+                                             attn_mask=mask).transpose(0, 1)
+        return md, (out.view(ql, H * G, D) - ref).norm() / ref.norm()
+
+    md, err = step(0, 330)                                             # fresh: flash-attn over the chunk, no packing
+    assert md.pack is None and dq == [] and err < 2e-5
+    md, err = step(330, 5)                                             # 5 new tokens over the quantized history
+    assert md.pack is not None and dq == [2, 2, 2, 2, 2, 1] and err < 2e-5
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_packed_slicing_is_exact(bits, monkeypatch):
+    """Structural check of the sliced dequantization: one chunk over 200 tokens of history (6 full pages + 8 tokens).
+    A 1 MiB budget gives 2-page slices: exactly [2, 2, 2] page records per call plus one partial-page call, and the
+    output is bit-identical to an unsliced pass (index_copy_ is a scatter, not a reduction)."""
+    monkeypatch.setenv("KUSHKASH_BITS", str(bits))
+    monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
+    monkeypatch.setattr(kb, "_HAS_FA", True)
+    monkeypatch.setattr(kb, "flash_attn_varlen_func", fake_flash, raising=False)
+    monkeypatch.setattr(kb, "get_flash_attn_version", lambda **kw: None, raising=False)
+    H, G, D, W = 2, 3, 64, 8
+    cfg = make_cfg(max_seqs=4, max_len=W * PAGE)
+    monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
+    impl = kb.KushAttentionImpl(H * G, D, D ** -0.5, num_kv_heads=H)
+    impl.fa_version = None
+    spec = SimpleNamespace(num_kv_heads=H, head_size=D)
+    C = record_bytes(D, bits) // PAGE
+    kv_cache = torch.zeros(W, H, PAGE, C, dtype=torch.uint8)
+
+    def step(ql, ctx, mb, cache, seed):
+        monkeypatch.setenv("KUSHKASH_PACK_MB", mb)
+        md = kb.KushMetadataBuilder(spec, ["l0"], cfg, torch.device("cpu")).build(0, _cam([ql], [ctx], W=W))
+        g = torch.Generator().manual_seed(seed)
+        q, k, v = torch.randn(ql, H * G * D, generator=g), torch.randn(ql, H * D, generator=g), torch.randn(ql, H * D, generator=g)
+        out = torch.zeros(ql, H * G * D)
+        impl.forward(SimpleNamespace(layer_name="l"), q, k, v, cache, md, output=out)
+        return md, out
+
+    step(200, 0, "512", kv_cache, 0)                                  # fresh prompt: fills 6 pages + an 8-token tail
+    tail = impl.tail_k.clone()
+    calls = []
+    orig = kb.dequant_records
+    monkeypatch.setattr(kb, "dequant_records", lambda *a, **kw: calls.append(a[0].shape[0]) or orig(*a, **kw))
+    outs = {}
+    for mb in ("1", "512"):
+        calls.clear()
+        impl.tail_k.copy_(tail)
+        md, outs[mb] = step(5, 200, mb, kv_cache.clone(), 1)
+        assert md.pack is not None
+        if mb == "1":
+            assert calls == [2, 2, 2, 1]                              # 3 page slices, then the partial page
+        else:
+            assert calls == [6, 1]                                    # one slice of all 6 pages
+    assert torch.equal(outs["1"], outs["512"])
