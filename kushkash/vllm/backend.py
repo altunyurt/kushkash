@@ -67,8 +67,18 @@ def _prefill_mode() -> str:
 
 
 def _pack_bytes() -> int:
-    """Upper bound on the packed K + V buffer of one layer; larger steps take the loop path."""
-    return int(os.environ.get("KUSHKASH_PACK_MB", "1024")) << 20
+    """Budget for the packed K + V buffer of one layer; larger steps take the loop path. History is dequantized
+    into it in slices of at most 1/_PACK_SLICES of the budget, so the step's peak extra memory stays near
+    (1 + 3 / _PACK_SLICES) x the budget: the buffer plus one slice's dequantized K/V, its codes and its
+    token-major copy."""
+    return int(os.environ.get("KUSHKASH_PACK_MB", "512")) << 20
+
+
+_PACK_SLICES = 16
+
+
+def _pack_buffer_bytes(total_k: int, num_kv_heads: int, head_size: int, elem: int) -> int:
+    return 2 * total_k * num_kv_heads * head_size * elem
 
 
 def _ranges(lengths: np.ndarray) -> np.ndarray:
@@ -223,7 +233,9 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
         # mid-page); the ring also grows if a step ever needs more
         max_jobs = 2 * max_reqs + sched.max_num_batched_tokens // PAGE + 1
         self._tail_idx = torch.zeros(max_reqs, dtype=torch.int32, device=device)   # persistent (CUDA graphs)
-        # one upload per step: [req_idx | prefill seq_lens | job_seq | job_page]; the ring grows if ever needed
+        # one upload per step: [req_idx | prefill seq_lens | job_seq | job_page | packed-prefill plan]; the plan
+        # scales with the step's history (~3 ints per history page + ints per tail and chunk token), so a buffer
+        # grows to the largest step seen (event-safe, see _PinnedRing)
         self._ring = _PinnedRing(32, 2 * max_reqs + 2 * max_jobs, device)
         gpu = device.type == "cuda"
         self._sl_bad = torch.zeros((), dtype=torch.bool, device=device)   # host bound != device seq_lens seen
@@ -233,6 +245,12 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
         self._sl_checks = 0                                                 # prefill steps checked
         self._builds = 0                                                    # all steps (flag read cadence)
         self._packed = _prefill_mode() == "packed" and _HAS_FA
+        # for skipping the pack plan of steps whose buffer will not fit the budget (the impl checks again with
+        # the actual tensor dtype); unknown on a spec without these fields: then the impl alone decides
+        hk, hs = getattr(kv_cache_spec, "num_kv_heads", None), getattr(kv_cache_spec, "head_size", None)
+        mdt = getattr(getattr(vllm_config, "model_config", None), "dtype", None)
+        self._pack_elem = (hk, hs, torch.empty((), dtype=mdt).element_size()) if hk and hs and \
+            isinstance(mdt, torch.dtype) else None
         self._arange = torch.arange(PAGE, dtype=torch.int64, device=device)
 
     @staticmethod
@@ -329,7 +347,11 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
             jp = np.fromiter((j[1] for j in jobs), dtype=np.int32, count=len(jobs))
             qlens = qsl[nd + 1:n + 1] - qsl[nd:n]
             fresh = sl[nd:n] == qlens
-            pack = self._pack_plan(nd, n, sl, qlens, req) if self._packed and not fresh.all() else None
+            pack = None
+            if self._packed and not fresh.all() and (
+                    self._pack_elem is None or
+                    _pack_buffer_bytes(int(sl[nd:n].sum()), *self._pack_elem) <= _pack_bytes()):
+                pack = self._pack_plan(nd, n, sl, qlens, req)
             # one host->device copy for everything this step needs; slices of a fresh device tensor are never
             # rewritten under a reader
             parts = [req, sl[nd:n].astype(np.int32), js, jp] + (list(pack[1]) if pack else [])
@@ -513,7 +535,8 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
         qsl = md.qsl_cpu
         kw = {} if self.fa_version is None else {"fa_version": self.fa_version}
         p = md.pack
-        if p is not None and 2 * p.total_k * self.num_kv_heads * self.head_size * k.element_size() <= _pack_bytes():
+        if p is not None and _pack_buffer_bytes(p.total_k, self.num_kv_heads, self.head_size,
+                                                k.element_size()) <= _pack_bytes():
             self._prefill_packed(q, k, v, out, kv_cache, md, kw)
             ops.write(k, v, md.query_start_loc, md.seq_lens, md.tail_idx, md.job_seq, md.job_page, kv_cache,
                       md.block_table, self.tail_k)
@@ -543,10 +566,16 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
         kp = k.new_empty(p.total_k, Hk, D)
         vp = v.new_empty(p.total_k, Hk, D)
         rec, bt = as_records(kv_cache), md.block_table
-        if p.page_row.numel():                        # full history pages: dequantized K and V
-            hk, hv = dequant_records(rec[bt[p.page_row, p.page_idx].long()], D, self.bits, k.dtype)   # [P, Hk, 32, D]
-            kp.index_copy_(0, p.page_dst, hk.transpose(1, 2).reshape(-1, Hk, D))
-            vp.index_copy_(0, p.page_dst, hv.transpose(1, 2).reshape(-1, Hk, D))
+        n_pages = p.page_row.numel()                  # full history pages: dequantized K and V, slice by slice
+        step = max(1, _pack_bytes() // _PACK_SLICES // _pack_buffer_bytes(PAGE, Hk, D, k.element_size()))
+        for p0 in range(0, n_pages, step):
+            p1 = min(n_pages, p0 + step)
+            blocks = bt[p.page_row[p0:p1], p.page_idx[p0:p1]].long()
+            hk, hv = dequant_records(rec[blocks], D, self.bits, k.dtype)                          # [n, Hk, 32, D]
+            dst = p.page_dst[p0 * PAGE:p1 * PAGE]
+            kp.index_copy_(0, dst, hk.transpose(1, 2).reshape(-1, Hk, D))
+            vp.index_copy_(0, dst, hv.transpose(1, 2).reshape(-1, Hk, D))
+            del hk, hv
         if p.tail_row.numel():                        # partial page: exact K from the tail, V from the record
             tv = dequant_records(rec[bt[p.tail_row, p.tail_page].long()], D, self.bits, k.dtype)[1]
             tk = self.tail_k[p.tail_slot]                                                         # [R, Hk, 32, D]

@@ -37,15 +37,22 @@ def fake_flash(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, 
                                                   scale=softmax_scale).transpose(0, 1)
 
 
-@pytest.mark.parametrize("fa,mode", [(False, "loop"), (True, "loop"), (True, "packed"), (True, "packed-fallback")])
+@pytest.mark.parametrize("fa,mode", [(False, "loop"), (True, "loop"), (True, "packed"), (True, "packed-fallback"),
+                                     (True, "packed-sliced")])
 @pytest.mark.parametrize("bits", [4, 8])
 def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
     """loop: history rows per row with LSE merges; packed: all prefill rows in one (fake) flash-attn varlen call;
-    packed-fallback: packed mode with a zero byte budget, so every step falls back to the loop path."""
+    packed-fallback: packed mode with a zero byte budget, so every step falls back to the loop path;
+    packed-sliced: a 1 MiB budget, so history is dequantized in 2-page slices and the larger steps fall back."""
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
     monkeypatch.setenv("KUSHKASH_PREFILL", mode.split("-")[0])
     if mode == "packed-fallback":
         monkeypatch.setenv("KUSHKASH_PACK_MB", "0")
+    if mode == "packed-sliced":
+        monkeypatch.setenv("KUSHKASH_PACK_MB", "1")
+    dq_calls = []
+    orig_dq = kb.dequant_records
+    monkeypatch.setattr(kb, "dequant_records", lambda *a, **kw: dq_calls.append(a[0].shape[0]) or orig_dq(*a, **kw))
     if fa:                                                            # fresh runs -> (fake) flash-attn varlen
         monkeypatch.setattr(kb, "_HAS_FA", True)
         monkeypatch.setattr(kb, "flash_attn_varlen_func", fake_flash, raising=False)
@@ -55,7 +62,7 @@ def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
     monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
     impl = kb.KushAttentionImpl(H * G, D, D ** -0.5, num_kv_heads=H)
     impl.fa_version = None
-    builder = kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], cfg, torch.device("cpu"))
+    builder = kb.KushMetadataBuilder(SimpleNamespace(num_kv_heads=H, head_size=D), ["l0"], cfg, torch.device("cpu"))
     packed_calls = []
     orig_packed = impl._prefill_packed
     impl._prefill_packed = lambda *a, **kw: packed_calls.append(1) or orig_packed(*a, **kw)
@@ -123,7 +130,11 @@ def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
             lens[r] = int(sl[i])
             n = lens[r]
             assert torch.equal(impl.tail_k[slot_of[r], :, :n % PAGE], exact[r][0][:, n // PAGE * PAGE:])
-    assert bool(packed_calls) == (mode == "packed")                   # the packed path ran (and only when asked)
+    assert bool(packed_calls) == (mode in ("packed", "packed-sliced"))  # the packed path ran (and only when asked)
+    if mode == "packed-sliced":
+        # page slices are <= 2 records (the partial-page read is one record per row, <= n_req); at most one
+        # partial-page read per call, so more than 2 calls per packed call means history was split into slices
+        assert max(dq_calls) <= max(2, n_req) and len(dq_calls) > 2 * len(packed_calls)
 
 
 def test_rejects_unsupported_configs(monkeypatch):
@@ -258,3 +269,20 @@ def test_sampled_flag_async_readback(monkeypatch):
     ev.done = True
     with pytest.raises(RuntimeError, match="earlier step"):
         b.build(0, _cam([1, 1], [40, 9]))
+
+
+def test_pack_plan_skipped_over_budget(monkeypatch):
+    """The builder skips the pack plan (and its upload) for a step whose buffer cannot fit the budget."""
+    monkeypatch.setattr(kb, "_HAS_FA", True)
+    monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
+    spec = SimpleNamespace(num_kv_heads=2, head_size=64)
+    cam = _cam([5, 7], [100, 0])                                       # row 0 has 100 tokens of history
+    sizes = []
+    for mb, packed in (("1", True), ("0", False)):
+        monkeypatch.setenv("KUSHKASH_PACK_MB", mb)
+        b = kb.KushMetadataBuilder(spec, ["l0"], make_cfg(max_seqs=4, max_len=256), torch.device("cpu"))
+        orig = b._ring.to_device
+        b._ring.to_device = lambda arr, out=None, orig=orig: sizes.append(arr.shape[0]) or orig(arr, out)
+        md = b.build(0, cam)
+        assert (md.pack is not None) == packed
+    assert sizes[0] > sizes[1] == 2 + 2 + 2 * len(md.job_seq)           # no plan payload when skipped

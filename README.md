@@ -90,9 +90,12 @@ Things to know:
   cache a little more memory, because kushkash keeps a small exact buffer per request slot (see below).
 - **Prompt chunks that follow cached history** (chunked prefill of long prompts, prefix-cache hits) attend to
   the quantized cache. The history of all of a step's prompt rows is dequantized into one temporary buffer per
-  layer and attended with a single flash-attention call. The buffer is capped at `KUSHKASH_PACK_MB` MiB per layer
-  (default 1024); larger steps, and `KUSHKASH_PREFILL=loop`, handle each request separately instead (slower, less
-  temporary memory).
+  layer and attended with a single flash-attention call. The buffer is capped at `KUSHKASH_PACK_MB` MiB
+  (default 512); while it is filled, up to about a fifth of that again is in use, so the extra GPU memory of
+  such a step stays below about 1.2x the cap. It is not part of vLLM's memory plan: on a GPU with little
+  headroom, lower the cap or `gpu_memory_utilization`. Larger steps, and `KUSHKASH_PREFILL=loop`, handle each
+  request separately instead (slower, less temporary memory). One 14k-token prompt of Qwen2.5-7B needs about
+  30 MB.
 - **Supported features:** chunked prefill, prefix caching, preemption, CUDA graphs (full graphs for steps that
   only decode; steps that also process prompts run in piecewise mode), and `torch.compile`.
 - **Requirements and limits:** vLLM 0.31.x with its default model runner, NVIDIA GPUs, decoder-only models with
