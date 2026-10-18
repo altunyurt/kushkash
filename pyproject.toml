@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kushkash"
-version = "0.3.8"     # keep in sync with kushkash/__init__.py
+version = "0.3.9"     # keep in sync with kushkash/__init__.py
 description = "Paged int4/int8 KV cache with fused Mojo decode attention (CUDA + CPU), drop-in for vLLM and Hugging Face transformers"
 readme = "README.md"
 requires-python = ">=3.10"
