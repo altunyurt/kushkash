@@ -75,6 +75,51 @@ def test_vllm_backend(reference, bits, eager, prefix, prefill):
         assert same >= 5, (r["texts"], reference["texts"])
 
 
+OFFLOAD_CHILD = r'''
+import json, sys
+from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer
+offload = float(sys.argv[1])
+extra = {"kv_offloading_size": offload, "kv_offloading_backend": "native"} if offload else {}
+llm = LLM(model=MODEL, max_model_len=8192, kv_cache_memory_bytes=int(0.35 * 2**30), seed=0, attention_backend="CUSTOM",
+          enable_prefix_caching=True, enable_chunked_prefill=True, max_num_batched_tokens=2048,
+          disable_log_stats=False, **extra)
+cap = llm.llm_engine.vllm_config.cache_config.kv_cache_size_tokens
+tok = AutoTokenizer.from_pretrained(MODEL)
+filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
+prompts, keys = [], []
+for i, key in enumerate(("31415", "27182", "16180", "14142")):
+    body = filler * (10 + 15 * i) + f" The pass key is {key}. Remember it. " + filler * (130 - 15 * i)
+    msg = [{"role": "user", "content": body + "\nWhat is the pass key? Answer with the number only."}]
+    prompts.append(tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True))
+    keys.append(key)
+
+def ext_hits():
+    return sum(getattr(m, "value", 0) for m in llm.get_metrics() if m.name == "vllm:external_prefix_cache_hits")
+
+sp = SamplingParams(max_tokens=16, temperature=0)
+first = [o.outputs[0].text for o in llm.generate(prompts, sp, use_tqdm=False)]
+words = filler.split()
+flush = [f"[{i}] " + " ".join(words[(i + j) % len(words)] for j in range(1500)) for i in range(2 * cap // 1800 + 1)]
+llm.generate(flush, SamplingParams(max_tokens=1), use_tqdm=False)   # 2x the GPU cache: prompts leave the GPU
+h0 = ext_hits()
+again = [o.outputs[0].text for o in llm.generate(prompts, sp, use_tqdm=False)]
+print("RESULT " + json.dumps({"first": first, "again": again, "keys": keys, "ram_hits": ext_hits() - h0}))
+'''.replace("MODEL", repr(MODEL))
+
+
+def test_vllm_ram_tier():
+    """vLLM's CPU offloading (kv_offloading_size) stores and reloads kushkash pages as opaque bytes: after the
+    prompts are pushed out of the GPU cache, they come back from RAM and give the same greedy text."""
+    p = subprocess.run([sys.executable, "-c", OFFLOAD_CHILD, "2"], env=dict(os.environ, KUSHKASH_BITS="4"),
+                       capture_output=True, text=True, timeout=1800)
+    line = next((l for l in p.stdout.splitlines() if l.startswith("RESULT ")), None)
+    assert line, p.stderr[-3000:]
+    r = json.loads(line[7:])
+    assert r["ram_hits"] > 0, r                                     # served from RAM, not recomputed
+    assert r["again"] == r["first"], r                              # reloaded pages are byte-exact
+    assert all(k in t for k, t in zip(r["keys"], r["first"])), r
+
 if __name__ == "__main__":     # bisect: which vLLM execution mode breaks the backend?  python tests/test_vllm_gpu.py [mode]
     if len(sys.argv) > 1 and sys.argv[1] == "check":   # one default-mode run, layer 0 checked against torch
         log = os.path.abspath("kushkash_check.log")

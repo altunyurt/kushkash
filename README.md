@@ -123,6 +123,32 @@ Things to know:
   error) for speculative decoding, sliding-window attention, ALiBi, logit soft-capping, attention sinks, MLA
   models and cross-layer KV sharing.
 
+### System RAM as a second cache tier
+
+vLLM's own CPU offloading works with kushkash unchanged: pages are copied to and from RAM as they are, so RAM
+holds 3.46x more context (int4) than it would with vLLM's default cache. This pays off when earlier context
+comes back: multi-turn chats, agents, shared document prefixes. A returning session is copied back over PCIe
+instead of being recomputed.
+
+```bash
+vllm serve Qwen/Qwen2.5-7B-Instruct --attention-backend CUSTOM --kv-offloading-size 10    # GiB of RAM
+```
+
+Measured on one L4 (Qwen2.5-7B-Instruct, vLLM 0.31, 4 GiB of GPU KV cache, 10 GiB of RAM for both cache
+types): 40 conversations with 12k-token histories, revisited one at a time in random order, each with a new turn.
+
+| | vLLM default (bf16) + RAM | kushkash int4 + RAM |
+|---|---|---|
+| Revisit served from GPU / RAM / recomputed | 1.5% / 6.3% / 92.2% | 25% / 74% / 1% |
+| Time to first token, median | 3.81 s | **0.137 s** |
+
+The 10 GiB of RAM holds the whole conversation set as int4 pages but not as bf16 pages, so the bf16 cache
+keeps evicting what it needs next. When everything fits either way (12 conversations), both reload quickly
+(0.166 s bf16, 0.115 s int4 straight from the GPU), so the gain is how much fits, not copy speed. Without
+returning context there is nothing to reload and no gain. vLLM offloads prompt tokens only by default; earlier
+replies in a chat are recomputed (pass `kv_transfer_config={"kv_connector_extra_config":
+{"offload_prompt_only": False}}` to offload them too). Reproduce with `python bench/offload_reuse.py`.
+
 ## Using it with Hugging Face transformers
 
 ```python
@@ -247,7 +273,7 @@ pytest tests/test_cpu.py                # runs anywhere: format, kernels vs a re
 pytest tests/test_ragged.py             # runs anywhere: vLLM-style mixed batches against ground truth
 pytest tests/test_vllm_backend_cpu.py   # needs vLLM importable: the vLLM backend driven on CPU
 pytest tests/test_gpu.py                # NVIDIA GPU: GPU vs CPU pages, decode vs reference, HF on GPU
-pytest tests/test_vllm_gpu.py -s       # NVIDIA GPU + vLLM: end-to-end serving (passkey retrieval, prefix caching)
+pytest tests/test_vllm_gpu.py -s       # NVIDIA GPU + vLLM: end-to-end serving (passkey retrieval, prefix caching, RAM tier)
 python tests/test_vllm_gpu.py           # same, once per vLLM execution mode (eager, compiled, CUDA graphs, ...)
 ```
 
@@ -257,6 +283,10 @@ Benchmarks (all print their results; nothing is uploaded anywhere):
 # vLLM: KV capacity, perplexity, passkey retrieval and throughput for several cache types
 python bench/vllm_compare.py --kv auto,kush4,kush8
 python bench/vllm_compare.py --kv auto,kush4@64 --only-throughput --tp-n 256 --tp-len 2048 --tp-out 2048 --batched-tokens 8192
+
+# vLLM: RAM as a second cache tier (multi-turn time to first token; correctness of offloaded pages)
+python bench/offload_reuse.py
+python bench/offload_check.py
 
 # vLLM's own memory accounting for one configuration
 python bench/mem_probe.py kush4
