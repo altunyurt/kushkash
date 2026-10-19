@@ -50,9 +50,12 @@ class _KushLayer(CacheLayerMixin):
         return kv.length(self.idx) if kv is not None else 0
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:
+        """transformers only needs this to size its buffers; the mask itself is never materialized
+        (see kush_mask). Full causal: the whole cache plus the new chunk, no offset."""
         return self.get_seq_length() + query_length, 0
 
     def get_max_length(self) -> int:
+        """-1 = unbounded: the page pool grows on demand (KushCache._map)."""
         return -1
 
     def reset(self) -> None:
@@ -97,13 +100,15 @@ class KushHFCache(Cache):
         super().__init__(layers=[_KushLayer(self, i) for i in range(self.num_layers)])
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        """transformers calls this and then the attention function, once per layer. Nothing is stored
+        here: the attention function receives the same new chunk and writes it in its own pass."""
         if self.kv is None:
             B, H, _, D = key_states.shape
             self.kv = KushCache(self.num_layers, H, self.num_q_heads, D, batch_size=B, bits=self.bits,
                                 device=key_states.device, dtype=key_states.dtype, max_length=self.max_length)
         self.layers[layer_idx].is_initialized = True
-        _active.cache = self
-        return key_states, value_states
+        _active.cache = self                # kush_attention gets no cache argument: this is the hand-off
+        return key_states, value_states     # unchanged: the attention consumes the chunk, not the cache
 
     def memory(self):
         """MemoryStats of the underlying KushCache (None before the first forward)."""

@@ -6,6 +6,17 @@
 # Every entry point takes the runtime head size D and BITS, dispatches to a comptime-
 # specialized implementation (D in {64, 128, 256}, BITS in {4, 8}) and returns 0, or -1
 # for an unsupported shape.
+#
+# How the work is split:
+#   kush_cpu_append / kush_cpu_write : one thread walks sequences and heads; the vector unit
+#       works on W = simd_width_of[Float32] channels at a time. The GPU kernels instead use one
+#       thread (or one lane) per channel; the arithmetic is the same, so pages match bit for bit.
+#   kush_cpu_decode : one task per (sequence, kv head), spread with sync_parallelize. Below ~256
+#       pages of work the thread pool costs more than it saves, so the tasks run inline.
+#
+# Decode never materializes dequantized K or V: the per-page K scale is folded into q, the
+# per-channel K bias into one scalar per head, the per-token V scale into the softmax weights and
+# the V bias into one scalar per head (the same trick as kush/gpu.mojo).
 
 from std.math import exp
 from std.memory import alloc, Layout, stack_allocation
@@ -23,16 +34,22 @@ comptime V32 = SIMD[DType.float32, W]
 
 @always_inline
 def _p[T: AnyType](addr: Int64) -> Pointer[T, MutUntrackedOrigin]:
+    """Raw address handed over by ctypes. The Python side owns every buffer and keeps it alive for the
+    duration of the call, so the pointer is untracked by design."""
     return Pointer[T, MutUntrackedOrigin](unsafe_from_address=Int(addr))
 
 
 def _buf(n: Int) -> F32P:
+    """fp32 decode scratch. `n` is a runtime value (G is not comptime here), so it cannot live on the
+    stack; it is leaked out of the allocator into a raw pointer and freed once at the end of the task."""
     return alloc(Layout[Float32](count=max(n, 1))).unsafe_leak()
 
 
 @fieldwise_init
 struct _Cache(ImplicitlyCopyable):
-    """One layer's page records, K tails and per-sequence tables (layouts: kush/gpu.mojo)."""
+    """One layer's page records, K tails and per-sequence tables (layouts: kush/gpu.mojo).
+    Record of (physical block b, kv head h) at cache + b*block_stride + h*head_stride; the exact K
+    of the page being filled at tail_k + (slot*Hkv + h)*P*D (slot = tail_idx[sequence])."""
     var cache: I8P
     var block_stride: Int
     var head_stride: Int
@@ -63,9 +80,17 @@ def _cache(cache: Int64, bs: Int64, hs: Int64, tail_k: Int64, tail_idx: Int64,
 
 # ------------------------------------------------------------------ write path
 def _quantize_k_page[D: Int, BITS: Int](ka: F32P, sa: Int, kb_src: F32P, skb: Int, split: Int, rec: I8P):
-    """K of one page (per-channel ranges), W channels per SIMD op. Token row t < split comes
-    from ka + t*sa (the tail), the rest from kb_src + (t - split)*skb.
-    Same arithmetic (kush/quant.mojo) as the GPU _quantize_k_page (kush/gpu.mojo)."""
+    """K of one page (per-channel ranges over the page's P tokens), W channels per SIMD op.
+    Token row t < split comes from ka + t*sa (the tail: those tokens were written by earlier steps),
+    the rest from kb_src + (t - split)*skb (this step's new rows).
+
+    Two passes, because a channel's range must be known before any code of that channel is fixed:
+    pass 1 reduces min/max over the P rows per channel group and stores the fp16-rounded scale and
+    bias; pass 2 re-reads the rows and quantizes. int4 packs dim j and dim j + D/2 into one byte
+    (the record layout), so j only walks half the channels.
+
+    Same arithmetic (kush/quant.mojo) as the GPU _quantize_k_page (kush/gpu.mojo), so the pages are
+    bit-identical across backends."""
     comptime DC = row_bytes[D, BITS]()
     comptime NCH = D if BITS == 8 else D // 2
     var kc = rec
@@ -103,7 +128,11 @@ def _quantize_k_page[D: Int, BITS: Int](ka: F32P, sa: Int, kb_src: F32P, skb: In
 
 
 def _quantize_v_row[D: Int, BITS: Int](row: F32P, rec: I8P, t: Int):
-    """V token row -> row t of a record (per-token range: this is its final encoding)."""
+    """V token row -> row t of a record (per-token range: this is its final encoding).
+    V ranges are per token over the D channels, so a row needs no other row to be quantized: it can
+    be written the moment the token arrives, and a partially filled page already has valid V (that
+    is what lets the packed prefill read a half-written page). The single scalar scale/bias pair
+    covers all D channels, so the range is reduced across the vector first."""
     comptime DC = row_bytes[D, BITS]()
     comptime NCH = D if BITS == 8 else D // 2
     var vc = rec.unsafe_offset(off_vq[D, BITS]())
@@ -127,6 +156,11 @@ def _quantize_v_row[D: Int, BITS: Int](row: F32P, rec: I8P, t: Int):
 
 def _append[D: Int, BITS: Int](k_new: F32P, v_new: F32P, ks: Int, vs: Int, seq_lens: I32P, pos_offset: Int,
                                advance: Bool, cc: _Cache, S: Int):
+    """One new token per sequence (decode step). K goes to its exact slot in the tail; V is quantized
+    straight into row `slot` of the page record. If that slot was the last of the page, the page is
+    complete and its K is quantized from the tail (split = P: every token is already there).
+    The token's position is seq_lens[s] + pos_offset (HF: 0 and advance; vLLM: -1 because seq_lens
+    already counts it); advance stores pos + 1 back."""
     var H = cc.hkv
     for s in range(S):
         var pos = Int(seq_lens[unsafe_offset=s]) + pos_offset
@@ -147,7 +181,11 @@ def _append[D: Int, BITS: Int](k_new: F32P, v_new: F32P, ks: Int, vs: Int, seq_l
 
 def _write[D: Int, BITS: Int](k_new: F32P, v_new: F32P, ks: Int, vs: Int, qsl: I32P, seq_lens: I32P,
                               job_seq: I32P, job_page: I32P, n_jobs: Int, mode: Int, cc: _Cache):
-    """Same contract as the GPU kush_write (one call per mode)."""
+    """Same contract as the GPU kush_write (one call per mode).
+    mode 0: write every job's new V rows; for a page that is now complete, quantize its K (older
+            tokens from the tail, newer ones from this step's rows).
+    mode 1: for a page that is still partial, copy its new K rows into the tail.
+    The caller issues mode 0 for all jobs, then mode 1, so the two never race on one tail."""
     var H = cc.hkv
     for j in range(n_jobs):
         var s = Int(job_seq[unsafe_offset=j])
@@ -178,7 +216,9 @@ def _write[D: Int, BITS: Int](k_new: F32P, v_new: F32P, ks: Int, vs: Int, qsl: I
 # ------------------------------------------------------------------ decode
 @always_inline
 def _codes[D: Int, BITS: Int](row: I8P, d: Int) -> Tuple[V32, V32]:
-    """Codes of dims [d, d+W) (int8) or ([d, d+W), [d+D/2, d+D/2+W)) (int4, d < D/2) as fp32."""
+    """Codes of dims [d, d+W) (int8) or ([d, d+W), [d+D/2, d+D/2+W)) (int4, d < D/2) as fp32.
+    int4: one byte holds dim d in its low nibble and dim d + D/2 in its high nibble; codes are
+    two's complement, so (b << 4) >> 4 sign-extends the low nibble and b >> 4 the high one."""
     var b = row.unsafe_load[width=W](d)
     comptime if BITS == 8:
         return (b.cast[DType.float32](), V32(0))
@@ -188,12 +228,18 @@ def _codes[D: Int, BITS: Int](row: I8P, d: Int) -> Tuple[V32, V32]:
 
 def _decode_task[D: Int, BITS: Int](q: F32P, o: F32P, cc: _Cache, seq_lens: I32P, G: Int,
                                     sm: Float32, s: Int, h: Int):
-    """Attention of the G q heads of (sequence s, kv head h) over the whole cache."""
+    """Attention of the G q heads of (sequence s, kv head h) over the whole cache.
+    Per full page: fold the page's K scale into q and its K bias into one scalar per head, compute
+    the P scores, then run the page-granular online softmax and accumulate the V rows. The last,
+    partial page takes its K from the exact tail and its V rows from the record."""
     comptime DC = row_bytes[D, BITS]()
     comptime NCH = D if BITS == 8 else D // 2
     var H = cc.hkv
     var n = Int(seq_lens[unsafe_offset=s])
     var qb = (s * H + h) * G * D
+    # scratch: per head a [G][D] copy of q*sm, a [G][D] copy with the page's k_scale folded in and a
+    # [G][D] accumulator, plus one [D] row of unpacked codes, the [G][P] scores and 4 scalars per head
+    # (running max, running sum, V-bias accumulator, K-bias dot).
     var scr = _buf(G * D * 3 + D + G * (P + 4))
     var qsm = scr                                 # q * sm                       [G][D]
     var qs = scr.unsafe_offset(G * D)             # q * sm * k_scale (this page) [G][D]
@@ -330,6 +376,9 @@ def _decode[D: Int, BITS: Int](q: F32P, o: F32P, cc: _Cache, seq_lens: I32P, G: 
 
 
 # ------------------------------------------------------------------ C ABI entry points
+# `comptime for` + a runtime `if`: every D/BITS pair gets its own specialized body (W, the record
+# offsets and the int4-only branches fold away), while the entry point itself stays a plain C
+# function with fixed arguments. Unsupported shapes fall through to the -1 return.
 comptime _DIMS = [64, 128, 256]
 
 

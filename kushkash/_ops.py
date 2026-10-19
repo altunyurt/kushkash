@@ -29,6 +29,9 @@ def record_bytes(head_dim: int, bits: int) -> int:
 
 
 def _byte_strides(cache: torch.Tensor) -> tuple[int, int]:
+    """Block and head strides in bytes, which is what the kernels take: a cache can be a slice of a
+    larger tensor (the vLLM backend hands over vLLM's own allocation), so the strides need not be
+    the packed ones."""
     e = cache.element_size()
     return cache.stride(0) * e, cache.stride(1) * e
 

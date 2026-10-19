@@ -212,7 +212,10 @@ def kush_write[D: Int, BITS: Int, IN: DType](
 # ------------------------------------------------------------------ shared decode helpers
 @always_inline
 def _byte_f32[k: Int](w: UInt32) -> Float32:
-    """Unsigned byte k of w -> fp32 exactly: prmt puts it under exponent 0x4B (2^23 + u)."""
+    """Unsigned byte k of w -> fp32 exactly: prmt puts it under exponent 0x4B (2^23 + u).
+    A float with bits 0x4B000000 | u is exactly 2^23 + u (exponent 23, and u < 2^23 is exact in the
+    mantissa), so one subtract of 2^23 turns the byte into the integer as a float without an
+    int->float conversion. 4 bytes per word, one prmt each."""
     comptime sel = UInt32(k | (4 << 4) | (5 << 8) | (7 << 12))
     var bits = inlined_assembly["prmt.b32 $0, $1, $2, $3;", UInt32, constraints="=r,r,r,r"](
         w, UInt32(0x4B000000), sel)
@@ -229,7 +232,9 @@ def _w2f(w: UInt32) -> SIMD[DType.float32, 4]:
 
 @always_inline
 def _w_to_h4[HALF: Int](w: UInt32) -> SIMD[DType.float16, 4]:
-    """4 unsigned code bytes (u = c + HALF) -> signed codes c as fp16, exact (2 values / op)."""
+    """4 unsigned code bytes (u = c + HALF) -> signed codes c as fp16, exact (2 values / op).
+    The same trick as _byte_f32 in fp16: prmt moves a byte under fp16's exponent for 1024 (0x64),
+    then subtracting 1024 + HALF undoes both the exponent bias and the code offset in one add."""
     var lo = inlined_assembly["prmt.b32 $0, $1, $2, $3;", UInt32, constraints="=r,r,r,r"](w, H64, UInt32(0x4140))
     var hi = inlined_assembly["prmt.b32 $0, $1, $2, $3;", UInt32, constraints="=r,r,r,r"](w, H64, UInt32(0x4342))
     var off = SIMD[DType.float16, 2](Float16(1024 + HALF))
@@ -238,6 +243,8 @@ def _w_to_h4[HALF: Int](w: UInt32) -> SIMD[DType.float16, 4]:
 
 @always_inline
 def _split_range(full: Int, n_splits: Int, z: Int) -> Tuple[Int, Int]:
+    """[start, end) in pages for split z: ceil(full / n_splits) pages each. A split can come out
+    empty (more splits than pages), which the callers handle as a no-op."""
     var pps = (full + n_splits - 1) // n_splits
     var start = min(full, z * pps)
     return (start, min(full, start + pps))
@@ -247,6 +254,8 @@ def _split_range(full: Int, n_splits: Int, z: Int) -> Tuple[Int, Int]:
 def _load_q[D: Int, G: Int, NW: Int, IN: DType](
     q: Pointer[Scalar[IN], MutAnyOrigin], qbase: Int, sm: Float32, qsm: SF32P,
 ):
+    """q * softmax scale into shared memory, once per block; the per-page K scale is then folded into
+    this shared copy instead of re-scaling q from global memory for every page."""
     for i in range(Int(thread_idx.x), G * D, NW * WARP):
         qsm[unsafe_offset=i] = Float32(q[unsafe_offset=qbase + i]) * sm
     barrier()
@@ -318,6 +327,9 @@ def kush_combine[D: Int, G: Int, IN: DType](
 
 @always_inline
 def _kphys[D: Int, BITS: Int, kt: Int](tid: Int) -> Int:
+    """Physical dim lane (g, tid) covers for k-tile kt: dims c*64 + tid*16 + j*4 + {0..3}. Choosing
+    this permutation is what lets each lane's B fragment be one aligned 32-bit word of a K row;
+    int4 needs a separate permutation for the low-nibble and the high-nibble tiles."""
     comptime HT = D // 32
     comptime if BITS == 8 or kt < HT:
         return (kt // 4) * 64 + tid * 16 + (kt % 4) * 4
@@ -350,6 +362,9 @@ def _load_page_tc[D: Int, BITS: Int](
 
 @always_inline
 def _quad_sum(x: Float32) -> Float32:
+    """Sum over the 4 lanes of a quad (lane // 4 = q head g, lane % 4 = tid). Those 4 lanes split
+    the page's tokens and the contraction dims between them, so a quad reduction is a full reduce
+    for one q head: 2 shuffle_xor steps, no shared memory."""
     var y = x + warp.shuffle_xor(x, UInt32(1))
     return y + warp.shuffle_xor(y, UInt32(2))
 
@@ -362,6 +377,8 @@ def _quad_max(x: Float32) -> Float32:
 
 @always_inline
 def _rescale_ot[MT: Int](o: LF32P, ca: Float32, cb: Float32):
+    """Rescale the O^T accumulators after a softmax correction. Each lane holds two q heads (columns
+    0, 2 and 1, 3 of the 4-wide fragment), so the two corrections are applied separately."""
     comptime for mt in range(MT):
         o[unsafe_offset=mt * 4 + 0] *= ca
         o[unsafe_offset=mt * 4 + 1] *= cb

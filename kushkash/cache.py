@@ -97,7 +97,11 @@ class KushCache:
         self.pool, self._pages = new, n
 
     def _map(self, need: int) -> None:
-        """Ensure logical pages [0, need) of every sequence are mapped to physical pages."""
+        """Ensure logical pages [0, need) of every sequence are mapped to physical pages.
+        block_table is [B, max_pages] int32 (logical page -> physical page, the same table the kernels
+        and vLLM read). Pages come from a bump allocator (`_next`): a sequence's pages are never freed,
+        so a table entry stays valid until reset() rewinds the allocator, and the pool only grows. Every
+        sequence advances together, so `_mapped` is one number, not one per sequence."""
         if need <= self._mapped:
             return
         if self._frozen_ns:
@@ -119,7 +123,12 @@ class KushCache:
         return self._len[layer]
 
     def write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
-        """Append T new tokens for every sequence. k, v: [B, Hkv, T, D]."""
+        """Append T new tokens for every sequence. k, v: [B, Hkv, T, D].
+        T == 1 (decode) takes the append kernel, which also advances seq_lens itself. A longer chunk
+        takes the ragged write kernel with one job per (sequence, logical page) touched: a chunk can
+        span pages, and a page's K can only be quantized once all of its tokens are in, so the kernel
+        needs to know which pages this step completes. seq_lens must already count the new tokens
+        (vLLM's convention), so it is filled here first."""
         B, H, T, D = k.shape
         if (B, H, D) != (self.B, self.H, self.D) or v.shape != k.shape:
             raise ValueError(f"expected k, v of shape [{self.B}, {self.H}, T, {self.D}], got {tuple(k.shape)}")
@@ -146,7 +155,12 @@ class KushCache:
 
     def attend(self, layer: int, q: torch.Tensor) -> torch.Tensor:
         """Decode attention of one query token per sequence over the whole cache.
-        q: [B, Hq, D] (q head i uses kv head i // G). Returns [B, Hq, D] in self.dtype."""
+        q: [B, Hq, D] (q head i uses kv head i // G). Returns [B, Hq, D] in self.dtype.
+
+        ns is the split-K factor (GPU only): the pages of a long sequence are split across blocks and
+        the partial (out, lse) results are merged by a second kernel, which writes them into `_work`:
+        first S*H*ns*G*2 floats of (m, l), then S*H*ns*G*D floats of unnormalized output. The buffer
+        only grows, and freeze() fixes its size for CUDA graphs."""
         if self._len[layer] == 0:
             raise RuntimeError("attend() on an empty cache")
         q = q.to(self.kdtype).contiguous()
