@@ -80,6 +80,22 @@ kushkash.build("cuda", head_dim=128, bits=4, group=7, dtype="bfloat16")   # grou
 kushkash.build("cpu")
 ```
 
+### CPU-only machines
+
+Pick PyTorch's CPU wheel and nothing GPU-side is installed: the CUDA libraries come from torch, not from
+kushkash, and the CPU kernels use only the Mojo standard library.
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # no nvidia-* wheels
+pip install kushkash                                                 # keeps that torch
+
+uv pip install --torch-backend=cpu kushkash                          # or let uv pick the wheel
+```
+
+Everything else stays the same: `KushCache(..., device="cpu")`, the Hugging Face wrapper on CPU and
+`kushkash.build("cpu")` work with no GPU present. The Mojo compiler (`mojo`, `max-core`) is still needed to
+build the CPU kernel on first use; it has no CUDA dependencies either.
+
 ## Using it with vLLM
 
 Installing the package registers a vLLM plugin. Select the backend with `--attention-backend CUSTOM`:

@@ -1,0 +1,36 @@
+name: cpu
+
+# The CPU path must install and run with no GPU stack: torch's CPU wheel, no nvidia-* packages.
+# See README "Installation / CPU-only machines".
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpu-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: torch's CPU build (no CUDA wheels)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: kushkash + test deps (the torch requirement is already satisfied, so pip keeps the CPU wheel)
+        run: pip install ".[test]"
+
+      - name: assert nothing CUDA is installed
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import torch
+          assert torch.version.cuda is None, f"torch is a CUDA build: {torch.__version__}"
+          assert importlib.util.find_spec("nvidia") is None, "nvidia-* wheels were installed"
+          print("cpu-only:", torch.__version__)
+          PY
+
+      - name: CPU tests (Mojo kernels compile on first use)
+        run: python -m pytest tests/test_cpu.py tests/test_ragged.py -q
