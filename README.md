@@ -29,6 +29,26 @@ per-channel offsets (for example Qwen2.x), where plain 8-bit float caches can lo
 It helps most when the KV cache is your bottleneck: many concurrent requests, long prompts, long outputs. With
 only a few short requests, model weights dominate memory and time, and you will see little difference.
 
+### Measured: Qwen2.5-7B-Instruct on one NVIDIA L4, vLLM 0.31
+
+Same GPU, same model, same 4 GiB KV cache budget for every cache type. Throughput is sustained output
+tokens/s over 300 s with the queue kept full (2,048-token prompts, 2,048 output tokens each); each cache type
+is shown at its best `max_num_seqs`.
+
+| | vLLM default (bf16) | kushkash int4 | | kushkash int8 | |
+|---|---|---|---|---|---|
+| KV cache capacity (tokens) | 74,896 | 259,104 | **3.46x** | 138,912 | **1.85x** |
+| Requests that fit at 4k tokens each | 18 | 63 | **3.50x** | 33 | 1.83x |
+| Output tokens/s, sustained | 256.0 | 619.3 | **2.42x** | — | |
+| Requests in flight (mean) | 24.5 | 62.7 | 2.56x | — | |
+| Preemptions (work thrown away) in 300 s | 33 | 0 | | — | |
+| Perplexity (WikiText-2, chunked prefill) | 6.001 | 6.013 | | 5.999 | |
+| Passkey retrieval, 8k / 16k | 10/10, 10/10 | 10/10, 10/10 | | 10/10, 10/10 | |
+
+The gain depends on how tight the cache is: with a larger KV budget, or short requests, more of each step
+goes to the model weights and the throughput ratio shrinks. Reproduce with `python bench/headline.py --sweep`
+(about 75 minutes on an L4); the other `max_num_seqs` settings it tries are printed under the table.
+
 ## Requirements
 
 - Python 3.10 or newer, PyTorch 2.5 or newer.

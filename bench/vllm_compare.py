@@ -48,11 +48,12 @@ def run_one(a):
     llm = LLM(model=a.model, max_model_len=a.max_len, gpu_memory_utilization=a.mem,
               enable_prefix_caching=False, enable_chunked_prefill=True, max_num_batched_tokens=a.batched_tokens,
               **({"max_num_seqs": a.max_num_seqs} if a.max_num_seqs else {}),
+              **({"kv_cache_memory_bytes": int(a.kv_gib * 2**30)} if a.kv_gib else {}),
               quantization=a.quantization, seed=0, disable_log_stats=False, **extra)   # stats: preemptions etc.
     cc = llm.llm_engine.vllm_config.cache_config
     log(f"engine ready: KV capacity {cc.kv_cache_size_tokens} tokens")
     res = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "kv_tokens": cc.kv_cache_size_tokens,
-           "attn_block": cc.effective_attention_block_size,
+           "attn_block": cc.effective_attention_block_size, "kv_gib": a.kv_gib,
            "max_num_seqs": llm.llm_engine.vllm_config.scheduler_config.max_num_seqs}
 
     rng = random.Random(0)
@@ -87,12 +88,19 @@ def run_one(a):
             res[f"passkey_{L // 1024}k"] = f"{sum(k in o.outputs[0].text for k, o in zip(keys, outs))}/{len(keys)}"
             log(f"   passkey {L // 1024}k = {res[f'passkey_{L // 1024}k']}")
 
+    if a.no_throughput:
+        print("RESULT " + json.dumps(res), flush=True)
+        return
     # 3. throughput: N random-token prompts of length L, tp_out output tokens, ignore_eos
     prompts = [TokensPrompt(prompt_token_ids=[rng.randint(100, 20000) for _ in range(a.tp_len)])
                for _ in range(a.tp_n)]
     sp = SamplingParams(max_tokens=a.tp_out, temperature=0, ignore_eos=True)
     log(f"3/3 throughput: {a.tp_n} prompts x {a.tp_len} in / {a.tp_out} out (progress bar below)")
     llm.generate(prompts[:2], SamplingParams(max_tokens=4), use_tqdm=False)          # warm-up
+    if a.tp_seconds:
+        res.update(_steady(llm, prompts, a))
+        print("RESULT " + json.dumps(res), flush=True)
+        return
     m0 = _metrics(llm)
     running, stop = [], threading.Event()
 
@@ -133,11 +141,18 @@ def main():
     ap.add_argument("--batched-tokens", type=int, default=256, help="prefill chunk (small = cache-heavy ppl)")
     ap.add_argument("--max-num-seqs", type=int, default=None,
                     help="vLLM max_num_seqs for all configs; per config: --kv auto@17,kush4@56")
+    ap.add_argument("--kv-gib", type=float, default=None,
+                    help="pin the KV cache budget (vLLM kv_cache_memory_bytes, GiB) so every config gets the same bytes; "
+                         "default: vLLM profiles free memory per run (budget varies run to run)")
     ap.add_argument("--quantization", default=None, help="weights, e.g. bitsandbytes / awq for small GPUs")
     ap.add_argument("--passkey-trials", type=int, default=10)
     ap.add_argument("--tp-n", type=int, default=64)
     ap.add_argument("--tp-len", type=int, default=4096)
     ap.add_argument("--tp-out", type=int, default=128, help="output tokens per prompt (large = decode/capacity bound)")
+    ap.add_argument("--tp-seconds", type=float, default=0,
+                    help="sustained mode: measure output tok/s over this window once the first request finishes, "
+                         "then abort the rest (0 = run all --tp-n prompts to completion)")
+    ap.add_argument("--no-throughput", action="store_true", help="capacity + ppl / passkey only")
     ap.add_argument("--only-throughput", action="store_true", help="skip ppl / passkey")
     ap.add_argument("--quick", action="store_true", help="smoke run: 3 passkey trials, 8k only, 16 x 2k throughput")
     ap.add_argument("--verbose", action="store_true", help="show all vLLM log lines")
@@ -156,8 +171,8 @@ def main():
         free = wait_gpu_free()
         log(f"GPU free memory at start: {free:.2f} GiB")
         cmd = [sys.executable, "-u", __file__, "--one", "--kv", kv] + [
-            x for k, v in vars(a).items() if k not in ("kv", "one", "quick", "verbose", "out", "only_throughput")
-            and v is not None for x in (f"--{k.replace('_', '-')}", str(v))] + (["--only-throughput"] if a.only_throughput else [])
+            x for k, v in vars(a).items() if k not in ("kv", "one", "quick", "verbose", "out", "only_throughput", "no_throughput")
+            and v is not None for x in (f"--{k.replace('_', '-')}", str(v))] + (["--only-throughput"] if a.only_throughput else []) + (["--no-throughput"] if a.no_throughput else [])
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True, bufsize=1)  # stderr: live bars/errors
         line_res, tail = None, []
         for line in p.stdout:
@@ -181,6 +196,53 @@ def main():
         print("\n| " + " | ".join(keys) + " |\n|" + "---|" * len(keys))
         for r in rows:
             print("| " + " | ".join(str(r.get(k, "")) for k in keys) + " |")
+
+
+def _steady(llm, prompts, a) -> dict:
+    """Sustained throughput: keep the queue full, start the clock when the first request finishes (the cache is
+    full and requests are leaving and joining), count output tokens for a.tp_seconds, then abort the rest."""
+    from vllm import SamplingParams
+    from vllm.sampling_params import RequestOutputKind
+    eng = llm.llm_engine
+    sp = SamplingParams(max_tokens=a.tp_out, temperature=0, ignore_eos=True, output_kind=RequestOutputKind.DELTA)
+    for i, p in enumerate(prompts):
+        eng.add_request(str(i), p, sp)
+    log(f"3/3 sustained throughput: {len(prompts)} queued, clock starts at the first completion, {a.tp_seconds:.0f} s window")
+    t0 = m0 = None
+    toks = steps = done = 0
+    finished = set()
+    running, last_sample = [], 0.0
+    while eng.has_unfinished_requests():
+        outs = eng.step()
+        now = time.perf_counter()
+        finished.update(o.request_id for o in outs if o.finished)
+        if t0 is None:
+            if any(o.finished for o in outs):
+                t0, m0, last_sample = now, _metrics(llm), now
+                log("   first completion: window open")
+            continue
+        steps += 1
+        toks += sum(len(o.outputs[0].token_ids) for o in outs)
+        done += sum(o.finished for o in outs)
+        if now - last_sample >= 0.5:
+            running.append(_metrics(llm).get("vllm:num_requests_running", 0))
+            last_sample = now
+        if now - t0 >= a.tp_seconds:
+            break
+    dt = time.perf_counter() - t0
+    left = eng.get_num_unfinished_requests()
+    m1 = _metrics(llm)
+    eng.abort_request([str(i) for i in range(len(prompts)) if str(i) not in finished])
+    if left < max(running, default=0):
+        log("   WARNING: the queue ran low inside the window; raise --tp-n")
+    res = {"mode": "sustained", "window_s": round(dt, 1), "steps": steps, "completed_in_window": done,
+           "ms_per_step": round(1000 * dt / steps, 1) if steps else None,
+           "preemptions": int(m1.get("vllm:num_preemptions", 0) - m0.get("vllm:num_preemptions", 0)),
+           "mean_running": round(sum(running) / len(running), 1) if running else None,
+           "max_running": max(running, default=None), "throughput_out_tok_s": round(toks / dt, 1)}
+    log(f"   {res['throughput_out_tok_s']} output tok/s sustained, running mean {res['mean_running']}, "
+        f"{res['ms_per_step']} ms/step, preemptions {res['preemptions']}")
+    return res
 
 
 def _metrics(llm) -> dict[str, float]:
