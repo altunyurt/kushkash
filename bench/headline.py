@@ -57,9 +57,13 @@ def summarize(path, seq_len=4096):
             best[k] = r
     if "auto" not in acc and "auto" not in best:
         sys.exit("no results for kv=auto in " + path)
-    meta = (rows[0] if rows else {})
+    meta = next((r for r in reversed(rows) if r.get("model")), {})   # newest row: this run's metadata
     print(f"\nModel {meta.get('model')}, vLLM {meta.get('vllm')}, kushkash {meta.get('kushkash')}, "
           f"GPU {meta.get('gpu')}\n")
+    mixed = [f"{k}={', '.join(sorted({r[k] for r in rows if r.get(k)}))}" for k in ("gpu", "kushkash")
+             if len({r.get(k) for r in rows if r.get(k)}) > 1]   # e.g. --reuse-accuracy from another run
+    if mixed:
+        print(f"WARNING: rows come from mixed runs: {'; '.join(mixed)}\n")
 
     def ratio(a, b, fmt="{:.2f}x"):
         return fmt.format(a / b) if a and b else ""
@@ -106,8 +110,10 @@ def tag(path, phase, meta):
         if "phase" not in r:
             r["phase"] = phase
             r.update(meta)
-    with open(path, "w") as f:
+    tmp = path + ".tmp"                                 # atomic: a crash must not truncate a long run
+    with open(tmp, "w") as f:
         f.write("".join(json.dumps(r) + "\n" for r in rows))
+    os.replace(tmp, path)
 
 
 def main():
@@ -115,8 +121,11 @@ def main():
     if ARGS.summarize:
         return summarize(ARGS.summarize)
     import kushkash
-    gpu = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True,
-                         text=True).stdout.strip().splitlines()[0]
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]
+    q = subprocess.run(["nvidia-smi", "-i", vis, "--query-gpu=name", "--format=csv,noheader"],
+                       capture_output=True, text=True)
+    names = q.stdout.strip().splitlines()
+    gpu = names[0] if q.returncode == 0 and names else f"device {vis}"
     meta = {"kushkash": kushkash.__version__, "gpu": gpu}
     open(out, "w").close()
     budget = ["--kv-gib", str(ARGS.kv_gib)]
@@ -130,7 +139,7 @@ def main():
         with open(out, "a") as f:
             f.write("".join(json.dumps(r) + "\n" for r in old))
     elif ARGS.no_accuracy:                              # capacity only: engine load, no ppl / passkey
-        run(["--kv", "auto,kush4", "--only-throughput", "--no-throughput"] + budget, out)
+        run(["--kv", "auto,kush4", "--no-throughput"] + budget, out)
         tag(out, "accuracy", meta)
     else:
         run(["--kv", "auto,kush4,kush8", "--no-throughput"] + (["--quick"] if ARGS.quick else []) + budget, out)

@@ -33,7 +33,7 @@ only a few short requests, model weights dominate memory and time, and you will 
 
 Same GPU, same model, same 4 GiB KV cache budget for every cache type. Throughput is sustained output
 tokens/s over 300 s with the queue kept full (2,048-token prompts, 2,048 output tokens each); each cache type
-is shown at its best `max_num_seqs`.
+is shown at its best `max_num_seqs`, which the script prints together with the settings it tried.
 
 | | vLLM default (bf16) | kushkash int4 | | kushkash int8 | |
 |---|---|---|---|---|---|
