@@ -329,3 +329,137 @@ def test_pack_plan_fuzz(sg):
                 pos.setdefault(int(base[i] + ctx[i] + t), []).append("new")
             assert sorted(pos) == list(range(int(base[i]), int(base[i] + seg[i])))
             assert all(len(v) == 1 for v in pos.values())
+
+
+def test_server_args_decisions():
+    """What the plugin declares in SGLang's argument resolution (the hook around handle_cuda_graph_config)."""
+    import enum
+    import kushkash.sglang as ks
+
+    class Backend(enum.Enum):
+        DISABLED = "disabled"
+        FULL = "full"
+
+    class Phase(enum.Enum):
+        PREFILL = "prefill"
+
+    def with_phase(cfg, phase, backend):
+        return ("prefill", backend)
+
+    graphs = types.SimpleNamespace(prefill=types.SimpleNamespace(backend=Backend.FULL))
+
+    def cfg(**kw):
+        base = dict(attention_backend="kushkash", prefill_attention_backend=None, decode_attention_backend=None,
+                    kv_cache_dtype="auto", speculative_algorithm=None, page_size=None, max_running_requests=None,
+                    cuda_graph_config=graphs)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    d = ks.server_args_decisions(cfg(), (), Backend, Phase, with_phase)
+    assert d == {"page_size": 32, "max_running_requests": 256, "cuda_graph_config": ("prefill", Backend.DISABLED)}
+    d = ks.server_args_decisions(cfg(page_size=32, max_running_requests=384,
+                                     cuda_graph_config=types.SimpleNamespace(
+                                         prefill=types.SimpleNamespace(backend=Backend.DISABLED))),
+                                 (), Backend, Phase, with_phase)
+    assert d == {}                                                   # user values that already fit are kept
+    assert ks.server_args_decisions(cfg(page_size=16), (), Backend, Phase, with_phase)["page_size"] == 32
+    assert ks.server_args_decisions(cfg(attention_backend="flashinfer"), (), Backend, Phase, with_phase) == {}
+    for bad in (dict(kv_cache_dtype="fp8_e4m3"), dict(speculative_algorithm="EAGLE"),
+                dict(decode_attention_backend="flashinfer")):
+        with pytest.raises(ValueError, match="kushkash"):
+            ks.server_args_decisions(cfg(**bad), (), Backend, Phase, with_phase)
+    with pytest.raises(ValueError, match="prefill CUDA graphs"):     # an explicit prefill graph backend is refused
+        ks.server_args_decisions(cfg(), {(Phase.PREFILL, "backend")}, Backend, Phase, with_phase)
+
+
+def _fake_sglang_arg_modules(monkeypatch, Backend, Phase):
+    """Stand-ins for the SGLang modules register() and the resolution hook import; records what they receive."""
+    rec = types.SimpleNamespace(hooks={}, declared=[], backends={}, choices=[], around=[])
+    mods = {}
+
+    def mod(name, **attrs):
+        m = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(m, k, v)
+        mods[name] = m
+
+    def register_resolution_hook(name):
+        def deco(fn):
+            rec.hooks.setdefault(name, []).append(fn)
+            return fn
+        return deco
+
+    def register_attention_backend(name):
+        def deco(fn):
+            rec.backends[name] = fn
+            return fn
+        return deco
+
+    class HookRegistry:
+        @staticmethod
+        def register(target, fn, hook_type):
+            rec.around.append(target)
+
+    mod("sglang.srt.arg_groups")
+    mod("sglang.srt.arg_groups.choices", ATTENTION_BACKEND_CHOICES=rec.choices,
+        add_attention_backend_choices=rec.choices.extend)
+    mod("sglang.srt.arg_groups.resolution_hooks", register_resolution_hook=register_resolution_hook)
+    mod("sglang.srt.arg_groups.overrides", resolving_view=lambda sa: sa,
+        declare_resolution=lambda sa, source, **fields: rec.declared.append((source, fields)))
+    mod("sglang.srt.layers.attention.attention_registry", ATTENTION_BACKENDS=rec.backends,
+        register_attention_backend=register_attention_backend)
+    mod("sglang.srt.plugins")
+    mod("sglang.srt.plugins.hook_registry", HookRegistry=HookRegistry, HookType=types.SimpleNamespace(AROUND="around"))
+    mod("sglang.srt.model_executor")
+    mod("sglang.srt.model_executor.cuda_graph_config", Backend=Backend, Phase=Phase,
+        with_phase=lambda cfg, phase, backend: ("with_phase", phase, backend))
+    for name, m in mods.items():
+        monkeypatch.setitem(sys.modules, name, m)
+    return rec
+
+
+def test_register_and_resolution_hook_wiring(sg, monkeypatch):
+    """Our side of the SGLang contract: register() wires the hook to handle_cuda_graph_config; the hook runs the
+    built-in step first, declares kushkash's decisions under one source, and imports nothing for other backends."""
+    import enum
+    import kushkash.sglang as ks
+
+    class Backend(enum.Enum):
+        DISABLED = "disabled"
+        FULL = "full"
+
+    class Phase(enum.Enum):
+        PREFILL = "prefill"
+
+    rec = _fake_sglang_arg_modules(monkeypatch, Backend, Phase)
+    ks.register()
+    assert list(rec.hooks) == ["handle_cuda_graph_config"] and rec.hooks["handle_cuda_graph_config"] == [
+        ks._resolution_hook]
+    assert "kushkash" in rec.choices and "kushkash" in rec.backends
+    assert any(t.endswith("._resolve_kv_pool_class") for t in rec.around)
+    assert any(t.endswith(".enable_fused_set_kv_buffer") for t in rec.around)
+
+    order = []
+    sa = types.SimpleNamespace(attention_backend="kushkash", prefill_attention_backend=None,
+                               decode_attention_backend=None, kv_cache_dtype="auto", speculative_algorithm=None,
+                               page_size=None, max_running_requests=None, _cuda_graph_config_locked=set(),
+                               cuda_graph_config=types.SimpleNamespace(
+                                   prefill=types.SimpleNamespace(backend=Backend.FULL)))
+    ks._resolution_hook(sa, lambda s: order.append("builtin"))
+    assert order == ["builtin"]
+    assert rec.declared == [("kushkash", {"page_size": 32, "max_running_requests": 256,
+                                          "cuda_graph_config": ("with_phase", Phase.PREFILL, Backend.DISABLED)})]
+
+    rec.declared.clear()                               # unset prefill phase: no crash, no prefill declaration
+    sa.cuda_graph_config = types.SimpleNamespace(prefill=None)
+    ks._resolution_hook(sa, lambda s: None)
+    assert rec.declared == [("kushkash", {"page_size": 32, "max_running_requests": 256})]
+
+    rec.declared.clear()                               # another backend: the step runs, nothing is imported
+    for name in ("sglang.srt.arg_groups.overrides", "sglang.srt.model_executor.cuda_graph_config"):
+        monkeypatch.setitem(sys.modules, name, None)    # any import of them now raises ImportError
+    other = types.SimpleNamespace(attention_backend="flashinfer", prefill_attention_backend=None,
+                                  decode_attention_backend=None)
+    ran = []
+    ks._resolution_hook(other, lambda s: ran.append(True))
+    assert ran == [True] and rec.declared == []

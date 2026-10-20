@@ -6,7 +6,9 @@
 register() runs in every SGLang process before the server arguments are built and uses only SGLang's documented
 extension points:
   - the attention-backend registry (`register_attention_backend`) and its CLI choices list,
-  - a server-args post-process pass: page_size 32 (one kushkash page), prefill CUDA graphs off, checks,
+  - a resolution hook around SGLang's `handle_cuda_graph_config` step (`register_resolution_hook`): declares
+    page_size 32 (one kushkash page), max_running_requests 256 unless set, prefill CUDA graphs off, and rejects
+    what the backend does not support. It runs before the memory, page-size-default and validation steps.
   - three AROUND hooks: the MHA KV pool class (KushPool: kushkash page records instead of K/V rows), the
     per-token KV size used to size the pool (compressed bytes, so SGLang's token capacity is the real one), and the
     profiled KV budget (minus the exact K tail, [request slots, Hkv, 32, D] per layer, which the backend allocates).
@@ -32,9 +34,15 @@ def enabled(args) -> bool:
     return getattr(args, "attention_backend", None) == NAME
 
 
+def requested(args) -> bool:
+    """kushkash named for any phase (the resolution hook rejects split prefill / decode backends)."""
+    return NAME in {getattr(args, f, None) for f in ("attention_backend", "prefill_attention_backend",
+                                                     "decode_attention_backend")}
+
+
 def register() -> None:
     from sglang.srt.arg_groups.choices import ATTENTION_BACKEND_CHOICES, add_attention_backend_choices
-    from sglang.srt.arg_groups.overrides import register_post_process
+    from sglang.srt.arg_groups.resolution_hooks import register_resolution_hook
     from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS, register_attention_backend
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -43,7 +51,9 @@ def register() -> None:
     if NAME not in ATTENTION_BACKEND_CHOICES:
         add_attention_backend_choices([NAME])
     register_attention_backend(NAME)(_create_backend)
-    register_post_process(_server_args_pass)
+    # register_post_process() would only list the pass: SGLang runs post-process passes from explicit call sites,
+    # so a registered pass never runs. A resolution hook wraps a pipeline step that does run.
+    register_resolution_hook("handle_cuda_graph_config")(_resolution_hook)
     HookRegistry.register("sglang.srt.mem_cache.kv_cache_configurator.KVCacheConfigurator._resolve_kv_pool_class",
                           _pool_class_hook, HookType.AROUND)
     HookRegistry.register("sglang.srt.model_executor.pool_configurator.DefaultPoolConfigurator._compute_cell_size",
@@ -61,29 +71,50 @@ def _create_backend(runner):
     return KushSGLangBackend(runner)
 
 
-def _server_args_pass(view) -> dict:
-    """Runs after SGLang's own passes. Forces what the format needs; rejects what the spike does not support."""
-    names = {getattr(view, f, None) for f in ("attention_backend", "prefill_attention_backend",
-                                              "decode_attention_backend")} - {None}
+def _resolution_hook(server_args, previous) -> None:
+    """Wraps SGLang's handle_cuda_graph_config step: after it, declare what the format needs and reject what the
+    backend does not support. Declarations go through SGLang's resolution record (declare_resolution); later steps
+    (memory settings, the page-size default, validations) read them."""
+    previous(server_args)
+    if not requested(server_args):                     # other backends: no SGLang internals touched
+        return
+    from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+    cfg = resolving_view(server_args)
+    decl = server_args_decisions(cfg, getattr(server_args, "_cuda_graph_config_locked", ()), Backend, Phase,
+                                 with_phase)
+    if decl:
+        declare_resolution(server_args, "kushkash", **decl)
+
+
+def server_args_decisions(cfg, locked, Backend, Phase, with_phase) -> dict:
+    """The kushkash decisions for one resolving config (pure; tested on CPU)."""
+    names = {getattr(cfg, f, None) for f in ("attention_backend", "prefill_attention_backend",
+                                             "decode_attention_backend")} - {None}
     if NAME not in names:
         return {}
     if names != {NAME}:
         raise ValueError("kushkash: use --attention-backend kushkash for both prefill and decode "
                          f"(got {sorted(names)})")
-    kv = getattr(view, "kv_cache_dtype", "auto")
+    kv = getattr(cfg, "kv_cache_dtype", "auto")
     if kv not in (None, "auto"):
         raise ValueError(f"kushkash: leave kv_cache_dtype at auto (got {kv}); choose 4/8 bits with KUSHKASH_BITS")
-    if getattr(view, "speculative_algorithm", None):
+    if getattr(cfg, "speculative_algorithm", None):
         raise ValueError("kushkash: speculative decoding is not supported")
     out = {}
-    if view.page_size != PAGE:
-        logger.warning("kushkash: page_size %s -> %d (one kushkash page)", view.page_size, PAGE)
+    if cfg.page_size != PAGE:
+        if cfg.page_size is not None:
+            logger.warning("kushkash: page_size %s -> %d (one kushkash page)", cfg.page_size, PAGE)
         out["page_size"] = PAGE
-    if getattr(view, "max_running_requests", None) is None:
-        # the exact K tail is [requests, Hkv, 32, D] per layer and not part of SGLang's memory plan: keep it small
+    if getattr(cfg, "max_running_requests", None) is None:
+        # the exact K tail is [request slots, Hkv, 32, D] per layer and reserved out of the KV budget: keep it small
         out["max_running_requests"] = 256
-    if hasattr(view, "disable_prefill_cuda_graph") and not view.disable_prefill_cuda_graph:
-        out["disable_prefill_cuda_graph"] = True    # decode steps may run as CUDA graphs; prefill stays eager
+    prefill = getattr(getattr(cfg, "cuda_graph_config", None), "prefill", None)
+    if prefill is not None and prefill.backend != Backend.DISABLED:
+        if (Phase.PREFILL, "backend") in locked:
+            raise ValueError("kushkash: prefill CUDA graphs are not supported (drop the prefill CUDA graph backend "
+                             "option); decode CUDA graphs are")
+        out["cuda_graph_config"] = with_phase(cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED)
     return out
 
 
