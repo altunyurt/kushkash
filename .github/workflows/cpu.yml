@@ -33,4 +33,4 @@ jobs:
           PY
 
       - name: CPU tests (Mojo kernels compile on first use)
-        run: python -m pytest tests/test_cpu.py tests/test_ragged.py -q
+        run: python -m pytest tests/test_cpu.py tests/test_ragged.py tests/test_sglang_backend_cpu.py -q

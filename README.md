@@ -5,9 +5,10 @@ kushkash is a compressed KV cache for LLM inference. It stores the attention key
 without first unpacking it into a full-size copy.
 
 The kernels are written in [Mojo](https://www.modular.com/mojo) and run on NVIDIA GPUs and on CPUs. You can
-use kushkash in three ways:
+use kushkash in four ways:
 
 - as an **attention backend for vLLM**, installed as a plugin (no fork, no patches);
+- as an **attention backend for SGLang**, installed as a plugin the same way;
 - as a **cache for Hugging Face transformers**, in place of the default `DynamicCache`;
 - as a small **Python API** you can wire into your own inference code.
 
@@ -63,6 +64,7 @@ goes to the model weights and the throughput ratio shrinks. Reproduce with `pyth
 ```bash
 pip install kushkash             # core package (CPU)
 pip install "kushkash[vllm]"     # vLLM backend
+pip install "kushkash[sglang]"   # SGLang backend
 pip install "kushkash[hf]"       # Hugging Face integration
 pip install "kushkash[hf,test]"  # plus what the test suite needs
 ```
@@ -164,6 +166,53 @@ keeps evicting what it needs next. When everything fits either way (12 conversat
 returning context there is nothing to reload and no gain. vLLM offloads prompt tokens only by default; earlier
 replies in a chat are recomputed (pass `kv_transfer_config={"kv_connector_extra_config":
 {"offload_prompt_only": False}}` to offload them too). Reproduce with `python bench/offload_reuse.py`.
+
+## Using it with SGLang
+
+Installing the package also registers an SGLang plugin (SGLang 0.5.22). Select the backend with
+`--attention-backend kushkash`:
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --attention-backend kushkash
+KUSHKASH_BITS=8 python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --attention-backend kushkash
+```
+
+Or from Python:
+
+```python
+import sglang as sgl
+engine = sgl.Engine(model_path="Qwen/Qwen2.5-7B-Instruct", attention_backend="kushkash")
+```
+
+Measured on one L4 (Qwen2.5-7B-Instruct, SGLang 0.5.22, `mem_fraction_static` 0.85, page size 32 and decode CUDA
+graphs for both): 128 requests of 2,048 prompt / 1,024 output tokens at once, more than either cache holds.
+
+| | SGLang default (flashinfer, bf16) | kushkash int4 | | kushkash int8 | |
+|---|---|---|---|---|---|
+| KV cache capacity (tokens) | 79,104 | 273,664 | **3.46x** | 146,720 | **1.85x** |
+| Output tokens/s | 282.6 | 569.2 | **2.01x** | 421.6 | 1.49x |
+| Prefill tokens/s (6k-token prompts) | 3,621 | 3,597 | 0.99x | 3,565 | 0.98x |
+| Passkey retrieval, greedy answers | 6/6 | 6/6, identical | | 6/6, identical | |
+
+Output tokens/s here is all output tokens divided by the time until the last request finished, a different
+method from the vLLM table above (a sustained 300 s window at a fixed KV budget), so do not compare the two
+ratios digit for digit. Reproduce with `python bench/sglang_spike.py` (its default now measures a sustained
+window, like the vLLM headline).
+
+Things to know:
+
+- **The plugin sets what the format needs:** page size 32, and `max_running_requests` 256 unless you set it. It
+  reserves the exact K tail (one unfinished page of K per request slot, see [How it works](#how-it-works)) out
+  of SGLang's KV budget: about 225 MiB for Qwen2.5-7B at 256 requests.
+- **Leave `kv_cache_dtype` at `auto`;** choose 4 or 8 bits with `KUSHKASH_BITS`.
+- **Decode steps run as CUDA graphs; prompt processing runs eagerly** (the plugin turns prefill CUDA graphs
+  off). Prompt chunks that follow cached history are attended with one flashinfer call per layer over the
+  dequantized history (`KUSHKASH_PREFILL`, `KUSHKASH_PACK_MB` as for vLLM).
+- **Supported:** radix (prefix) cache, chunked prefill, decode CUDA graphs. **Not supported** (refused with an
+  error): speculative decoding, other quantized `kv_cache_dtype` values, ALiBi, attention sinks, logit
+  soft-capping, hybrid / sliding-window / MLA models. Not tested yet:
+  tensor parallelism, HiCache, prefill-decode disaggregation (the pool refuses the operations these need,
+  with an error naming them).
 
 ## Using it with Hugging Face transformers
 
@@ -288,6 +337,8 @@ produce byte-for-byte identical pages (this is tested).
 pytest tests/test_cpu.py                # runs anywhere: format, kernels vs a reference, HF generation (tiny models)
 pytest tests/test_ragged.py             # runs anywhere: vLLM-style mixed batches against ground truth
 pytest tests/test_vllm_backend_cpu.py   # needs vLLM importable: the vLLM backend driven on CPU
+pytest tests/test_sglang_backend_cpu.py # runs anywhere (SGLang stubbed): the SGLang backend's bookkeeping
+pytest tests/test_sglang_gpu.py -s     # NVIDIA GPU + SGLang: radix-cache prefixes that end mid-page
 pytest tests/test_gpu.py                # NVIDIA GPU: GPU vs CPU pages, decode vs reference, HF on GPU
 pytest tests/test_vllm_gpu.py -s       # NVIDIA GPU + vLLM: end-to-end serving (passkey retrieval, prefix caching, RAM tier)
 python tests/test_vllm_gpu.py           # same, once per vLLM execution mode (eager, compiled, CUDA graphs, ...)
@@ -303,6 +354,9 @@ python bench/vllm_compare.py --kv auto,kush4@64 --only-throughput --tp-n 256 --t
 # vLLM: RAM as a second cache tier (multi-turn time to first token; correctness of offloaded pages)
 python bench/offload_reuse.py
 python bench/offload_check.py
+
+# SGLang: capacity, answers, prefill and sustained serving throughput, default backend vs kush4 / kush8
+python bench/sglang_spike.py --model Qwen/Qwen2.5-7B-Instruct --mem 0.85 --max-reqs 384 --tp-out 1024
 
 # vLLM's own memory accounting for one configuration
 python bench/mem_probe.py kush4
@@ -334,6 +388,7 @@ kushkash/
   cache.py             KushCache (framework-independent API)
   hf.py, _generate.py  Hugging Face integration
   vllm/                vLLM plugin and attention backend
+  sglang/              SGLang plugin, KV pool and attention backend
 tests/                 test suites (see above)
 bench/                 benchmarks (see above)
 ```
@@ -341,5 +396,5 @@ bench/                 benchmarks (see above)
 ## What kushkash is not
 
 kushkash is a cache format plus the kernels that write and read it. It does not schedule requests, sample
-tokens or run models; vLLM or transformers do that. The attention kernels are part of it because a compressed
+tokens or run models; vLLM, SGLang or transformers do that. The attention kernels are part of it because a compressed
 cache is only useful if attention can read it without first unpacking it into a full-size copy.

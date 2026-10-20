@@ -29,6 +29,7 @@ dependencies = ["torch>=2.5", "mojo>=1.1", "max-core>=26.6"]
 [project.optional-dependencies]
 hf = ["transformers>=5.0"]
 vllm = ["vllm>=0.31,<0.32"]
+sglang = ["sglang==0.5.22"]
 test = ["pytest", "transformers>=5.0"]
 
 [project.urls]
@@ -39,6 +40,9 @@ Issues = "https://github.com/altunyurt/kushkash/issues"
 [project.entry-points."vllm.general_plugins"]
 kushkash = "kushkash.vllm:register"
 
+[project.entry-points."sglang.srt.plugins"]
+kushkash = "kushkash.sglang:register"
+
 [tool.setuptools]
 # kush holds the Mojo sources (no .py files); listing it keeps setuptools from warning
-packages = ["kushkash", "kushkash.vllm", "kushkash.kush"]
+packages = ["kushkash", "kushkash.vllm", "kushkash.sglang", "kushkash.kush"]

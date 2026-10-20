@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# patch scratch files
+*.orig
+*.rej
+/*.patch
