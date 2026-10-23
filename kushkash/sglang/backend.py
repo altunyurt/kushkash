@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
-from kushkash._ops import PAGE, Ops, dequant_records, history_attention, pages_touched
+from kushkash._ops import PAGE, Ops, dequant_records, hadamard, history_attention, pages_touched, rotate, rotation_enabled
 
 from .pool import KushPool
 
@@ -140,6 +140,9 @@ class KushSGLangBackend(AttentionBackend):
         self.device = pool.k_buffer[0].device if pool.k_buffer else torch.device("cuda")
         self.dtype = runner.model_config.dtype
         self.D, self.Hk, self.bits = pool.head_dim, pool.head_num, pool.kush_bits
+        # pages hold Hadamard-rotated K/V (KUSHKASH_ROTATE; auto = 4-bit): q is rotated the same way and the
+        # output rotated back, so the model sees plain attention
+        self.rot = hadamard(self.D, self.device) if rotation_enabled(self.bits) else None
         slots = self.rtp.req_to_token.shape[0]
         if pool.kush_tail is None:                     # exact K of each request's unfinished page
             pool.kush_tail = [torch.zeros((slots, self.Hk, PAGE, self.D), dtype=self.dtype, device=self.device)
@@ -303,16 +306,17 @@ class KushSGLangBackend(AttentionBackend):
         Hq, Hk, D = layer.tp_q_head_num, layer.tp_k_head_num, layer.qk_head_dim
         ops = self._ops_for(Hq // Hk)
         cache, tail = self.pool.records(layer.layer_id), self.pool.tail(layer.layer_id)
-        q3 = q.reshape(-1, Hq, D).contiguous()
+        q3 = rotate(q.reshape(-1, Hq, D), self.rot).contiguous()
         if save_kv_cache and k is not None:
             k3, v3 = _rows(k.view(-1, Hk, D)), _rows(v.view(-1, Hk, D))
+            k3, v3 = rotate(k3, self.rot), rotate(v3, self.rot)
             ops.append(k3, v3, md.seq_lens, md.tail_idx, cache, md.block_table, tail, pos_offset=-1, advance=False)
         if md.n_splits is None:
             md.n_splits = ops.splits(q3.shape[0], Hk, md.block_table.shape[1])
         out = torch.empty_like(q3)
         ops.decode(q3, out, cache, md.block_table, md.seq_lens, md.tail_idx, tail, float(layer.scaling),
                    md.n_splits, self.work)
-        return out.view(-1, Hq * D)
+        return rotate(out, self.rot).view(-1, Hq * D)
 
     def forward_extend(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
         self._check_layer(layer, kwargs)
@@ -324,6 +328,7 @@ class KushSGLangBackend(AttentionBackend):
         cache, tail = self.pool.records(layer.layer_id), self.pool.tail(layer.layer_id)
         q3 = q.reshape(-1, Hq, D)
         k3, v3 = _rows(k.view(-1, Hk, D)), _rows(v.view(-1, Hk, D))
+        q3, k3, v3 = rotate(q3, self.rot), rotate(k3, self.rot), rotate(v3, self.rot)
         if md.pack is not None:
             out = self._prefill_packed(q3, k3, v3, cache, tail, md, float(layer.scaling))
         else:
@@ -331,7 +336,7 @@ class KushSGLangBackend(AttentionBackend):
         if save_kv_cache:
             ops.write(k3, v3, md.qsl, md.seq_lens, md.tail_idx, md.job_seq, md.job_page, cache, md.block_table,
                       tail)
-        return out.reshape(-1, Hq * D)
+        return rotate(out, self.rot).reshape(-1, Hq * D)
 
     def _prefill_packed(self, q3, k3, v3, cache, tail, md, scale):
         """One attention call over packed [dequantized history | exact K tail | chunk] keys for all rows.

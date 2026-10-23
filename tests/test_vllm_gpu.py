@@ -81,7 +81,10 @@ from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 offload = float(sys.argv[1])
 extra = {"kv_offloading_size": offload, "kv_offloading_backend": "native"} if offload else {}
-llm = LLM(model=MODEL, max_model_len=8192, kv_cache_memory_bytes=int(0.35 * 2**30), seed=0, attention_backend="CUSTOM",
+# gpu_memory_utilization: vLLM checks free memory >= utilization x total at startup even with a fixed KV size; the
+# default 0.9 fails when this file runs after other GPU tests in one pytest process (that process keeps memory)
+llm = LLM(model=MODEL, max_model_len=8192, kv_cache_memory_bytes=int(0.35 * 2**30), gpu_memory_utilization=0.6,
+          seed=0, attention_backend="CUSTOM",
           enable_prefix_caching=True, enable_chunked_prefill=True, max_num_batched_tokens=2048,
           disable_log_stats=False, **extra)
 cap = llm.llm_engine.vllm_config.cache_config.kv_cache_size_tokens

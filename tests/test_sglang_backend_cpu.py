@@ -93,8 +93,9 @@ class Layer:
 class World:
     """SGLang-like state: a page allocator, req_to_token, and per-request token counts."""
 
-    def __init__(self, sg, monkeypatch, bits, slots=8, max_ctx=512, pages=64, packed=False):
+    def __init__(self, sg, monkeypatch, bits, slots=8, max_ctx=512, pages=64, packed=False, rot=False):
         monkeypatch.setenv("KUSHKASH_BITS", str(bits))
+        monkeypatch.setenv("KUSHKASH_ROTATE", "1" if rot else "0")
         self.pool = sg.Pool(size=pages * PAGE - PAGE, page_size=PAGE, head_num=HK, head_dim=D, layer_num=LAYERS,
                             device=torch.device("cpu"))
         self.rtp = types.SimpleNamespace(req_to_token=torch.zeros(slots, max_ctx, dtype=torch.int32))
@@ -145,15 +146,19 @@ def ref_dequant(x, bits, dim):
     return torch.round((x - b) * inv).clamp(-half, half - 1) * s + b
 
 
-def stored(K, V, bits):
+def stored(K, V, bits, h=None):
     """What the cache should hold for exact K, V [n, HK, D]: K per channel over each full 32-token page (the
-    unfinished page exact), V per token. Independent of the backend's own storage."""
+    unfinished page exact), V per token; with a rotation h, of K h and V h, returned rotated back (model space).
+    Independent of the backend's own storage."""
+    if h is not None:
+        K, V = K @ h, V @ h
     n = K.shape[0]
     full = n // PAGE * PAGE
     Kq = K.clone()
     if full:
         Kq[:full] = ref_dequant(K[:full].view(-1, PAGE, HK, D), bits, 1).view(full, HK, D)
-    return Kq, ref_dequant(V, bits, -1)
+    Vq = ref_dequant(V, bits, -1)
+    return (Kq, Vq) if h is None else (Kq @ h, Vq @ h)
 
 
 def attend(q, K, V, n_hist):
@@ -197,10 +202,10 @@ def _step(world, slots, qlens, decode, gen, graph_pad=None):
             Kall, Vall = torch.cat([Ks, kn]), torch.cat([Vs, vn])
             world.shadow[(li, s)] = (Kall, Vall)
             if decode:
-                Kq, Vq = stored(Kall, Vall, bits)
+                Kq, Vq = stored(Kall, Vall, bits, world.be.rot)
                 refs.append(attend(q[a:a + ql].view(ql, HQ, D), Kq, Vq, nb))
             else:
-                Kq, Vq = stored(Ks, Vs, bits)
+                Kq, Vq = stored(Ks, Vs, bits, world.be.rot)
                 refs.append(attend(q[a:a + ql].view(ql, HQ, D), torch.cat([Kq, kn]), torch.cat([Vq, vn]), nb))
             a += ql
         ref = torch.cat(refs).reshape(T, HQ * D)
@@ -208,9 +213,11 @@ def _step(world, slots, qlens, decode, gen, graph_pad=None):
     assert worst < 1e-3, worst
 
 
-@pytest.mark.parametrize("bits,packed", [(4, False), (8, False), (4, True), (8, True)])
-def test_sglang_backend_bookkeeping(sg, monkeypatch, bits, packed):
-    w, gen = World(sg, monkeypatch, bits, packed=packed), torch.Generator().manual_seed(0)
+@pytest.mark.parametrize("bits,packed,rot", [(4, False, False), (8, False, False), (4, True, False),
+                                             (8, True, False), (4, False, True), (4, True, True)])
+def test_sglang_backend_bookkeeping(sg, monkeypatch, bits, packed, rot):
+    w, gen = World(sg, monkeypatch, bits, packed=packed, rot=rot), torch.Generator().manual_seed(0)
+    assert (w.be.rot is not None) == rot
     A, B, C = 3, 1, 5                                    # request-pool slots (not contiguous)
     _step(w, [A, B], [70, 33], decode=False, gen=gen)   # fresh prompts; A ends mid-page
     _step(w, [A], [26], decode=False, gen=gen)          # chunk after a mid-page boundary (tail in use)

@@ -46,6 +46,10 @@ is shown at its best `max_num_seqs`, which the script prints together with the s
 | Perplexity (WikiText-2, chunked prefill) | 6.001 | 6.013 | | 5.999 | |
 | Passkey retrieval, 8k / 16k | 10/10, 10/10 | 10/10, 10/10 | | 10/10, 10/10 | |
 
+The int4 numbers were measured before the 4-bit Hadamard rotation (see [How it works](#how-it-works)) became
+the default; in a separate run at `max_num_seqs` 256 it cost 1.5% of sustained output tokens/s and lowered
+perplexity from 6.0127 to 6.0105.
+
 The gain depends on how tight the cache is: with a larger KV budget, or short requests, more of each step
 goes to the model weights and the throughput ratio shrinks. Reproduce with `python bench/headline.py --sweep`
 (about 75 minutes on an L4); the other `max_num_seqs` settings it tries are printed under the table.
@@ -118,6 +122,9 @@ Things to know:
 
 - **Leave `kv_cache_dtype` at its default (`auto`).** The backend decides the format; choose 4 or 8 bits with
   the `KUSHKASH_BITS` environment variable. Other values are rejected with an error.
+- **Rotation:** at 4 bits the cache stores keys and values after a Hadamard rotation, which lowers its error
+  (see [How it works](#how-it-works)). `KUSHKASH_ROTATE=0` turns it off, `1` turns it on for 8 bits too; the
+  default `auto` means on for 4 bits only.
 - **vLLM sees the real cache size.** The backend tells vLLM how many bytes a cached token takes, so vLLM's own
   memory planning, its "KV cache size: N tokens" log line and its scheduler all work with the compressed size.
   The block size is fixed at 32 tokens and set automatically.
@@ -184,27 +191,34 @@ import sglang as sgl
 engine = sgl.Engine(model_path="Qwen/Qwen2.5-7B-Instruct", attention_backend="kushkash")
 ```
 
-Measured on one L4 (Qwen2.5-7B-Instruct, SGLang 0.5.22, `mem_fraction_static` 0.85, page size 32 and decode CUDA
-graphs for both): 128 requests of 2,048 prompt / 1,024 output tokens at once, more than either cache holds.
+Measured on one L4 (Qwen2.5-7B-Instruct, SGLang 0.5.22, `mem_fraction_static` 0.85, page size 32, decode CUDA
+graphs and `max_running_requests` 384 for both). Throughput is sustained output tokens/s over 300 s with the
+queue kept full (1,024 requests of 2,048 prompt / 1,024 output tokens submitted at once, far more than either
+cache holds), counted as tokens stream out.
 
 | | SGLang default (flashinfer, bf16) | kushkash int4 | | kushkash int8 | |
 |---|---|---|---|---|---|
-| KV cache capacity (tokens) | 79,104 | 273,664 | **3.46x** | 146,720 | **1.85x** |
-| Output tokens/s | 282.6 | 569.2 | **2.01x** | 421.6 | 1.49x |
-| Prefill tokens/s (6k-token prompts) | 3,621 | 3,597 | 0.99x | 3,565 | 0.98x |
+| KV cache capacity (tokens) | 79,104 | 252,352 | **3.19x** | 135,296 | **1.71x** |
+| Output tokens/s, sustained | 274.5 | 582.2 | **2.12x** | 431.9 | **1.57x** |
+| Prefill tokens/s (6k-token prompts) | 3,532 | 3,559 | 1.01x | 3,595 | 1.02x |
 | Passkey retrieval, greedy answers | 6/6 | 6/6, identical | | 6/6, identical | |
 
-Output tokens/s here is all output tokens divided by the time until the last request finished, a different
-method from the vLLM table above (a sustained 300 s window at a fixed KV budget), so do not compare the two
-ratios digit for digit. Reproduce with `python bench/sglang_spike.py` (its default now measures a sustained
-window, like the vLLM headline).
+The capacity ratio is below the format's 3.46x because the plugin reserves the exact K tail (below) out of the
+same memory: an earlier run without that reservation held 273,664 int4 tokens, and the difference, 21,312 tokens x
+16,576 bytes per token = 337 MiB, is the tail for 385 request slots. These numbers predate the 4-bit Hadamard
+rotation (rotation off). The vLLM table above gives every cache type the same fixed KV budget instead of the same
+memory fraction, so its ratios are not directly comparable.
+Reproduce with
+`python bench/sglang_spike.py --model Qwen/Qwen2.5-7B-Instruct --mem 0.85 --max-reqs 384 --tp-out 1024`
+(about 45 minutes on an L4).
 
 Things to know:
 
 - **The plugin sets what the format needs:** page size 32, and `max_running_requests` 256 unless you set it. It
   reserves the exact K tail (one unfinished page of K per request slot, see [How it works](#how-it-works)) out
-  of SGLang's KV budget: about 225 MiB for Qwen2.5-7B at 256 requests.
-- **Leave `kv_cache_dtype` at `auto`;** choose 4 or 8 bits with `KUSHKASH_BITS`.
+  of SGLang's KV budget: about 225 MiB for Qwen2.5-7B at 256 requests, 337 MiB at 384.
+- **Leave `kv_cache_dtype` at `auto`;** choose 4 or 8 bits with `KUSHKASH_BITS`. `KUSHKASH_ROTATE` works as
+  for vLLM.
 - **Decode steps run as CUDA graphs; prompt processing runs eagerly** (the plugin turns prefill CUDA graphs
   off). Prompt chunks that follow cached history are attended with one flashinfer call per layer over the
   dequantized history (`KUSHKASH_PREFILL`, `KUSHKASH_PACK_MB` as for vLLM).
@@ -249,6 +263,7 @@ Limits of the Hugging Face integration:
 - **All sequences in a batch must have the same length.** Padded batches are rejected when the prompt is
   processed. Single-token decode steps are not re-checked (that would slow down every token), so do not feed
   padded inputs to decode steps directly.
+- `KushHFCache(..., rotate=False)` turns the Hadamard rotation off (default: `KUSHKASH_ROTATE`, on for 4 bits).
 - One `KushHFCache` per generation. Every forward pass that uses kushkash attention must pass the cache as
   `past_key_values` with `use_cache=True`; otherwise it raises an error.
 
@@ -307,11 +322,33 @@ used for vLLM's cache blocks and for the Hugging Face cache, so both share the s
   of letting those channels blow up the error for all the others.
 - **Values** get one scale and offset *per token*.
 
+This split (keys per channel, values per token, asymmetric scale and offset) is the one proposed by KIVI
+[[1]](#references), which showed why it suits the two tensors: keys have fixed outlier channels, values do not.
+kushkash uses it at 4 and 8 bits with a group of 32 tokens (one page); KIVI's focus is 2 bits.
+
 **The page being filled.** Because key ranges are computed over a full page, the keys of the newest, not yet
 full page are kept exactly (in the model's dtype) in a small per-request buffer and are quantized as soon as
-the page fills. Values have per-token ranges, so each new value is written straight into its final place in
-the page. The extra buffer costs `max_num_seqs × layers × kv_heads × 32 × head_size × 2` bytes in vLLM
-(about 235 MB for Qwen2.5-7B with 256 request slots); vLLM sizes the rest of the cache around it.
+the page fills. This is KIVI's full-precision window of recent tokens [[1]](#references), kept as small as the
+format allows: only the unfinished page, and only for keys. Values have per-token ranges, so each new value is
+written straight into its final place in the page. The extra buffer costs
+`max_num_seqs × layers × kv_heads × 32 × head_size × 2` bytes in vLLM (about 235 MB for Qwen2.5-7B with 256
+request slots); vLLM sizes the rest of the cache around it.
+
+**Rotation (4 bits).** Before keys and values reach the cache, they are multiplied by a Hadamard matrix `H`
+(orthonormal, along the head dimension), as in QuaRot [[2]](#references); queries are rotated the same way and the
+attention output is rotated back. Attention only uses dot products, and `q·k = (qH)·(kH)`, so the result is the
+same attention, but the rotation spreads each vector's few large channels over all channels. That tightens the
+per-token value ranges most (keys already get per-channel ranges). The exact key buffer then holds rotated keys,
+rounded once to the model's dtype. In an emulation of this cache inside transformers attention it lowered the KL
+divergence from a 16-bit cache by 11–46% (Qwen2.5-1.5B, Llama-3.2-1B, Qwen2.5-7B; WikiText-2 at 2k and 8k tokens),
+at the same size and with the same kernels. Its cost is three small matrix multiplies per layer and step (queries,
+keys and values) plus one for the output, and their temporary results: about 190 MB for an 8,192-token prompt step
+of Qwen2.5-7B (calculated), less than the model's own MLP needs at that step. Measured end to end in vLLM
+(Qwen2.5-7B-Instruct, one L4, 4 GiB KV budget, rotation off vs on): chunked-prefill perplexity 6.0127 vs 6.0105
+(16-bit cache: 6.001), passkey 10/10 at 8k and 16k both, sustained output tokens/s 401.2 vs 395.1 (−1.5%; two
+8-bit identical runs differed by 0.1%). At 8 bits it is off by default (not measured). Pages written with and
+without rotation must not be mixed, so use the same `KUSHKASH_ROTATE` setting in every process that shares a
+cache.
 
 **Attention kernels.**
 
@@ -329,7 +366,8 @@ the page. The extra buffer costs `max_num_seqs × layers × kv_heads × 32 × he
   FlashAttention in vLLM, or PyTorch's attention in the Hugging Face integration.
 
 The CPU kernels use the same format and the same arithmetic as the GPU kernels: given the same inputs, both
-produce byte-for-byte identical pages (this is tested).
+produce byte-for-byte identical pages (this is tested with the rotation off; with it on, the rotation itself
+may round differently on the two devices).
 
 ## Tests and benchmarks
 
@@ -392,6 +430,15 @@ kushkash/
 tests/                 test suites (see above)
 bench/                 benchmarks (see above)
 ```
+
+## References
+
+1. Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, Xia Hu.
+   *KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache.* ICML 2024.
+   [arXiv:2402.02750](https://arxiv.org/abs/2402.02750)
+2. Saleh Ashkboos, Amirkeivan Mohtashami, Maximilian L. Croci, Bo Li, Pashmina Cameron, Martin Jaggi, Dan
+   Alistarh, Torsten Hoefler, James Hensman. *QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs.*
+   NeurIPS 2024. [arXiv:2404.00456](https://arxiv.org/abs/2404.00456)
 
 ## What kushkash is not
 

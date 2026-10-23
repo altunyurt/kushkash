@@ -88,14 +88,15 @@ class KushHFCache(Cache):
         config: the model config (attention shape is read from it).
         bits: 4 (default, ~3.5x smaller than fp16) or 8 (~1.9x, near-lossless).
         max_length: optional per-sequence capacity hint (pools grow on demand otherwise).
+        rotate: Hadamard rotation inside the cache (None: KUSHKASH_ROTATE, auto = on for 4-bit).
     """
 
-    def __init__(self, config, bits: int = 4, max_length: int | None = None):
+    def __init__(self, config, bits: int = 4, max_length: int | None = None, rotate: bool | None = None):
         cfg = config.get_text_config() if hasattr(config, "get_text_config") else config
         self.num_layers = cfg.num_hidden_layers
         self.num_q_heads = cfg.num_attention_heads
         self.head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
-        self.bits, self.max_length = bits, max_length
+        self.bits, self.max_length, self.rotate = bits, max_length, rotate
         self.kv: KushCache | None = None
         super().__init__(layers=[_KushLayer(self, i) for i in range(self.num_layers)])
 
@@ -105,7 +106,8 @@ class KushHFCache(Cache):
         if self.kv is None:
             B, H, _, D = key_states.shape
             self.kv = KushCache(self.num_layers, H, self.num_q_heads, D, batch_size=B, bits=self.bits,
-                                device=key_states.device, dtype=key_states.dtype, max_length=self.max_length)
+                                device=key_states.device, dtype=key_states.dtype, max_length=self.max_length,
+                                rotate=self.rotate)
         self.layers[layer_idx].is_initialized = True
         _active.cache = self                # kush_attention gets no cache argument: this is the hand-off
         return key_states, value_states     # unchanged: the attention consumes the chunk, not the cache

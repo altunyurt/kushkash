@@ -55,6 +55,9 @@ def run_one(a):
     res = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "kv_tokens": cc.kv_cache_size_tokens,
            "attn_block": cc.effective_attention_block_size, "kv_gib": a.kv_gib,
            "max_num_seqs": llm.llm_engine.vllm_config.scheduler_config.max_num_seqs}
+    if a.kv.startswith("kush"):                       # Hadamard rotation in the cache (auto = on for 4-bit)
+        from kushkash._ops import rotation_enabled
+        res["rotate"] = rotation_enabled(int(a.kv[4:]))
 
     rng = random.Random(0)
     if not a.only_throughput:

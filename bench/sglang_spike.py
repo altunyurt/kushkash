@@ -47,6 +47,9 @@ info = eng.get_server_info()
 res = {"kind": a["kind"], "kv_tokens": info.get("max_total_num_tokens"),
        "attention_backend": info.get("attention_backend"), "page_size": info.get("page_size"),
        "max_running_requests": info.get("max_running_requests")}
+if a["kind"] != "default":                        # Hadamard rotation in the cache (auto = on for 4-bit)
+    from kushkash._ops import rotation_enabled
+    res["rotate"] = rotation_enabled(int(a["kind"][4:]))
 tok = AutoTokenizer.from_pretrained(a["model"])
 filler = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
 rng = random.Random(0)

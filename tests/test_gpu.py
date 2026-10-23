@@ -19,7 +19,8 @@ def test_pages_match_cpu(bits, D):
     K[..., 1] += 50
     caches = {}
     for dev in ("cpu", "cuda"):
-        c = kk.KushCache(1, H, H, D, batch_size=B, bits=bits, device=dev, dtype=torch.float32)
+        # kernels only: a rotation would sum in a device-dependent order before the kernels see K, V
+        c = kk.KushCache(1, H, H, D, batch_size=B, bits=bits, device=dev, dtype=torch.float32, rotate=False)
         c.write(0, K[:, :, :40].to(dev), V[:, :, :40].to(dev))                 # bulk fill
         for t in range(40, T):                                                  # token appends
             c.write(0, K[:, :, t:t + 1].to(dev), V[:, :, t:t + 1].to(dev))
@@ -59,6 +60,33 @@ def test_decode_matches_reference(D, bits, G, dtype, B, N):
         err = ((out - ref).norm() / ref.norm()).item()
         tol = 1e-5 if dtype == torch.float32 and not c.ops.cfg.tensor_cores else 2e-2 if dtype == torch.bfloat16 else 3e-3
         assert err < tol, (t, err)
+
+
+def test_rotate_rounds_once_gpu():
+    """rotate() on CUDA: the exact orthonormal product rounded once (cuBLAS, fp32 accumulation and alpha)."""
+    from kushkash._ops import hadamard, rotate
+    unit = {torch.float32: 2.0 ** -24, torch.float16: 2.0 ** -11, torch.bfloat16: 2.0 ** -8}
+    for dt, u in unit.items():
+        for D in (64, 128, 256):
+            h = hadamard(D, "cuda")
+            x = torch.randn(6, 8, D, device="cuda").to(dt)[:, ::2]
+            y = rotate(x, h)
+            ref = x.double() @ h.double()
+            tol = u * ref.abs() + 1e-5                    # fp32 under TF32 would be off by ~1e-3 and fail
+            assert y.dtype == dt and bool(((y.double() - ref).abs() <= tol).all()), (dt, D)
+
+
+def test_rotated_cache_gpu_matches_cpu():
+    """Rotation on: GPU and CPU attention agree (pages may differ in rare rounding flips, the outputs must not)."""
+    B, H, G, D, T = 2, 2, 4, 128, 3 * PAGE + 5
+    K, V, q = torch.randn(B, H, T, D) * 2, torch.randn(B, H, T, D), torch.randn(B, H * G, D)
+    K[..., 1] += 50
+    outs = []
+    for dev in ("cpu", "cuda"):
+        c = kk.KushCache(1, H, H * G, D, batch_size=B, bits=4, device=dev, dtype=torch.float32, rotate=True)
+        c.write(0, K.to(dev), V.to(dev))
+        outs.append(c.attend(0, q.to(dev)).cpu())
+    assert (outs[0] - outs[1]).norm() / outs[0].norm() < 3e-3
 
 
 def test_split_k_long_context():

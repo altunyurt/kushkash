@@ -7,6 +7,8 @@ Memory per layer
     pool     uint8 [pages, Hkv, RB]       one record per (page, kv head): codes + scales
     tail_k   [B, Hkv, 32, D]              K of the page being filled, exact (model dtype; fp32 on
                                           CPU); its V rows are already final in the page's record
+With rotation on (rotate=, KUSHKASH_ROTATE), pages and tail hold K H and V H (Hadamard H); every public method
+takes and returns unrotated tensors.
 Shared by all layers: block_table int32 [B, max_pages] (logical -> physical page).
 """
 from __future__ import annotations
@@ -15,7 +17,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ._ops import PAGE, Ops, as_records, cached_kv, default_scale, history_attention, record_bytes
+from ._ops import (PAGE, Ops, as_records, cached_kv, default_scale, hadamard, history_attention, record_bytes,
+                   rotate, rotation_enabled)
 
 _GPU_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -47,11 +50,14 @@ class KushCache:
         dtype: dtype of q / k / v given to the cache and of the attention output.
         max_length: optional per-sequence capacity hint; pools grow on demand otherwise.
         scale: softmax scale (default 1/sqrt(head_dim)).
+        rotate: Hadamard-rotate K, V and q inside the cache (lower error, same size and kernels). None:
+            KUSHKASH_ROTATE (auto: on for 4-bit, off for 8-bit). Inputs and outputs stay unrotated.
     """
 
     def __init__(self, num_layers: int, num_kv_heads: int, num_q_heads: int, head_dim: int, *,
                  batch_size: int = 1, bits: int = 4, device: str | torch.device = "cuda",
-                 dtype: torch.dtype = torch.float16, max_length: int | None = None, scale: float | None = None):
+                 dtype: torch.dtype = torch.float16, max_length: int | None = None, scale: float | None = None,
+                 rotate: bool | None = None):
         if bits not in (4, 8):
             raise ValueError("bits must be 4 or 8")
         if num_q_heads % num_kv_heads:
@@ -71,6 +77,7 @@ class KushCache:
                 self.device = torch.device("cuda", torch.cuda.current_device())
         self.kdtype = dtype if self.gpu else torch.float32           # kernel / tail dtype
         self.ops = Ops(self.device, head_dim, bits, self.G, self.kdtype)
+        self.rot = hadamard(head_dim, self.device) if rotation_enabled(bits, rotate) else None
         self._work = torch.empty(0, dtype=torch.float32, device=self.device)
         pages0 = max(1, -(-(max_length or 4 * PAGE) // PAGE))
         self._pages = 0
@@ -136,6 +143,7 @@ class KushCache:
             return
         n = self._len[layer]
         self._map(-(-(n + T) // PAGE))                 # incl. the partial page (holds its V rows)
+        k, v = rotate(k, self.rot, self.kdtype), rotate(v, self.rot, self.kdtype)
         # kernel rows: [B*T, H, D] with head stride D (HF's [B, H, T, D] is a transpose of this)
         k = k.transpose(1, 2).to(self.kdtype)
         v = v.transpose(1, 2).to(self.kdtype)
@@ -163,7 +171,7 @@ class KushCache:
         only grows, and freeze() fixes its size for CUDA graphs."""
         if self._len[layer] == 0:
             raise RuntimeError("attend() on an empty cache")
-        q = q.to(self.kdtype).contiguous()
+        q = rotate(q, self.rot, self.kdtype).contiguous()
         out = torch.empty_like(q)
         ns = self._frozen_ns or (self.ops.splits(self.B, self.H, self._len[layer] // PAGE) if self.gpu else 1)
         if ns > 1:
@@ -172,7 +180,7 @@ class KushCache:
                 self._work = torch.empty(need, dtype=torch.float32, device=self.device)
         self.ops.decode(q, out, self.pool[layer], self.block_table, self.seq_lens[layer], self.tail_idx,
                         self.tail_k[layer], self.scale, ns, self._work)
-        return out.to(self.dtype)
+        return rotate(out, self.rot, self.dtype)
 
     def attend_chunk(self, layer: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                      block_bytes: int = 1 << 28) -> torch.Tensor:
@@ -183,18 +191,21 @@ class KushCache:
         if prof:
             ev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
             ev[0].record()
+        q, k, v = rotate(q, self.rot), rotate(k, self.rot), rotate(v, self.rot)
         out = history_attention(q, k, v, as_records(self.pool[layer]), self.block_table, self._len[layer],
                                 self.tail_k[layer], self.D, self.bits, self.scale, block_bytes)
+        out = rotate(out, self.rot)
         if prof:
             ev[1].record()
             self.profile.append(ev)
         return out
 
     def dequantize(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reference: the cached K, V of `layer` as [B, Hkv, n, D] in self.dtype. Testing only;
-        materializes the whole history (attend_chunk does not)."""
-        return cached_kv(self.pool[layer], self.block_table, self._len[layer], self.tail_k[layer], self.D,
+        """Reference: the cached K, V of `layer` as [B, Hkv, n, D] in self.dtype, rotated back if the cache
+        rotates. Testing only; materializes the whole history (attend_chunk does not)."""
+        k, v = cached_kv(self.pool[layer], self.block_table, self._len[layer], self.tail_k[layer], self.D,
                          self.bits, self.dtype)
+        return rotate(k, self.rot), rotate(v, self.rot)
 
     # ---------------------------------------------------------------- CUDA-graph support
     def freeze(self, max_tokens: int) -> None:

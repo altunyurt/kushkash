@@ -11,10 +11,13 @@ Tensor conventions
               record (per-token codes), so that page must be mapped in the block table.
   k, v rows   [rows, H, D] (row strides free, may differ between k and v; head stride D)
   q, out      [S, Hq, D] contiguous
+  rotation    the kernels do not rotate: with rotation on, callers pass q H, k H, v H (rotate()) and rotate
+              the output back
 """
 from __future__ import annotations
 
 import math
+import os
 import warnings
 
 import torch
@@ -246,6 +249,65 @@ def history_attention(q: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor,
 def pages_touched(ctx: int, total: int) -> range:
     """Logical pages written when positions [ctx, total) are added."""
     return range(ctx // PAGE, (total - 1) // PAGE + 1) if total > ctx else range(0)
+
+
+_HADAMARD: dict = {}
+
+
+def rotation_enabled(bits: int, rotate: bool | None = None) -> bool:
+    """Whether K, V and q are rotated by a Hadamard matrix before they meet the cache. None: the
+    KUSHKASH_ROTATE environment variable (auto | 1 | 0; auto = on for 4-bit, where it was measured to cut
+    the cache's error by 11-46% (KL divergence vs fp16, 3 models), off for 8-bit, where it was not measured)."""
+    if rotate is None:
+        env = os.environ.get("KUSHKASH_ROTATE", "auto")
+        if env not in ("auto", "0", "1"):
+            raise ValueError(f"KUSHKASH_ROTATE must be auto, 0 or 1, got {env}")
+        return bits == 4 if env == "auto" else env == "1"
+    return bool(rotate)
+
+
+def hadamard(head_dim: int, device) -> torch.Tensor:
+    """Orthonormal, symmetric Walsh-Hadamard matrix [D, D] in fp32 (H @ H = I), cached per device.
+
+    Why: attention only sees dot products, and q.k = (qH).(kH) for an orthogonal H, so the cache can hold
+    rotated K and V and attention is unchanged (the output, a mix of rotated V rows, is rotated back with H
+    again). The rotation spreads each token's few outlier channels over all channels, so the per-token V
+    scale and the per-channel K ranges of a page are tighter, and 4-bit codes lose less."""
+    key = (head_dim, str(device))
+    if key not in _HADAMARD:
+        if head_dim & (head_dim - 1):
+            raise ValueError(f"Hadamard rotation needs a power-of-2 head_dim, got {head_dim}")
+        h = torch.ones(1, 1, dtype=torch.float64)
+        while h.shape[0] < head_dim:
+            h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+        _HADAMARD[key] = (h / math.sqrt(head_dim)).to(torch.float32).to(device)
+    return _HADAMARD[key]
+
+
+def _signs(head_dim: int, device, dtype: torch.dtype) -> torch.Tensor:
+    """sqrt(D) H: the same Hadamard matrix with entries +-1, exact in every dtype."""
+    key = ("signs", head_dim, str(device), dtype)
+    if key not in _HADAMARD:
+        h = hadamard(head_dim, device)
+        _HADAMARD[key] = torch.sign(h).to(dtype)
+    return _HADAMARD[key]
+
+
+def rotate(x: torch.Tensor, h: torch.Tensor | None, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """x @ h over the last dim, returned contiguous in `dtype` (default x's). h None: x unchanged.
+
+    One GEMM in the output dtype with the +-1 matrix (exact) and the 1/sqrt(D) factor applied as the GEMM's
+    fp32 alpha, so the result is the exactly orthonormal product rounded once, with no fp32 copies of x
+    (a bf16 / fp16 H would not be orthonormal at D = 128: 1/sqrt(128) is not representable). H is symmetric
+    and H @ H = I, so the same call rotates back."""
+    if h is None:
+        return x if dtype is None else x.to(dtype)
+    dtype = dtype or x.dtype
+    D = h.shape[0]
+    x2 = x.to(dtype).reshape(-1, D)
+    # beta=0: the first argument is ignored (never read, NaN-safe); passing x2 avoids allocating a zero tensor
+    y = torch.addmm(x2, x2, _signs(D, h.device, dtype), beta=0, alpha=1.0 / math.sqrt(D))
+    return y.view(x.shape)
 
 
 def default_scale(head_dim: int) -> float:

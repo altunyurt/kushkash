@@ -44,8 +44,8 @@ from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_availa
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 
-from kushkash._ops import (PAGE, Ops, as_records, cached_kv, dequant_records, history_attention, pages_touched,
-                           record_bytes)
+from kushkash._ops import (PAGE, Ops, as_records, cached_kv, dequant_records, hadamard, history_attention,
+                           pages_touched, record_bytes, rotate, rotation_enabled)
 
 _HAS_FA = is_flash_attn_varlen_func_available()
 if _HAS_FA:
@@ -417,6 +417,9 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
         # so vLLM sizes the KV pool around it)
         shape = (vc.scheduler_config.max_num_seqs, self.num_kv_heads, PAGE, head_size)
         self.tail_k = torch.zeros(shape, dtype=self.dtype, device=device)
+        # the cache holds Hadamard-rotated K/V (KUSHKASH_ROTATE; auto = 4-bit): q is rotated the same way
+        # and the output rotated back, so the model sees plain attention
+        self.rot = hadamard(head_size, device) if rotation_enabled(self.bits) else None
         self.ops: Ops | None = None
         self.work: torch.Tensor | None = None
         self.fa_version = get_flash_attn_version(head_size=head_size) if _HAS_FA else None
@@ -451,17 +454,23 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
         # a fresh K while V stays a view into qkv); kernels need unit dim stride and head stride D
         k, v = _rows(key.view(-1, self.num_kv_heads, self.head_size)), _rows(value.view(-1, self.num_kv_heads, self.head_size))
         ops = self._ensure_ops(query.device)
+        o = out
+        if self.rot is not None:
+            q, k, v = rotate(q, self.rot), rotate(k, self.rot), rotate(v, self.rot)
+            o = torch.empty_like(q)
         nd = md.num_decodes
         check = (_CHECK and getattr(layer, "layer_name", "").endswith(".0.self_attn.attn")
                  and not (q.is_cuda and torch.cuda.is_current_stream_capturing()) and _check_calls[0] < 400)
         if check:
             ref_pre = self._check_prefill_refs(q, k, v, kv_cache, md)          # before this step's writes
         if nd:
-            self._decode(ops, q[:nd], k[:nd], v[:nd], out[:nd], kv_cache, md)
+            self._decode(ops, q[:nd], k[:nd], v[:nd], o[:nd], kv_cache, md)
         if md.num_reqs > nd:
-            self._prefill(ops, q, k, v, out, kv_cache, md, N)
+            self._prefill(ops, q, k, v, o, kv_cache, md, N)
         if check:
-            self._check_log(q, out, kv_cache, md, N, ref_pre)
+            self._check_log(q, o, kv_cache, md, N, ref_pre)                  # in the cache's (rotated) space
+        if o is not out:                              # padded rows beyond N stay as vLLM left them
+            out[:N].copy_(rotate(o[:N], self.rot))
         if _SYNC and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return output

@@ -159,6 +159,57 @@ _ENTRY = re.compile(r"\.visible\s+\.entry\s+(\S+)\(([^)]*)\)", re.S)
 _PARAM = re.compile(r"\.param\s+\.(\w+)")
 
 
+def _close(src: str, i: int) -> int:
+    """Index just past the bracket that closes the one opening at src[i] ('(' or '[')."""
+    depth = 0
+    for k in range(i, len(src)):
+        if src[k] in "([":
+            depth += 1
+        elif src[k] in ")]":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    raise BuildError("unbalanced brackets in Mojo source")
+
+
+def mojo_param_types(src: str, fn: str) -> list[str]:
+    """Declared types of the runtime parameters of `def fn[...](...)` in Mojo source, e.g.
+    ['Pointer[Scalar[IN], MutAnyOrigin]', ..., 'Int32', 'Float32', ...]."""
+    m = re.search(rf"\bdef\s+{fn}\s*\[", src)
+    if m is None:
+        raise BuildError(f"kernel {fn} not found in the Mojo source")
+    i = src.index("(", _close(src, m.end() - 1))
+    body = src[i + 1:_close(src, i) - 1]
+    parts, depth, start = [], 0, 0
+    for k, c in enumerate(body):
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c == "," and depth == 0:
+            parts.append(body[start:k])
+            start = k + 1
+    parts.append(body[start:])
+    return [p.split(":", 1)[1].strip() for p in parts if p.strip()]
+
+
+def param_types(fn: str, ptx: list[str], mojo: list[str]) -> tuple[str, ...]:
+    """PTX parameter types with Mojo's Float32 parameters marked 'f32'. Mojo 1.1 emits `.f32` for them; Mojo
+    1.2 emits `.b32` for every 32-bit parameter, ints and floats alike, so the PTX alone no longer says how a
+    Python float must be packed. Checks that both lists agree on count and width."""
+    if len(ptx) != len(mojo):
+        raise BuildError(f"{fn}: {len(ptx)} PTX parameters, {len(mojo)} in the Mojo source")
+    out = []
+    for p, t in zip(ptx, mojo):
+        if t == "Float32":
+            if p not in ("f32", "b32"):
+                raise BuildError(f"{fn}: Float32 parameter emitted as .{p}")
+            out.append("f32")
+        else:
+            out.append(p)
+    return tuple(out)
+
+
 def _emit_ptx(cfg: GpuConfig, arch: str, tmp: Path) -> dict[str, str]:
     body = "".join(
         f'    print("@@{name}")\n    print(String(compile_info[{inst}, emission_kind="asm", target=T]()))\n'
@@ -191,8 +242,11 @@ def gpu_modules(cfg: GpuConfig) -> dict[str, tuple[str, str, tuple[str, ...]]]:
         (tmp / "ok").write_text(repr(cfg))
         _publish(tmp, out)
     mods = {}
-    for name in cfg.kernels():
+    src = (MOJO_DIR / "gpu.mojo").read_text()
+    for name, inst in cfg.kernels().items():
         path = out / f"{name}.ptx"
         m = _ENTRY.search(path.read_text())
-        mods[name] = (str(path), m.group(1), tuple(_PARAM.findall(m.group(2))))
+        fn = inst.split("[", 1)[0]
+        mods[name] = (str(path), m.group(1),
+                      param_types(fn, _PARAM.findall(m.group(2)), mojo_param_types(src, fn)))
     return mods

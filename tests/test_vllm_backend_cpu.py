@@ -26,8 +26,10 @@ def _cpu_only(monkeypatch):
     - KushAttentionImpl puts its K tail on CUDA whenever a GPU is visible; the CPU kernels would then write
       through a device pointer (illegal memory access, and the error sticks to the process).
     - With vLLM's flash-attn installed, the backend would call its CUDA-only kernel on CPU tensors. Tests that
-      want the flash-attn paths set _HAS_FA and the CPU stand-in (fake_flash) themselves."""
+      want the flash-attn paths set _HAS_FA and the CPU stand-in (fake_flash) themselves.
+    - References read the stored pages as they are: no Hadamard rotation unless a test turns it on."""
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("KUSHKASH_ROTATE", "0")
     monkeypatch.setattr(kb, "_HAS_FA", False)
 
 
@@ -52,11 +54,13 @@ def fake_flash(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, 
 @pytest.mark.parametrize("fa,mode", [(False, "loop"), (True, "loop"), (True, "packed"), (True, "packed-fallback"),
                                      (True, "packed-sliced")])
 @pytest.mark.parametrize("bits", [4, 8])
-def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
+@pytest.mark.parametrize("rot", [False, True])
+def test_backend_mixed_steps(bits, fa, mode, rot, monkeypatch):
     """loop: history rows per row with LSE merges; packed: all prefill rows in one (fake) flash-attn varlen call;
     packed-fallback: packed mode with a zero byte budget, so every step falls back to the loop path;
     packed-sliced: a 1 MiB budget, so history is dequantized in 2-page slices and the larger steps fall back."""
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
+    monkeypatch.setenv("KUSHKASH_ROTATE", "1" if rot else "0")
     monkeypatch.setenv("KUSHKASH_PREFILL", mode.split("-")[0])
     if mode == "packed-fallback":
         monkeypatch.setenv("KUSHKASH_PACK_MB", "0")
@@ -74,6 +78,8 @@ def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
     monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
     impl = kb.KushAttentionImpl(H * G, D, D ** -0.5, num_kv_heads=H)
     impl.fa_version = None
+    assert (impl.rot is not None) == rot
+    h = impl.rot if rot else torch.eye(D)                             # pages / tail hold K h, V h
     builder = kb.KushMetadataBuilder(SimpleNamespace(num_kv_heads=H, head_size=D), ["l0"], cfg, torch.device("cpu"))
     packed_calls = []
     orig_packed = impl._prefill_packed
@@ -90,7 +96,7 @@ def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
     def history(r, n):                                                # stored state as the kernels see it
         ts = slot_of[r]
         k, v = cached_kv(as_records(kv_cache), table[r:r + 1], n, impl.tail_k[ts:ts + 1], D, bits, torch.float32)
-        return k[0], v[0]
+        return k[0] @ h, v[0] @ h                                     # back to model space (h symmetric, h h = I)
 
     plans = [[(0, 70), (1, 5)], [(2, 33), (3, 64)], [(4, 40), (0, 7), (5, 20)]] + [None] * 30   # fresh/hist/fresh
     for plan in plans:
@@ -141,7 +147,8 @@ def test_backend_mixed_steps(bits, fa, mode, monkeypatch):
             assert (out[a:b] - ref).norm() / ref.norm() < 2e-5, (r, lens[r], b - a)
             lens[r] = int(sl[i])
             n = lens[r]
-            assert torch.equal(impl.tail_k[slot_of[r], :, :n % PAGE], exact[r][0][:, n // PAGE * PAGE:])
+            tail, ref_tail = impl.tail_k[slot_of[r], :, :n % PAGE], exact[r][0][:, n // PAGE * PAGE:]
+            assert torch.equal(tail, ref_tail) if not rot else torch.allclose(tail @ h, ref_tail, atol=1e-5)
     assert bool(packed_calls) == (mode in ("packed", "packed-sliced"))  # the packed path ran (and only when asked)
     if mode == "packed-sliced":
         # page slices are <= 2 records; the partial-page read is one record per row (<= n_req). The exact slice
