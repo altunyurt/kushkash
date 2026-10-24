@@ -5,6 +5,7 @@
     python bench/headline.py --quick                           # 2 min windows, ~35 min (rougher numbers)
     python bench/headline.py --quick --reuse-accuracy old.jsonl  # ~20 min
     python bench/headline.py --summarize headline.jsonl        # re-print the table from saved results
+    python bench/headline.py --quantization fp8 --kv-gib 10 --out headline_fp8.jsonl  # KV formats on FP8 weights
 
 Runs bench/vllm_compare.py (each configuration in its own process) and prints one Markdown table with the
 measured values and the ratio to vLLM's default cache. Every run gets the same KV cache budget in bytes
@@ -28,6 +29,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def run(args, out):
     cmd = [sys.executable, os.path.join(HERE, "vllm_compare.py"), "--model", ARGS.model, "--out", out] + args
+    if ARGS.quantization:
+        cmd += ["--quantization", ARGS.quantization]
     subprocess.run(cmd, check=True)
 
 
@@ -58,17 +61,17 @@ def summarize(path, seq_len=4096):
     if "auto" not in acc and "auto" not in best:
         sys.exit("no results for kv=auto in " + path)
     meta = next((r for r in reversed(rows) if r.get("model")), {})   # newest row: this run's metadata
-    print(f"\nModel {meta.get('model')}, vLLM {meta.get('vllm')}, kushkash {meta.get('kushkash')}, "
-          f"GPU {meta.get('gpu')}\n")
-    mixed = [f"{k}={', '.join(sorted({r[k] for r in rows if r.get(k)}))}" for k in ("gpu", "kushkash")
-             if len({r.get(k) for r in rows if r.get(k)}) > 1]   # e.g. --reuse-accuracy from another run
+    print(f"\nModel {meta.get('model')}, weights {meta.get('quantization') or 'checkpoint dtype'}, "
+          f"vLLM {meta.get('vllm')}, kushkash {meta.get('kushkash')}, GPU {meta.get('gpu')}\n")
+    mixed = [f"{k}={', '.join(sorted({str(r.get(k)) for r in rows}))}" for k in ("gpu", "kushkash", "quantization")
+             if len({r.get(k) for r in rows}) > 1]   # e.g. --reuse-accuracy from another run
     if mixed:
         print(f"WARNING: rows come from mixed runs: {'; '.join(mixed)}\n")
 
     def ratio(a, b, fmt="{:.2f}x"):
         return fmt.format(a / b) if a and b else ""
 
-    hdr = ["", "vLLM default (bf16)", "kushkash 4-bit", "vs default", "kushkash 8-bit", "vs default"]
+    hdr = ["", "vLLM default KV (16-bit)", "kushkash 4-bit", "vs default", "kushkash 8-bit", "vs default"]
     lines = ["| " + " | ".join(hdr) + " |", "|" + "---|" * len(hdr)]
 
     def row(label, key, src, fmt=lambda x: f"{x:,}", higher=True):
@@ -126,7 +129,7 @@ def main():
                        capture_output=True, text=True)
     names = q.stdout.strip().splitlines()
     gpu = names[0] if q.returncode == 0 and names else f"device {vis}"
-    meta = {"kushkash": kushkash.__version__, "gpu": gpu}
+    meta = {"kushkash": kushkash.__version__, "gpu": gpu, "quantization": ARGS.quantization}
     open(out, "w").close()
     budget = ["--kv-gib", str(ARGS.kv_gib)]
     ln, secs = 2048, (120 if ARGS.quick else ARGS.tp_seconds)
@@ -134,8 +137,10 @@ def main():
                    "--tp-out", str(ln), "--batched-tokens", "8192"]
     if ARGS.reuse_accuracy:                             # ppl / passkey / capacity from an earlier run, same budget
         old = [r for r in load(ARGS.reuse_accuracy) if r.get("phase") == "accuracy"]
-        if not old or {r.get("kv_gib") for r in old} != {ARGS.kv_gib} or {r.get("model") for r in old} != {ARGS.model}:
-            sys.exit(f"{ARGS.reuse_accuracy}: no accuracy rows for {ARGS.model} at --kv-gib {ARGS.kv_gib}")
+        if not old or {r.get("kv_gib") for r in old} != {ARGS.kv_gib} or {r.get("model") for r in old} != {ARGS.model} \
+                or {r.get("quantization") for r in old} != {ARGS.quantization}:
+            sys.exit(f"{ARGS.reuse_accuracy}: no accuracy rows for {ARGS.model} at --kv-gib {ARGS.kv_gib}, "
+                     f"--quantization {ARGS.quantization}")
         with open(out, "a") as f:
             f.write("".join(json.dumps(r) + "\n" for r in old))
     elif ARGS.no_accuracy:                              # capacity only: engine load, no ppl / passkey
@@ -166,7 +171,10 @@ if __name__ == "__main__":
     ap.add_argument("--sweep", action="store_true", help="also run kush4 at vLLM's default max_num_seqs and at cap+8")
     ap.add_argument("--tp-seconds", type=float, default=300, help="sustained-throughput window per run")
     ap.add_argument("--kv-gib", type=float, default=4.0,
-                    help="KV cache budget for every run (4.0 fits a 7B bf16 model on a 24 GB L4)")
+                    help="KV cache budget for every run (4.0 fits a 7B bf16 model on a 24 GB L4; FP8 weights free "
+                         "~6 GiB more)")
+    ap.add_argument("--quantization", default=None,
+                    help="weight quantization for every run, passed to vLLM (e.g. fp8); recorded in each row")
     ap.add_argument("--summarize", default=None, help="print the table from an existing results file")
     ARGS = ap.parse_args()
     main()

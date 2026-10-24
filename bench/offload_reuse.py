@@ -42,12 +42,14 @@ if a["offload_gib"]:
     extra["kv_offloading_size"] = a["offload_gib"]
     extra["kv_offloading_backend"] = "native"
 llm = LLM(model=a["model"], max_model_len=a["max_len"], kv_cache_memory_bytes=int(a["kv_gib"] * 2**30),
+          quantization=a["quantization"],
           enforce_eager=a["eager"], seed=0, enable_prefix_caching=True, enable_chunked_prefill=True,
           max_num_batched_tokens=a["batched_tokens"], disable_log_stats=False, **extra)
 vc = llm.llm_engine.vllm_config
 ktc = vc.kv_transfer_config
 res = {"kind": a["kind"], "offload_gib": a["offload_gib"], "kv_tokens": vc.cache_config.kv_cache_size_tokens,
-       "connector": getattr(ktc, "kv_connector", None) if ktc else None, "order": a["order"]}
+       "connector": getattr(ktc, "kv_connector", None) if ktc else None, "order": a["order"],
+       "quantization": a["quantization"]}
 tok = AutoTokenizer.from_pretrained(a["model"])
 
 def metrics():
@@ -106,7 +108,7 @@ print("RESULT " + json.dumps(res))
 
 def child(args, kind, offload):
     cfg = {k: getattr(args, k) for k in ("model", "kv_gib", "max_len", "batched_tokens", "eager", "sessions",
-                                         "context_tokens", "turn_tokens", "rounds", "order")}
+                                         "context_tokens", "turn_tokens", "rounds", "order", "quantization")}
     cfg.update(kind=kind, offload_gib=offload)
     print(f"== {kind} offload={offload or 'off'} ==", flush=True)
     p = subprocess.run([sys.executable, "-c", CHILD, json.dumps(cfg)], capture_output=True, text=True,
@@ -171,6 +173,7 @@ def main():
     ap.add_argument("--max-len", type=int, default=16384)
     ap.add_argument("--batched-tokens", type=int, default=8192)
     ap.add_argument("--eager", action="store_true")
+    ap.add_argument("--quantization", default=None, help="weight quantization passed to vLLM (e.g. fp8)")
     ap.add_argument("--out", default="offload_reuse.jsonl")
     ap.add_argument("--summarize", metavar="JSONL")
     args = ap.parse_args()

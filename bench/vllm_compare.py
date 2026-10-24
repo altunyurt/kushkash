@@ -54,7 +54,8 @@ def run_one(a):
     log(f"engine ready: KV capacity {cc.kv_cache_size_tokens} tokens")
     res = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "kv_tokens": cc.kv_cache_size_tokens,
            "attn_block": cc.effective_attention_block_size, "kv_gib": a.kv_gib,
-           "max_num_seqs": llm.llm_engine.vllm_config.scheduler_config.max_num_seqs}
+           "max_num_seqs": llm.llm_engine.vllm_config.scheduler_config.max_num_seqs,
+           "quantization": a.quantization}                 # weights (None = checkpoint dtype)
     if a.kv.startswith("kush"):                       # Hadamard rotation in the cache (auto = on for 4-bit)
         from kushkash._ops import rotation_enabled
         res["rotate"] = rotation_enabled(int(a.kv[4:]))
@@ -147,7 +148,7 @@ def main():
     ap.add_argument("--kv-gib", type=float, default=None,
                     help="pin the KV cache budget (vLLM kv_cache_memory_bytes, GiB) so every config gets the same bytes; "
                          "default: vLLM profiles free memory per run (budget varies run to run)")
-    ap.add_argument("--quantization", default=None, help="weights, e.g. bitsandbytes / awq for small GPUs")
+    ap.add_argument("--quantization", default=None, help="weights, e.g. fp8 (online, sm89+ for FP8 GEMMs) / awq / bitsandbytes")
     ap.add_argument("--passkey-trials", type=int, default=10)
     ap.add_argument("--tp-n", type=int, default=64)
     ap.add_argument("--tp-len", type=int, default=4096)
