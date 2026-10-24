@@ -352,17 +352,17 @@ class KushSGLangBackend(AttentionBackend):
         for p0 in range(0, n_pages, step):            # full history pages, slice by slice
             p1 = min(n_pages, p0 + step)
             blocks = bt[p.page_row[p0:p1], p.page_idx[p0:p1]].long()
-            hk, hv = dequant_records(cache[blocks], D, self.bits, k3.dtype)                     # [n, Hk, 32, D]
+            hk, hv = dequant_records(cache[blocks], D, self.bits, k3.dtype, token_major=True)   # [n, 32, Hk, D]
             dst = (p.page_dst0[p0:p1, None] + ar).flatten()
-            kp.index_copy_(0, dst, hk.transpose(1, 2).reshape(-1, Hk, D))
-            vp.index_copy_(0, dst, hv.transpose(1, 2).reshape(-1, Hk, D))
+            kp.index_copy_(0, dst, hk.view(-1, Hk, D))
+            vp.index_copy_(0, dst, hv.view(-1, Hk, D))
             del hk, hv
         if p.tail_row.numel():                        # partial page: exact K from the tail, V from the record
-            tv = dequant_records(cache[bt[p.tail_row, p.tail_page].long()], D, self.bits, k3.dtype)[1]
-            tk = tail[p.tail_slot]                                                              # [R, Hk, 32, D]
-            kp.index_copy_(0, p.tail_dst, tk.transpose(1, 2).reshape(-1, Hk, D).index_select(0, p.tail_src)
-                           .to(k3.dtype))
-            vp.index_copy_(0, p.tail_dst, tv.transpose(1, 2).reshape(-1, Hk, D).index_select(0, p.tail_src))
+            tv = dequant_records(cache[bt[p.tail_row, p.tail_page].long()], D, self.bits, k3.dtype,
+                                 token_major=True)[1]
+            tk = tail[p.tail_slot[p.tail_src // PAGE], :, p.tail_src % PAGE]                   # [t, Hk, D]
+            kp.index_copy_(0, p.tail_dst, tk.to(k3.dtype))
+            vp.index_copy_(0, p.tail_dst, tv.view(-1, Hk, D).index_select(0, p.tail_src))
         kp.index_copy_(0, p.new_dst, k3)
         vp.index_copy_(0, p.new_dst, v3)
         if self.ragged_attention is not None:

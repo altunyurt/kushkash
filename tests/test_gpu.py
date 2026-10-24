@@ -74,6 +74,9 @@ def test_rotate_rounds_once_gpu():
             ref = x.double() @ h.double()
             tol = u * ref.abs() + 1e-5                    # fp32 under TF32 would be off by ~1e-3 and fail
             assert y.dtype == dt and bool(((y.double() - ref).abs() <= tol).all()), (dt, D)
+            buf = torch.full((8, 4, D), float("nan"), device="cuda", dtype=dt)       # out= (vLLM output buffer)
+            rotate(x, h, out=buf[:6])
+            assert torch.equal(buf[:6], y) and bool(buf[6:].isnan().all()), (dt, D)   # same cuBLAS result, bit for bit
 
 
 def test_rotated_cache_gpu_matches_cpu():

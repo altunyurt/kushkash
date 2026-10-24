@@ -470,7 +470,10 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
         if check:
             self._check_log(q, o, kv_cache, md, N, ref_pre)                  # in the cache's (rotated) space
         if o is not out:                              # padded rows beyond N stay as vLLM left them
-            out[:N].copy_(rotate(o[:N], self.rot))
+            if out.is_contiguous():                   # rotate back straight into vLLM's buffer: no temp + copy
+                rotate(o[:N], self.rot, out=out[:N])
+            else:
+                out[:N].copy_(rotate(o[:N], self.rot))
         if _SYNC and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return output
@@ -580,16 +583,16 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
         for p0 in range(0, n_pages, step):
             p1 = min(n_pages, p0 + step)
             blocks = bt[p.page_row[p0:p1], p.page_idx[p0:p1]].long()
-            hk, hv = dequant_records(rec[blocks], D, self.bits, k.dtype)                          # [n, Hk, 32, D]
+            hk, hv = dequant_records(rec[blocks], D, self.bits, k.dtype, token_major=True)        # [n, 32, Hk, D]
             dst = p.page_dst[p0 * PAGE:p1 * PAGE]
-            kp.index_copy_(0, dst, hk.transpose(1, 2).reshape(-1, Hk, D))
-            vp.index_copy_(0, dst, hv.transpose(1, 2).reshape(-1, Hk, D))
+            kp.index_copy_(0, dst, hk.view(-1, Hk, D))
+            vp.index_copy_(0, dst, hv.view(-1, Hk, D))
             del hk, hv
         if p.tail_row.numel():                        # partial page: exact K from the tail, V from the record
-            tv = dequant_records(rec[bt[p.tail_row, p.tail_page].long()], D, self.bits, k.dtype)[1]
-            tk = self.tail_k[p.tail_slot]                                                         # [R, Hk, 32, D]
-            kp.index_copy_(0, p.tail_dst, tk.transpose(1, 2).reshape(-1, Hk, D).index_select(0, p.tail_src).to(k.dtype))
-            vp.index_copy_(0, p.tail_dst, tv.transpose(1, 2).reshape(-1, Hk, D).index_select(0, p.tail_src))
+            tv = dequant_records(rec[bt[p.tail_row, p.tail_page].long()], D, self.bits, k.dtype, token_major=True)[1]
+            tk = self.tail_k[p.tail_slot[p.tail_src // PAGE], :, p.tail_src % PAGE]                # [t, Hk, D]
+            kp.index_copy_(0, p.tail_dst, tk.to(k.dtype))
+            vp.index_copy_(0, p.tail_dst, tv.view(-1, Hk, D).index_select(0, p.tail_src))
         kp.index_copy_(0, p.new_dst, k[a:b])
         vp.index_copy_(0, p.new_dst, v[a:b])
         flash_attn_varlen_func(q=q[a:b], k=kp, v=vp, cu_seqlens_q=p.cu_q, cu_seqlens_k=p.cu_k, max_seqlen_q=p.max_q,

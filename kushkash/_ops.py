@@ -136,25 +136,31 @@ class Ops:
 
 
 # ---------------------------------------------------------------- reference / prefill helpers
-def dequant_records(rec: torch.Tensor, head_dim: int, bits: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+def dequant_records(rec: torch.Tensor, head_dim: int, bits: int, dtype: torch.dtype,
+                    token_major: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
     """Records [..., RB] (uint8) -> K, V [..., 32, D] in dtype. Pure torch, same math as the
-    kernels (codes * fp16 scale + fp16 bias)."""
+    kernels (codes * fp16 scale + fp16 bias).
+    token_major: records [..., H, RB] -> K, V [..., 32, H, D], contiguous, so the packed prefill can scatter
+    token rows without transposing the dequantized pages (the int8 codes are transposed instead: 2x fewer bytes at 8 bits, 4x at 4).
+    Same values element by element as the default layout."""
     D, P = head_dim, PAGE
     dc = D if bits == 8 else D // 2
     o_ks = 2 * P * dc
     kq = rec[..., :P * dc].view(torch.int8).unflatten(-1, (P, dc))
     vq = rec[..., P * dc:o_ks].view(torch.int8).unflatten(-1, (P, dc))
     meta = rec[..., o_ks:].contiguous().view(torch.float16)        # [..., 2D + 2P]
-    ks, kb = meta[..., :D], meta[..., D:2 * D]
-    vs, vb = meta[..., 2 * D:2 * D + P], meta[..., 2 * D + P:]
+    ks, kb = meta[..., :D].unsqueeze(-2), meta[..., D:2 * D].unsqueeze(-2)              # [..., 1, D]
+    vs, vb = meta[..., 2 * D:2 * D + P, None], meta[..., 2 * D + P:, None]              # [..., P, 1]
+    if token_major:                               # [..., H, P, x] -> [..., P, H, x]
+        kq, vq, ks, kb, vs, vb = (t.transpose(-3, -2) for t in (kq, vq, ks, kb, vs, vb))
 
     def codes(c):
         if bits == 4:
             c = torch.cat([(c << 4) >> 4, c >> 4], -1)
-        return c.to(dtype)
+        return c.to(dtype, memory_format=torch.contiguous_format)
 
-    k = codes(kq).mul_(ks.to(dtype).unsqueeze(-2)).add_(kb.to(dtype).unsqueeze(-2))
-    v = codes(vq).mul_(vs.to(dtype).unsqueeze(-1)).add_(vb.to(dtype).unsqueeze(-1))
+    k = codes(kq).mul_(ks.to(dtype)).add_(kb.to(dtype))
+    v = codes(vq).mul_(vs.to(dtype)).add_(vb.to(dtype))
     return k, v
 
 
@@ -293,19 +299,43 @@ def _signs(head_dim: int, device, dtype: torch.dtype) -> torch.Tensor:
     return _HADAMARD[key]
 
 
-def rotate(x: torch.Tensor, h: torch.Tensor | None, dtype: torch.dtype | None = None) -> torch.Tensor:
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether the byte spans of two strided tensors (non-negative strides) intersect: a conservative test, it
+    also flags interleaved views that share a span without sharing an element."""
+    if a.device != b.device or a.numel() == 0 or b.numel() == 0:
+        return False
+
+    def span(t):
+        lo = t.data_ptr()
+        return lo, lo + (1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()))) * t.element_size()
+    (a0, a1), (b0, b1) = span(a), span(b)
+    return a0 < b1 and b0 < a1
+
+
+def rotate(x: torch.Tensor, h: torch.Tensor | None, dtype: torch.dtype | None = None,
+           out: torch.Tensor | None = None) -> torch.Tensor:
     """x @ h over the last dim, returned contiguous in `dtype` (default x's). h None: x unchanged.
+    out: contiguous tensor of x's element count in `dtype`, not overlapping x (both checked: ValueError); the GEMM
+    writes into it (no temp).
 
     One GEMM in the output dtype with the +-1 matrix (exact) and the 1/sqrt(D) factor applied as the GEMM's
     fp32 alpha, so the result is the exactly orthonormal product rounded once, with no fp32 copies of x
     (a bf16 / fp16 H would not be orthonormal at D = 128: 1/sqrt(128) is not representable). H is symmetric
     and H @ H = I, so the same call rotates back."""
     if h is None:
-        return x if dtype is None else x.to(dtype)
+        y = x if dtype is None else x.to(dtype)
+        return y if out is None else out.copy_(y.reshape(out.shape))
     dtype = dtype or x.dtype
     D = h.shape[0]
     x2 = x.to(dtype).reshape(-1, D)
     # beta=0: the first argument is ignored (never read, NaN-safe); passing x2 avoids allocating a zero tensor
+    if out is not None:
+        if out.numel() != x2.numel() or not out.is_contiguous() or out.dtype != dtype:
+            raise ValueError("rotate(out=): out must be contiguous, in the output dtype, with x's element count")
+        if _overlaps(out, x2):                        # the GEMM would read rows it has already overwritten
+            raise ValueError("rotate(out=): out overlaps x")
+        torch.addmm(x2, x2, _signs(D, h.device, dtype), beta=0, alpha=1.0 / math.sqrt(D), out=out.view(-1, D))
+        return out
     y = torch.addmm(x2, x2, _signs(D, h.device, dtype), beta=0, alpha=1.0 / math.sqrt(D))
     return y.view(x.shape)
 

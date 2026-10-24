@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 import kushkash as kk
-from kushkash._ops import hadamard, rotate, rotation_enabled
+from kushkash._ops import dequant_records, hadamard, record_bytes, rotate, rotation_enabled
 from kushkash.cache import PAGE
 
 torch.manual_seed(0)
@@ -251,6 +251,31 @@ def check_rotate_rounds_once(device):
             back = rotate(y, h).double()
             assert float((back - x.double()).norm() / x.double().norm()) < 2 * u * 4, (dt, D)
             assert rotate(x, None) is x and rotate(x, h, torch.float32).dtype == torch.float32
+            buf = torch.full((8, 4, D), float("nan"), device=device, dtype=dt)       # out=: same GEMM, no temp
+            rotate(x, h, out=buf[:6])
+            assert torch.equal(buf[:6], y) and bool(buf[6:].isnan().all()), (dt, D)
+            with pytest.raises(ValueError):
+                rotate(x, h, out=buf[:3])                                            # wrong size: no silent resize
+            with pytest.raises(ValueError):
+                rotate(buf[:6], h, out=buf[1:7])                                     # aliasing: no silent garbage
+            xc = x.contiguous()
+            with pytest.raises(ValueError):
+                rotate(xc, h, out=xc)
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_dequant_token_major(bits):
+    """token_major=True (packed prefill) = the default layout with the page and head axes swapped, value for
+    value, and contiguous (so the caller's .view() does not copy)."""
+    for D in (64, 128, 256):
+        for dt in (torch.float32, torch.bfloat16, torch.float16):
+            rb, o = record_bytes(D, bits), 2 * PAGE * (D if bits == 8 else D // 2)
+            rec = torch.randint(0, 256, (5, 3, rb), dtype=torch.uint8)
+            rec[..., o:] = torch.randn(5, 3, (rb - o) // 2).half().view(torch.uint8)     # finite fp16 meta
+            k, v = dequant_records(rec, D, bits, dt)
+            kt, vt = dequant_records(rec, D, bits, dt, token_major=True)
+            assert kt.shape == vt.shape == (5, PAGE, 3, D) and kt.is_contiguous() and vt.is_contiguous()
+            assert torch.equal(kt, k.transpose(1, 2)) and torch.equal(vt, v.transpose(1, 2)), (D, dt)
 
 
 def test_rotate_rounds_once():
