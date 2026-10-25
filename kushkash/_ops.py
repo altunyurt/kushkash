@@ -136,13 +136,16 @@ class Ops:
 
 
 # ---------------------------------------------------------------- reference / prefill helpers
-def dequant_records(rec: torch.Tensor, head_dim: int, bits: int, dtype: torch.dtype,
-                    token_major: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+def dequant_records(rec: torch.Tensor, head_dim: int, bits: int, dtype: torch.dtype, token_major: bool = False,
+                    out: tuple[torch.Tensor | None, torch.Tensor | None] | None = None
+                    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Records [..., RB] (uint8) -> K, V [..., 32, D] in dtype. Pure torch, same math as the
     kernels (codes * fp16 scale + fp16 bias).
     token_major: records [..., H, RB] -> K, V [..., 32, H, D], contiguous, so the packed prefill can scatter
-    token rows without transposing the dequantized pages (the int8 codes are transposed instead: 2x fewer bytes at 8 bits, 4x at 4).
-    Same values element by element as the default layout."""
+    token rows without transposing the dequantized pages (the int8 codes are transposed instead: 2x fewer bytes
+    at 8 bits, 4x at 4). Same values element by element as the default layout.
+    out: (k, v) contiguous tensors of the result's shape and dtype to write into instead of allocating (the packed
+    prefill's workspace); a None entry skips that half and returns None for it. Same values as without out."""
     D, P = head_dim, PAGE
     dc = D if bits == 8 else D // 2
     o_ks = 2 * P * dc
@@ -154,13 +157,19 @@ def dequant_records(rec: torch.Tensor, head_dim: int, bits: int, dtype: torch.dt
     if token_major:                               # [..., H, P, x] -> [..., P, H, x]
         kq, vq, ks, kb, vs, vb = (t.transpose(-3, -2) for t in (kq, vq, ks, kb, vs, vb))
 
-    def codes(c):
+    def codes(c, dst):
         if bits == 4:
             c = torch.cat([(c << 4) >> 4, c >> 4], -1)
-        return c.to(dtype, memory_format=torch.contiguous_format)
+        if dst is None:
+            return c.to(dtype, memory_format=torch.contiguous_format)
+        if dst.shape != c.shape or dst.dtype != dtype or not dst.is_contiguous():
+            raise ValueError(f"dequant_records(out=): need a contiguous {dtype} {tuple(c.shape)} tensor, "
+                             f"got {dst.dtype} {tuple(dst.shape)}")
+        return dst.copy_(c)                       # int8 -> dtype is exact, as in .to(dtype)
 
-    k = codes(kq).mul_(ks.to(dtype)).add_(kb.to(dtype))
-    v = codes(vq).mul_(vs.to(dtype)).add_(vb.to(dtype))
+    ko, vo = out if out is not None else (None, None)
+    k = codes(kq, ko).mul_(ks.to(dtype)).add_(kb.to(dtype)) if out is None or ko is not None else None
+    v = codes(vq, vo).mul_(vs.to(dtype)).add_(vb.to(dtype)) if out is None or vo is not None else None
     return k, v
 
 

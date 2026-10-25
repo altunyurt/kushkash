@@ -15,7 +15,7 @@ vllm = pytest.importorskip("vllm.v1.attention.backend")
 from vllm.v1.attention.backend import CommonAttentionMetadata  # noqa: E402
 
 import kushkash.vllm.backend as kb  # noqa: E402
-from kushkash._ops import PAGE, as_records, cached_kv, record_bytes  # noqa: E402
+from kushkash._ops import PAGE, as_records, cached_kv, dequant_records, record_bytes  # noqa: E402
 
 torch.manual_seed(0)
 
@@ -58,17 +58,18 @@ def fake_flash(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, 
 def test_backend_mixed_steps(bits, fa, mode, rot, monkeypatch):
     """loop: history rows per row with LSE merges; packed: all prefill rows in one (fake) flash-attn varlen call;
     packed-fallback: packed mode with a zero byte budget, so every step falls back to the loop path;
-    packed-sliced: a 1 MiB budget, so history is dequantized in 2-page slices and the larger steps fall back."""
+    packed-sliced: a 256 KiB budget, so history is dequantized in 1-page slices and the workspace holds only
+    max_model_len keys: larger steps are split into several groups (never the loop path)."""
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
     monkeypatch.setenv("KUSHKASH_ROTATE", "1" if rot else "0")
     monkeypatch.setenv("KUSHKASH_PREFILL", mode.split("-")[0])
     if mode == "packed-fallback":
         monkeypatch.setenv("KUSHKASH_PACK_MB", "0")
-    if mode == "packed-sliced":
-        monkeypatch.setenv("KUSHKASH_PACK_MB", "1")
+    if mode == "packed-sliced":                                       # 256 KiB: 1-page slices, a 768-key workspace
+        monkeypatch.setattr(kb, "_pack_bytes", lambda: 256 << 10)
     dq_calls = []
-    orig_dq = kb.dequant_records
-    monkeypatch.setattr(kb, "dequant_records", lambda *a, **kw: dq_calls.append(a[0].shape[0]) or orig_dq(*a, **kw))
+    orig_dq = kb._dequant_pages
+    monkeypatch.setattr(kb, "_dequant_pages", lambda *a, **kw: dq_calls.append(a[1]) or orig_dq(*a, **kw))
     if fa:                                                            # fresh runs -> (fake) flash-attn varlen
         monkeypatch.setattr(kb, "_HAS_FA", True)
         monkeypatch.setattr(kb, "flash_attn_varlen_func", fake_flash, raising=False)
@@ -81,9 +82,11 @@ def test_backend_mixed_steps(bits, fa, mode, rot, monkeypatch):
     assert (impl.rot is not None) == rot
     h = impl.rot if rot else torch.eye(D)                             # pages / tail hold K h, V h
     builder = kb.KushMetadataBuilder(SimpleNamespace(num_kv_heads=H, head_size=D), ["l0"], cfg, torch.device("cpu"))
-    packed_calls = []
+    packed_calls, loop_calls, groups = [], [], []
     orig_packed = impl._prefill_packed
     impl._prefill_packed = lambda *a, **kw: packed_calls.append(1) or orig_packed(*a, **kw)
+    orig_hist = kb.history_attention
+    monkeypatch.setattr(kb, "history_attention", lambda *a, **kw: loop_calls.append(1) or orig_hist(*a, **kw))
     C = record_bytes(D, bits) // PAGE
     kv_cache = torch.zeros(n_blocks, H * PAGE * C + 64, dtype=torch.uint8)[:, :H * PAGE * C].view(n_blocks, H, PAGE, C)
     free = list(range(n_blocks)); random.Random(0).shuffle(free)
@@ -98,7 +101,8 @@ def test_backend_mixed_steps(bits, fa, mode, rot, monkeypatch):
         k, v = cached_kv(as_records(kv_cache), table[r:r + 1], n, impl.tail_k[ts:ts + 1], D, bits, torch.float32)
         return k[0] @ h, v[0] @ h                                     # back to model space (h symmetric, h h = I)
 
-    plans = [[(0, 70), (1, 5)], [(2, 33), (3, 64)], [(4, 40), (0, 7), (5, 20)]] + [None] * 30   # fresh/hist/fresh
+    plans = [[(0, 70), (1, 5)], [(2, 33), (3, 64)], [(4, 40), (0, 7), (5, 20)],     # fresh/hist/fresh
+             [(0, 300), (2, 350), (3, 300)]] + [None] * 30   # 1124 packed keys: several groups when sliced
     for plan in plans:
         if plan is None:                                              # decodes first, then chunks
             dec = [(r, 1) for r in range(n_req) if rng.random() < 0.7]
@@ -122,6 +126,7 @@ def test_backend_mixed_steps(bits, fa, mode, rot, monkeypatch):
             max_seq_len=int(sl.max()), block_table_tensor=bt[:len(reqs)], slot_mapping=torch.zeros(N, dtype=torch.int64),
             seq_lens_cpu_upper_bound=torch.from_numpy(sl), req_idx=np.array([slot_of[r] for r in reqs]))
         md = builder.build(0, cam)
+        groups.append(len(md.packs or []))
         q = torch.randn(N + 3, H * G, D)                               # + padded rows
         k, v = torch.randn(N + 3, H, D), torch.randn(N + 3, H, D)
         refs = {}
@@ -150,6 +155,10 @@ def test_backend_mixed_steps(bits, fa, mode, rot, monkeypatch):
             tail, ref_tail = impl.tail_k[slot_of[r], :, :n % PAGE], exact[r][0][:, n // PAGE * PAGE:]
             assert torch.equal(tail, ref_tail) if not rot else torch.allclose(tail @ h, ref_tail, atol=1e-5)
     assert bool(packed_calls) == (mode in ("packed", "packed-sliced"))  # the packed path ran (and only when asked)
+    if mode in ("packed", "packed-sliced"):
+        assert not loop_calls                                          # no loop fallback: big steps are grouped
+    if mode == "packed-sliced":
+        assert max(groups) > 1                                         # some steps needed several groups
     if mode == "packed-sliced":
         # page slices are <= 2 records; the partial-page read is one record per row (<= n_req). The exact slice
         # count is checked structurally in test_packed_slicing_is_exact
@@ -166,6 +175,11 @@ def test_rejects_unsupported_configs(monkeypatch):
     with pytest.raises(NotImplementedError, match="speculative"):
         kb.KushMetadataBuilder(SimpleNamespace(), ["l0"], spec, torch.device("cpu"))
     assert kb.KushAttentionBackend.supported_kv_cache_dtypes == ["auto"]
+    dbo = make_cfg(max_seqs=4, max_len=256)
+    dbo.parallel_config.use_ubatching = True                          # two micro-batches on two streams
+    monkeypatch.setattr(kb, "get_current_vllm_config", lambda: dbo)
+    with pytest.raises(NotImplementedError, match="micro-batching"):
+        kb.KushAttentionImpl(4, 64, 0.125, num_kv_heads=2)
 
 
 def _cam(qlens, ctxs, W=8, upper=None):
@@ -290,21 +304,48 @@ def test_sampled_flag_async_readback(monkeypatch):
         b.build(0, _cam([1, 1], [40, 9]))
 
 
-def test_pack_plan_skipped_over_budget(monkeypatch):
-    """The builder skips the pack plan (and its upload) for a step whose buffer cannot fit the budget."""
+def test_pack_plan_off(monkeypatch):
+    """KUSHKASH_PACK_MB=0 turns packing off: no plan and no plan upload; rows with history take the loop path.
+    With a budget, a step that fits is one group (the packed buffer is no longer budget-checked per step:
+    groups always fit the workspace)."""
     monkeypatch.setattr(kb, "_HAS_FA", True)
     monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
-    spec = SimpleNamespace(num_kv_heads=2, head_size=64)
-    cam = _cam([5, 7], [100, 0])                                       # row 0 has 100 tokens of history
-    sizes = []
-    for mb, packed in (("1", True), ("0", False)):
+    spec = SimpleNamespace(num_kv_heads=2, head_size=64)               # fp32: 1 KiB of K + V per key
+    ql, ctx = [5, 7, 3, 9, 2], [200, 0, 250, 100, 180]                 # 756 packed keys
+    sizes, mds = [], {}
+    for mb in ("1", "0"):
         monkeypatch.setenv("KUSHKASH_PACK_MB", mb)
-        b = kb.KushMetadataBuilder(spec, ["l0"], make_cfg(max_seqs=4, max_len=256), torch.device("cpu"))
+        b = kb.KushMetadataBuilder(spec, ["l0"], make_cfg(max_seqs=8, max_len=256), torch.device("cpu"))
         orig = b._ring.to_device
         b._ring.to_device = lambda arr, out=None, orig=orig: sizes.append(arr.shape[0]) or orig(arr, out)
-        md = b.build(0, cam)
-        assert (md.pack is not None) == packed
-    assert sizes[0] > sizes[1] == 2 + 2 + 2 * len(md.job_seq)           # no plan payload when skipped
+        mds[mb] = b.build(0, _cam(ql, ctx, W=16))
+    monkeypatch.setenv("KUSHKASH_PACK_MB", "1")
+    assert kb._pack_geometry(2, 64, 4, 256) == (1024, 2)              # 1 MiB / 1 KiB per key; 64 KiB slices
+    assert [(p.r0, p.r1, p.total_k) for p in mds["1"].packs] == [(0, 5, 756)]
+    assert mds["0"].packs == [] and mds["0"].hist_rows == [0, 2, 3, 4]
+    assert sizes[0] > sizes[1] == 5 + 5 + 2 * len(mds["0"].job_seq)
+
+
+def test_pack_groups_split(monkeypatch):
+    """Greedy consecutive groups: each group's packed keys <= the workspace, every prefill row in exactly one
+    group, and a row longer than the workspace (cannot happen: keys >= max_model_len) is an error."""
+    assert kb._groups(np.array([100, 900, 30, 1000, 5, 5]), 1024) == [(0, 2), (2, 3), (3, 6)]
+    assert kb._groups(np.array([1024]), 1024) == [(0, 1)]
+    with pytest.raises(RuntimeError, match="does not fit"):
+        kb._groups(np.array([10, 1025]), 1024)
+    monkeypatch.setattr(kb, "_HAS_FA", True)
+    monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
+    monkeypatch.setenv("KUSHKASH_PACK_MB", "1")
+    b = kb.KushMetadataBuilder(SimpleNamespace(num_kv_heads=2, head_size=64), ["l0"],
+                               make_cfg(max_seqs=8, max_len=1024), torch.device("cpu"))
+    ql, ctx = [5, 7, 3, 9, 2, 4], [500, 0, 250, 1000, 180, 30]
+    md = b.build(0, _cam(ql, ctx, W=40))
+    seg = [c + q for c, q in zip(ctx, ql)]
+    assert [(p.r0, p.r1) for p in md.packs] == kb._groups(np.array(seg), 1024) == [(0, 3), (3, 4), (4, 6)]
+    for p in md.packs:
+        assert p.total_k == sum(seg[p.r0:p.r1]) <= 1024
+        assert p.cu_k.tolist() == np.concatenate([[0], np.cumsum(seg[p.r0:p.r1])]).tolist()
+        assert p.cu_q.tolist() == np.concatenate([[0], np.cumsum(ql[p.r0:p.r1])]).tolist()
 
 
 @pytest.mark.parametrize("bits", [4, 8])
@@ -328,8 +369,8 @@ def test_packed_slices_exact(bits, monkeypatch):
     kv_cache = torch.zeros(W, H, PAGE, C, dtype=torch.uint8)
     table = torch.arange(W, dtype=torch.int32).view(1, W)
     dq = []
-    orig_dq = kb.dequant_records
-    monkeypatch.setattr(kb, "dequant_records", lambda *a, **kw: dq.append(a[0].shape[0]) or orig_dq(*a, **kw))
+    orig_dq = kb._dequant_pages
+    monkeypatch.setattr(kb, "_dequant_pages", lambda *a, **kw: dq.append(a[1]) or orig_dq(*a, **kw))
 
     def step(ctx, ql):
         qsl = np.array([0, ql], dtype=np.int32)
@@ -352,9 +393,9 @@ def test_packed_slices_exact(bits, monkeypatch):
         return md, (out.view(ql, H * G, D) - ref).norm() / ref.norm()
 
     md, err = step(0, 330)                                             # fresh: flash-attn over the chunk, no packing
-    assert md.pack is None and dq == [] and err < 2e-5
+    assert not md.packs and dq == [] and err < 2e-5
     md, err = step(330, 5)                                             # 5 new tokens over the quantized history
-    assert md.pack is not None and dq == [2, 2, 2, 2, 2, 1] and err < 2e-5
+    assert len(md.packs) == 1 and dq == [2, 2, 2, 2, 2, 1] and err < 2e-5
 
 
 @pytest.mark.parametrize("bits", [4, 8])
@@ -388,16 +429,158 @@ def test_packed_slicing_is_exact(bits, monkeypatch):
     step(200, 0, "512", kv_cache, 0)                                  # fresh prompt: fills 6 pages + an 8-token tail
     tail = impl.tail_k.clone()
     calls = []
-    orig = kb.dequant_records
-    monkeypatch.setattr(kb, "dequant_records", lambda *a, **kw: calls.append(a[0].shape[0]) or orig(*a, **kw))
+    orig = kb._dequant_pages
+    monkeypatch.setattr(kb, "_dequant_pages", lambda *a, **kw: calls.append(a[1]) or orig(*a, **kw))
     outs = {}
     for mb in ("1", "512"):
         calls.clear()
         impl.tail_k.copy_(tail)
         md, outs[mb] = step(5, 200, mb, kv_cache.clone(), 1)
-        assert md.pack is not None
+        assert len(md.packs) == 1
         if mb == "1":
             assert calls == [2, 2, 2, 1]                              # 3 page slices, then the partial page
         else:
             assert calls == [6, 1]                                    # one slice of all 6 pages
     assert torch.equal(outs["1"], outs["512"])
+
+
+@pytest.mark.parametrize("mode", ["packed", "packed-small", "loop"])
+@pytest.mark.parametrize("bits,rot", [(4, True), (8, False)])
+def test_profile_step(mode, bits, rot, monkeypatch):
+    """The synthetic profiling step runs the real attention path (prefill-heavy, then decode-heavy) on scratch
+    pages, leaves no state behind (tail slots cleared, the model's cache untouched), and its rows are a valid
+    step: N query tokens, decodes first, every packed group within the workspace, the long row's group full."""
+    monkeypatch.setenv("KUSHKASH_BITS", str(bits))
+    monkeypatch.setenv("KUSHKASH_ROTATE", "1" if rot else "0")
+    monkeypatch.setenv("KUSHKASH_PREFILL", "loop" if mode == "loop" else "packed")
+    if mode == "packed-small":                                        # workspace = max_model_len keys
+        monkeypatch.setattr(kb, "_pack_bytes", lambda: 64 << 10)
+    if mode != "loop":
+        monkeypatch.setattr(kb, "_HAS_FA", True)
+        monkeypatch.setattr(kb, "flash_attn_varlen_func", fake_flash, raising=False)
+        monkeypatch.setattr(kb, "get_flash_attn_version", lambda **kw: None, raising=False)
+    H, G, D, max_seqs, max_len, N = 2, 2, 64, 8, 512, 200
+    cfg = make_cfg(max_seqs=max_seqs, max_len=max_len)
+    monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
+    impl = kb.KushAttentionImpl(H * G, D, D ** -0.5, num_kv_heads=H)
+    impl.fa_version = None
+    geom = impl._pack_geom()
+    assert (geom is None) == (mode == "loop")
+    for heavy in (False, True):
+        rows, nd = impl._synthetic_rows(N, heavy)
+        assert sum(c for _, c in rows) == N and all(c == 1 for _, c in rows[:nd]) and nd <= max_seqs - 1
+        assert all(c >= 1 for _, c in rows) and len(rows) <= max_seqs
+        if geom and not heavy:
+            seg = np.array([h + c for h, c in rows[nd:]])
+            groups = kb._groups(seg, geom[0])                          # raises if a row does not fit
+            assert sum(seg[groups[0][0]:groups[0][1]]) > geom[0] - 2 * PAGE   # the first group ~ fills it
+            assert any(h % PAGE for h, _ in rows[nd:])                 # partial pages are exercised
+            assert max(h for h, _ in rows) >= geom[1] * PAGE           # at least one full dequantization slice
+        if not geom and not heavy:
+            assert rows[-1][0] >= max_len and rows[-1][1] == N - nd    # loop: longest history, all queries
+    runs = []
+    orig_run = impl._run
+    impl._run = lambda *a, **kw: runs.append(a[5]) or orig_run(*a, **kw)
+    q, k, v = torch.randn(N, H * G * D), torch.randn(N, H * D), torch.randn(N, H * D)
+    impl.tail_k.normal_()
+    out = torch.zeros(N, H * G * D)
+    impl._profile_step(q, k, v, out)
+    assert len(runs) == 2 and runs[0].num_decodes == 1 and runs[1].num_decodes == max_seqs - 1
+    assert (runs[0].packs is not None and len(runs[0].packs) >= 1) == (mode != "loop")
+    assert torch.count_nonzero(impl.tail_k) == 0
+    assert torch.isfinite(out).all()
+    # vLLM's dummy run on the CPU (or by a non-owner layer): no synthetic step, zeros
+    runs.clear()
+    res = impl.forward(None, q, k, v, torch.zeros(1), None, output=torch.ones(N, H * G * D))
+    assert runs == [] and torch.count_nonzero(res) == 0
+
+
+def test_workspace_never_allocated_mid_serve(monkeypatch):
+    """On CUDA the packed-prefill workspace exists from construction; a step that finds none (or one of another
+    geometry) raises instead of allocating it."""
+    monkeypatch.setattr(kb, "_HAS_FA", True)
+    monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
+    cfg = make_cfg(max_seqs=4, max_len=256)
+    monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
+    monkeypatch.setattr(kb, "get_flash_attn_version", lambda **kw: None, raising=False)
+    impl = kb.KushAttentionImpl(4, 64, 0.125, num_kv_heads=2)
+    assert impl.ws is None                                            # CPU: allocated on first use
+    with pytest.raises(RuntimeError, match="not reserved at startup"):
+        impl._workspace(torch.device("cuda"))
+    ws = impl._workspace(torch.device("cpu"))
+    assert (ws.keys, ws.slice_pages) == impl._pack_geom() and impl._workspace(torch.device("cpu")) is ws
+    monkeypatch.setenv("KUSHKASH_PACK_MB", "1")                        # geometry changed after construction
+    with pytest.raises(RuntimeError, match="not reserved at startup"):
+        impl._workspace(torch.device("cuda"))
+    monkeypatch.setenv("KUSHKASH_PACK_MB", "0")
+    with pytest.raises(RuntimeError, match="packed path is off"):
+        impl._workspace(torch.device("cpu"))
+
+
+def test_plan_bytes_bound(monkeypatch):
+    """_plan_bytes_bound (reserved by the profiling step) covers the device bytes of a real step's prefill plan:
+    the upload plus the int64 index copies, for the largest steps the scheduler can form."""
+    monkeypatch.setattr(kb, "_HAS_FA", True)
+    monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
+    monkeypatch.setattr(kb, "_pack_bytes", lambda: 64 << 10)          # many groups
+    H, D, max_seqs, max_len = 2, 64, 8, 512
+    cfg = make_cfg(max_seqs=max_seqs, max_len=max_len)                # max_num_batched_tokens 512
+    monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
+    monkeypatch.setattr(kb, "get_flash_attn_version", lambda **kw: None, raising=False)
+    impl = kb.KushAttentionImpl(H * 2, D, D ** -0.5, num_kv_heads=H)
+    W = max_len // PAGE
+    for ql, ctx in [([2] * max_seqs, [max_len - 2] * max_seqs),       # every row: full history, partial page
+                    ([64] * max_seqs, [max_len - 64 - 1] * max_seqs),
+                    ([505, 7], [7, 200])]:
+        b = kb.KushMetadataBuilder(SimpleNamespace(num_kv_heads=H, head_size=D), ["l0"], cfg, torch.device("cpu"))
+        up = []
+        orig = b._ring.to_device
+        b._ring.to_device = lambda arr, out=None, orig=orig: up.append(arr.nbytes) or orig(arr, out)
+        md = b.build(0, _cam(ql, ctx, W=W))
+        fields = ("page_blk", "page_dst0", "tail_blk", "tail_vsrc", "tail_kidx", "tail_dst", "new_dst", "cu_q")
+        used = sum(up) + sum(getattr(p, f).nbytes for p in md.packs for f in fields)
+        assert md.packs and used <= impl._plan_bytes_bound(sum(ql)), (used, impl._plan_bytes_bound(sum(ql)))
+
+
+def test_synthetic_rows_extremes(monkeypatch):
+    """Synthetic rows stay a valid step at the extremes: more short rows than the workspace holds, more queries
+    than one group, a single query token, max_num_seqs 1."""
+    monkeypatch.setattr(kb, "_HAS_FA", True)
+    monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
+    monkeypatch.setattr(kb, "_pack_bytes", lambda: 64 << 10)          # workspace = max_model_len keys
+    monkeypatch.setattr(kb, "get_flash_attn_version", lambda **kw: None, raising=False)
+    for max_seqs, max_len, n in [(256, 256, 8192), (256, 4096, 8192), (1, 256, 100), (8, 256, 1), (2, 256, 3)]:
+        cfg = make_cfg(max_seqs=max_seqs, max_len=max_len)
+        monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
+        impl = kb.KushAttentionImpl(4, 64, 0.125, num_kv_heads=2)
+        keys, slice_pages = impl._pack_geom()
+        for heavy in (False, True):
+            rows, nd = impl._synthetic_rows(n, heavy)
+            assert sum(c for _, c in rows) == n and all(c == 1 for _, c in rows[:nd]), (max_seqs, max_len, n)
+            assert nd <= max(0, max_seqs - 1) and all(h + c <= max(max_len, keys) for h, c in rows if h == 0)
+            if rows[nd:]:
+                kb._groups(np.array([h + c for h, c in rows[nd:]]), keys)        # every row fits a group
+            if not heavy and n >= 64:
+                assert max(h for h, _ in rows) >= slice_pages * PAGE
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_dequant_pages_matches_reference(bits):
+    """The workspace dequantization is value-for-value dequant_records(token_major=True), for K and V, every head
+    size and dtype, partial slices, and V-only (partial-page reads); it writes only into the workspace."""
+    for D in (64, 128, 256):
+        for dt in (torch.float32, torch.bfloat16, torch.float16):
+            S, Hk = 5, 3
+            ws = kb._PackWorkspace(64, S, Hk, D, bits, dt, torch.device("cpu"))
+            rb, o = record_bytes(D, bits), 2 * PAGE * (D if bits == 8 else D // 2)
+            rec = torch.randint(0, 256, (S, Hk, rb), dtype=torch.uint8)
+            rec[..., o:] = torch.randn(S, Hk, (rb - o) // 2).half().view(torch.uint8)    # finite fp16 meta
+            for n in (S, 2):
+                ws.rec[:n].copy_(rec[:n])
+                k, v = kb._dequant_pages(ws, n, D)
+                rk, rv = dequant_records(rec[:n], D, bits, dt, token_major=True)
+                assert torch.equal(k, rk) and torch.equal(v, rv), (D, dt, n)
+                assert k.data_ptr() == ws.sk.data_ptr() and v.data_ptr() == ws.sv.data_ptr()
+                ws.sv.fill_(float("nan"))
+                k2, v2 = kb._dequant_pages(ws, n, D, need_k=False)
+                assert k2 is None and torch.equal(v2, rv)

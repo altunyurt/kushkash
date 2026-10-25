@@ -276,6 +276,15 @@ def test_dequant_token_major(bits):
             kt, vt = dequant_records(rec, D, bits, dt, token_major=True)
             assert kt.shape == vt.shape == (5, PAGE, 3, D) and kt.is_contiguous() and vt.is_contiguous()
             assert torch.equal(kt, k.transpose(1, 2)) and torch.equal(vt, v.transpose(1, 2)), (D, dt)
+            ko = torch.full((6, PAGE, 3, D), float("nan"), dtype=dt)              # out=: workspace slices
+            vo = torch.full((6, PAGE, 3, D), float("nan"), dtype=dt)
+            k2, v2 = dequant_records(rec, D, bits, dt, token_major=True, out=(ko[:5], vo[:5]))
+            assert k2.data_ptr() == ko.data_ptr() and torch.equal(ko[:5], kt) and torch.equal(vo[:5], vt)
+            assert bool(ko[5].isnan().all() and vo[5].isnan().all())
+            k3, v3 = dequant_records(rec, D, bits, dt, token_major=True, out=(None, vo[1:]))   # V only
+            assert k3 is None and torch.equal(vo[1:], vt)
+            with pytest.raises(ValueError):
+                dequant_records(rec, D, bits, dt, token_major=True, out=(ko[:4], None))      # wrong shape
 
 
 def test_rotate_rounds_once():
