@@ -326,6 +326,34 @@ def test_pack_plan_off(monkeypatch):
     assert sizes[0] > sizes[1] == 5 + 5 + 2 * len(mds["0"].job_seq)
 
 
+def test_pack_auto_geometry(monkeypatch):
+    """KUSHKASH_PACK_MB unset / auto: room for 2 full-length histories, clamped to 64..512 MiB; an explicit value
+    is used as before; 0 = off."""
+    MiB = 1 << 20
+    for v in (None, "", "auto", " AUTO "):
+        if v is None:
+            monkeypatch.delenv("KUSHKASH_PACK_MB", raising=False)
+        else:
+            monkeypatch.setenv("KUSHKASH_PACK_MB", v)
+        assert kb._pack_bytes() is None and not kb._pack_off()
+        # Qwen2.5-7B bf16 (4 x 128, 2 KiB K+V per key), max_len 4096: 16 MiB needed -> 64 MiB floor; slices stay at
+        # the 512 MiB budget's 32 MiB (512 pages of 64 KiB), not 1/16 of the small buffer
+        assert kb._pack_geometry(4, 128, 2, 4096) == (64 * MiB // 2048, 512)
+        # Qwen3-8B bf16 (8 x 128, 4 KiB per key): 32k -> 256 MiB keys, 32 MiB slices = 256 pages of 128 KiB
+        assert kb._pack_geometry(8, 128, 2, 32768) == (65536, 256)
+        assert kb._pack_geometry(8, 128, 2, 131072)[0] == 131072
+        assert kb._pack_geometry(8, 128, 2, 262144)[0] == 262144     # keys >= max_model_len still holds
+        # a tiny model: the slice never exceeds the key buffer (64 MiB floor here, so 32 MiB slices still fit)
+        assert kb._pack_geometry(1, 64, 2, 256) == (64 * MiB // 256, 32 * MiB // (32 * 256))
+    monkeypatch.setenv("KUSHKASH_PACK_MB", "512")                    # explicit: the old default
+    assert kb._pack_geometry(4, 128, 2, 4096) == (262144, 512)      # 32 MiB slices / 64 KiB per page
+    monkeypatch.setenv("KUSHKASH_PACK_MB", "0")
+    assert kb._pack_off()
+    monkeypatch.setenv("KUSHKASH_PACK_MB", "-1")
+    with pytest.raises(ValueError, match="auto"):
+        kb._pack_bytes()
+
+
 def test_pack_groups_split(monkeypatch):
     """Greedy consecutive groups: each group's packed keys <= the workspace, every prefill row in exactly one
     group, and a row longer than the workspace (cannot happen: keys >= max_model_len) is an error."""

@@ -143,12 +143,12 @@ the L4 below it fit inside what vLLM already sets aside for the model).
 | Buffer | What it is for | Size for Qwen2.5-7B | Set by |
 |---|---|---|---|
 | Exact key buffer | Keys of each request's newest, still-filling 32-token block | about 225 MiB at 256 requests (calculated) | `--max-num-seqs` |
-| Prompt workspace | Unpacking earlier context when a prompt continues it (long prompts processed in chunks, prefix-cache hits) | about 0.55 GiB at the default `KUSHKASH_PACK_MB` (calculated) | `KUSHKASH_PACK_MB` |
+| Prompt workspace | Unpacking earlier context when a prompt continues it (long prompts processed in chunks, prefix-cache hits) | about 0.1 GiB at `--max-model-len 4096`, up to about 0.55 GiB at 128k (calculated) | `KUSHKASH_PACK_MB` |
 
-On an L4 with Qwen2.5-7B (bf16 weights, `--gpu-memory-utilization 0.90`), the workspace takes about 12% of the
-memory the KV cache would otherwise get (calculated), and does not change the model's output. A smaller
-`KUSHKASH_PACK_MB` gives that memory back to the cache; earlier context is then unpacked in more pieces (speed
-effect not measured).
+By default the workspace holds two full-length requests' earlier context (at least 64 MiB, at most 512 MiB),
+plus a fixed 32 MiB area that earlier context is unpacked into piece by piece. It does not change the model's
+output. When a step has more earlier context than fits, it is processed in more groups (speed effect of the default
+size not measured yet). `KUSHKASH_PACK_MB` sets the size directly; its unpacking area is then 1/16 of it.
 
 ### Settings
 
@@ -156,7 +156,7 @@ effect not measured).
 |---|---|---|
 | `KUSHKASH_BITS` | `4` | `4` or `8` bits per stored value |
 | `KUSHKASH_ROTATE` | `auto` | Rotate keys and values before storing them, which lowers the error ([How it works](#how-it-works)). `auto` = on for 4 bits only; `0` off; `1` on |
-| `KUSHKASH_PACK_MB` | `512` | Prompt workspace size in MiB (raised automatically so one full-length request fits). `0` = no workspace, slower prompt processing |
+| `KUSHKASH_PACK_MB` | `auto` | Prompt workspace size in MiB (raised automatically so one full-length request fits). `auto` = room for two full-length requests, 64 to 512 MiB. `0` = no workspace, slower prompt processing |
 | `KUSHKASH_PREFILL` | `packed` | `loop` = process prompts one request at a time (slower, no workspace) |
 | `KUSHKASH_PROFILE_STEP` | `1` | `0` skips the test step vLLM's startup memory check runs through kushkash (not recommended) |
 | `KUSHKASH_MEM_STATS` | `0` | `N` = print PyTorch memory counters every N prompt steps (debugging) |

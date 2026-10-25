@@ -72,13 +72,31 @@ def _prefill_mode() -> str:
     return mode
 
 
-def _pack_bytes() -> int:
-    """KUSHKASH_PACK_MB: packed-prefill budget for one group's K + V buffer (MiB, default 512); 0 turns the packed
-    path off (every prefill row with history takes the per-row loop path)."""
-    mb = int(os.environ.get("KUSHKASH_PACK_MB", "512"))
+def _pack_bytes() -> int | None:
+    """KUSHKASH_PACK_MB: packed-prefill budget for one group's K + V buffer, in MiB; 0 turns the packed path off
+    (every prefill row with history takes the per-row loop path). Unset or `auto` -> None: sized from the model
+    (_pack_auto_bytes)."""
+    v = os.environ.get("KUSHKASH_PACK_MB", "auto").strip().lower()
+    if v in ("", "auto"):
+        return None
+    mb = int(v)
     if mb < 0:
-        raise ValueError("KUSHKASH_PACK_MB must be >= 0")
+        raise ValueError("KUSHKASH_PACK_MB must be >= 0 or auto")
     return mb << 20
+
+
+def _pack_off() -> bool:
+    return _pack_bytes() == 0
+
+
+# auto workspace: key buffer for _PACK_AUTO_REQS full-length histories, within [_PACK_AUTO_MIN, _PACK_AUTO_MAX]. Steps
+# with more history than that are split into more groups (more flash-attn calls), not refused. Its slices (history
+# dequantized at a time) stay at _PACK_AUTO_SLICE, the 512 MiB budget's slice: each slice pass has a fixed cost, and
+# 1/16 of a small buffer made prefill attention up to ~2x slower (packed_microbench, L4, 2026-10-26).
+_PACK_AUTO_REQS = 2
+_PACK_AUTO_MIN = 64 << 20
+_PACK_AUTO_MAX = 512 << 20
+_PACK_AUTO_SLICE = (512 << 20) // 16
 
 
 _PACK_SLICES = 16
@@ -88,13 +106,22 @@ def _pack_buffer_bytes(total_k: int, num_kv_heads: int, head_size: int, elem: in
     return 2 * total_k * num_kv_heads * head_size * elem
 
 
+def _pack_auto_bytes(num_kv_heads: int, head_size: int, elem: int, max_model_len: int) -> int:
+    need = _PACK_AUTO_REQS * _pack_buffer_bytes(max_model_len, num_kv_heads, head_size, elem)
+    return min(max(need, _PACK_AUTO_MIN), _PACK_AUTO_MAX)
+
+
 def _pack_geometry(num_kv_heads: int, head_size: int, elem: int, max_model_len: int) -> tuple[int, int]:
     """(keys, slice_pages) of the packed-prefill workspace. keys: the budget in packed key rows, raised to
     max_model_len so that every single request fits one group; slice_pages: history pages dequantized at a time
-    (1/_PACK_SLICES of the budget)."""
+    (explicit KUSHKASH_PACK_MB: 1/_PACK_SLICES of the budget; auto: _PACK_AUTO_SLICE, at most the key buffer)."""
     budget = _pack_bytes()
+    slice_bytes = None if budget is None else budget // _PACK_SLICES
+    if budget is None:
+        budget = _pack_auto_bytes(num_kv_heads, head_size, elem, max_model_len)
+        slice_bytes = min(_PACK_AUTO_SLICE, budget)
     keys = max(budget // _pack_buffer_bytes(1, num_kv_heads, head_size, elem), max_model_len)
-    slice_pages = max(1, budget // _PACK_SLICES // _pack_buffer_bytes(PAGE, num_kv_heads, head_size, elem))
+    slice_pages = max(1, slice_bytes // _pack_buffer_bytes(PAGE, num_kv_heads, head_size, elem))
     return keys, slice_pages
 
 
@@ -450,7 +477,7 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
         mc = getattr(vllm_config, "model_config", None)
         mdt, max_len = getattr(mc, "dtype", None), getattr(mc, "max_model_len", None)
         self._pack = None                                  # (workspace keys, slice pages, kv heads)
-        if _prefill_mode() == "packed" and _HAS_FA and _pack_bytes() > 0 and hk and hs and max_len and \
+        if _prefill_mode() == "packed" and _HAS_FA and not _pack_off() and hk and hs and max_len and \
                 isinstance(mdt, torch.dtype):
             self._pack = (*_pack_geometry(hk, hs, torch.empty((), dtype=mdt).element_size(), max_len), hk)
 
@@ -606,7 +633,7 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
     def _pack_geom(self) -> tuple[int, int] | None:
         """(keys, slice_pages) of the packed-prefill workspace, or None when the packed path is off (same rule as
         the metadata builder's grouping)."""
-        if _prefill_mode() != "packed" or not _HAS_FA or _pack_bytes() == 0:
+        if _prefill_mode() != "packed" or not _HAS_FA or _pack_off():
             return None
         return _pack_geometry(self.num_kv_heads, self.head_size, torch.empty((), dtype=self.dtype).element_size(),
                               self.max_len)

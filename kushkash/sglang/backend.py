@@ -42,8 +42,10 @@ def _prefill_mode() -> str:
 
 def _pack_bytes() -> int:
     """Budget for one layer's packed K + V buffer; history is dequantized into it in slices of <= 1/_PACK_SLICES
-    of the budget, so the step's extra memory stays near (1 + 3 / _PACK_SLICES) x the budget."""
-    return int(os.environ.get("KUSHKASH_PACK_MB", "512")) << 20
+    of the budget, so the step's extra memory stays near (1 + 3 / _PACK_SLICES) x the budget. `auto` (the vLLM
+    backend's sizing rule) means the SGLang default here, 512 MiB: this budget is a per-step cap, not reserved."""
+    v = os.environ.get("KUSHKASH_PACK_MB", "auto").strip().lower()
+    return (512 if v in ("", "auto") else int(v)) << 20
 
 
 def _ranges(lengths: np.ndarray) -> np.ndarray:
