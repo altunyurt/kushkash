@@ -59,6 +59,9 @@ def run_one(a):
     if a.kv.startswith("kush"):                       # Hadamard rotation in the cache (auto = on for 4-bit)
         from kushkash._ops import rotation_enabled
         res["rotate"] = rotation_enabled(int(a.kv[4:]))
+    if a.capacity_only:
+        print("RESULT " + json.dumps(res), flush=True)
+        return
 
     rng = random.Random(0)
     if not a.only_throughput:
@@ -157,7 +160,10 @@ def main():
                     help="sustained mode: measure output tok/s over this window once the first request finishes, "
                          "then abort the rest (0 = run all --tp-n prompts to completion)")
     ap.add_argument("--no-throughput", action="store_true", help="capacity + ppl / passkey only")
+    ap.add_argument("--whole-waves", action="store_true",
+                    help="sustained mode: close the window at a wave boundary after --tp-seconds (see _steady)")
     ap.add_argument("--only-throughput", action="store_true", help="skip ppl / passkey")
+    ap.add_argument("--capacity-only", action="store_true", help="engine start only: KV capacity, nothing else")
     ap.add_argument("--quick", action="store_true", help="smoke run: 3 passkey trials, 8k only, 16 x 2k throughput")
     ap.add_argument("--verbose", action="store_true", help="show all vLLM log lines")
     ap.add_argument("--out", default="vllm_compare.jsonl", help="results appended here as they finish")
@@ -175,8 +181,9 @@ def main():
         free = wait_gpu_free()
         log(f"GPU free memory at start: {free:.2f} GiB")
         cmd = [sys.executable, "-u", __file__, "--one", "--kv", kv] + [
-            x for k, v in vars(a).items() if k not in ("kv", "one", "quick", "verbose", "out", "only_throughput", "no_throughput")
-            and v is not None for x in (f"--{k.replace('_', '-')}", str(v))] + (["--only-throughput"] if a.only_throughput else []) + (["--no-throughput"] if a.no_throughput else [])
+            x for k, v in vars(a).items() if k not in ("kv", "one", "quick", "verbose", "out", "only_throughput", "no_throughput",
+                                                         "capacity_only", "whole_waves")
+            and v is not None for x in (f"--{k.replace('_', '-')}", str(v))] + (["--only-throughput"] if a.only_throughput else []) + (["--no-throughput"] if a.no_throughput else []) + (["--capacity-only"] if a.capacity_only else []) + (["--whole-waves"] if a.whole_waves else [])
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True, bufsize=1)  # stderr: live bars/errors
         line_res, tail = None, []
         for line in p.stdout:
@@ -204,7 +211,13 @@ def main():
 
 def _steady(llm, prompts, a) -> dict:
     """Sustained throughput: keep the queue full, start the clock when the first request finishes (the cache is
-    full and requests are leaving and joining), count output tokens for a.tp_seconds, then abort the rest."""
+    full and requests are leaving and joining), count output tokens for a.tp_seconds, then abort the rest.
+
+    Every request has the same prompt and output length and the first ones start together, so completions come in
+    waves, one per tp_out decode steps: a wave of requests finishes and the same number of new prompts is processed.
+    The window opens at a wave's first completion, so a window shorter than a wave over-weights that prompt-heavy
+    part. With a.whole_waves the window instead closes at the first completion of a later wave once tp_seconds
+    have passed: it covers whole waves, whatever the format's step time and concurrency."""
     from vllm import SamplingParams
     from vllm.sampling_params import RequestOutputKind
     eng = llm.llm_engine
@@ -213,7 +226,12 @@ def _steady(llm, prompts, a) -> dict:
         eng.add_request(str(i), p, sp)
     log(f"3/3 sustained throughput: {len(prompts)} queued, clock starts at the first completion, {a.tp_seconds:.0f} s window")
     t0 = m0 = None
-    toks = steps = done = 0
+    toks = steps = done = waves = 0
+    last_done, prev_now, closed = 0, None, not a.whole_waves
+    limit = max(4 * a.tp_seconds, 1800.0)                # whole waves: give up waiting for a wave boundary
+    # steps without a completion that separate two waves: a wave's completions span the steps that admitted its
+    # requests (<= max_num_seqs x tp_len / batched tokens, 256 at 1,024 x 2,048 / 8,192); waves are tp_out apart
+    gap = max(64, a.tp_out // 4)
     finished = set()
     running, last_sample = [], 0.0
     while eng.has_unfinished_requests():
@@ -222,28 +240,42 @@ def _steady(llm, prompts, a) -> dict:
         finished.update(o.request_id for o in outs if o.finished)
         if t0 is None:
             if any(o.finished for o in outs):
-                t0, m0, last_sample = now, _metrics(llm), now
+                t0, m0, last_sample, prev_now = now, _metrics(llm), now, now
                 log("   first completion: window open")
             continue
+        n_done = sum(o.finished for o in outs)
+        if a.whole_waves and n_done and steps + 1 - last_done >= gap:
+            waves += 1                                   # this step starts the next wave
+            if prev_now - t0 >= a.tp_seconds:
+                closed = True
+                break                                    # window = whole waves; this step is not counted
+        if a.whole_waves and prev_now - t0 >= limit:
+            break
         steps += 1
+        if n_done:
+            last_done = steps
+        prev_now = now
         toks += sum(len(o.outputs[0].token_ids) for o in outs)
         done += sum(o.finished for o in outs)
         if now - last_sample >= 0.5:
             running.append(_metrics(llm).get("vllm:num_requests_running", 0))
             last_sample = now
-        if now - t0 >= a.tp_seconds:
+        if not a.whole_waves and now - t0 >= a.tp_seconds:
             break
-    dt = time.perf_counter() - t0
+    dt = (prev_now if a.whole_waves else time.perf_counter()) - t0
     left = eng.get_num_unfinished_requests()
     m1 = _metrics(llm)
     eng.abort_request([str(i) for i in range(len(prompts)) if str(i) not in finished])
     if left < max(running, default=0):
         log("   WARNING: the queue ran low inside the window; raise --tp-n")
+    if not closed:
+        log(f"   WARNING: no wave boundary within {limit:.0f} s: the window does not cover whole waves")
     res = {"mode": "sustained", "window_s": round(dt, 1), "steps": steps, "completed_in_window": done,
            "ms_per_step": round(1000 * dt / steps, 1) if steps else None,
            "preemptions": int(m1.get("vllm:num_preemptions", 0) - m0.get("vllm:num_preemptions", 0)),
            "mean_running": round(sum(running) / len(running), 1) if running else None,
-           "max_running": max(running, default=None), "throughput_out_tok_s": round(toks / dt, 1)}
+           "max_running": max(running, default=None), "throughput_out_tok_s": round(toks / dt, 1),
+           "whole_waves": closed if a.whole_waves else None, "waves": waves if a.whole_waves else None}
     log(f"   {res['throughput_out_tok_s']} output tok/s sustained, running mean {res['mean_running']}, "
         f"{res['ms_per_step']} ms/step, preemptions {res['preemptions']}")
     return res

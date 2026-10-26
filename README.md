@@ -57,6 +57,10 @@ Notes on this table:
   6.0105.
 - The gain depends on how tight the cache is: with more KV memory, or short requests, the model weights take a
   larger share of each step and the ratio shrinks.
+- The throughput rows were measured over a fixed 300 s window. All requests have the same length, so they finish
+  and are replaced in waves, and a fixed window covers different parts of a wave for each cache type; the ratio
+  can be off by an amount not measured yet. The [next comparison](#measured-serving-throughput-against-the-other-4-bit-formats)
+  measures over whole waves instead.
 
 Reproduce with `python bench/headline.py --sweep` (about 75 minutes on an L4).
 
@@ -79,7 +83,7 @@ brackets are 95% confidence intervals.
 | `turboquant_k8v4` | 1.72x | +0.023 [+0.019, +0.028] | −0.53 [−1.67, +0.61] | 2.21x | −0.021 | −0.68 [−1.74, +0.38] |
 | `turboquant_4bit_nc` | 2.72x | +0.012 [+0.008, +0.017] | −0.53 [−1.74, +0.68] | 2.91x | +0.022 | −0.91 [−2.20, +0.38] |
 | `int4_per_token_head` | 3.05x | breaks down (ppl 11,046) | | **3.74x** | +0.098 [+0.072, +0.123] | +0.53 [−0.45, +1.52] |
-| **kushkash int4** | **3.19x** (calc.) | **+0.007 [+0.004, +0.011]** | +0.15 [−0.83, +1.06] | 2.86x (calc.) | **+0.004 [−0.002, +0.009]** | +0.38 [−0.53, +1.36] |
+| **kushkash int4** | **3.19x** | **+0.007 [+0.004, +0.011]** | +0.15 [−0.83, +1.06] | 2.86x | **+0.004 [−0.002, +0.009]** | +0.38 [−0.53, +1.36] |
 
 - **Qwen2.5:** of the formats that hold up, kushkash int4 holds the most tokens, with the smallest perplexity
   change of the 4-bit ones (`turboquant_4bit_nc`: 2.72x, +0.012).
@@ -95,13 +99,40 @@ brackets are 95% confidence intervals.
   differently; whether that is the whole cause is not tested. The intervals above do not include this.
 - kushkash int8 was measured with the earlier fixed 0.55 GiB prompt workspace. With the current default it gets
   about 0.44 GiB more cache: about 1.71x on Qwen2.5-7B and 1.54x on Qwen3-8B (calculated, not measured).
-- "(calc.)" marks a capacity calculated with the current default workspace; every other capacity column is
-  measured. The workspace does not change the output (perplexity identical token by token).
+- kushkash int4's capacities were measured with the current default workspace, in a separate run (the workspace
+  does not change the output: perplexity identical token by token).
 - Perplexity: WikiText-2, 128 windows of 2,048 tokens, prompts processed in 256-token chunks so later chunks read
   the compressed cache. GSM8K: all 1,319 test questions, zero-shot, greedy, at most 1,024 answer tokens.
 
 Reproduce with `python bench/quality.py` (about 3.5 hours on an L4 for both models; `--report` prints these tables,
 `--base` compares against another format).
+
+### Measured: serving throughput against the other 4-bit formats
+
+Qwen3-8B-AWQ (4-bit weights) on one NVIDIA RTX PRO 6000 Blackwell (96 GB), vLLM 0.31, `--gpu-memory-utilization
+0.90`, `--max-model-len 4096`. Every cache type is set up the same way: `--max-num-seqs` = the requests its cache
+holds (tokens ÷ 4,096). Workload: 2,048-token prompts, 2,048 output tokens each, the queue kept full. Output
+tokens/s is measured over one whole wave (2,048 decode steps: every request in flight finishes and is replaced
+once), so each cache type is measured over the same mix of prompt processing and generation.
+
+| Cache type | Tokens held | Requests in flight | Output tokens/s | vs 16-bit | Time per step | Δ perplexity |
+|---|---|---|---|---|---|---|
+| 16-bit (vLLM default) | 567,440 (1x) | 137 | 2,251 | 1.00x | 61 ms | ppl 10.180 |
+| `int4_per_token_head` | **3.74x** | 517 | 3,081 | 1.37x | 169 ms | +0.070 [+0.039, +0.101] |
+| **kushkash int4** | 3.39x | 461 | **4,993** | **2.22x** | 93 ms | **+0.0006 [−0.005, +0.006]** |
+
+- `int4_per_token_head` holds 10% more tokens than kushkash int4, but each step takes 1.8x as long: kushkash int4
+  serves 1.62x its output tokens/s.
+- Per request, kushkash int4 generates 10.8 tokens/s, `int4_per_token_head` 6.0 and the 16-bit cache 16.4: the
+  4-bit caches serve more requests at once, each a little slower.
+- Tokens held: measured in each throughput run, at the `--max-num-seqs` it used.
+- All three ran at the same GPU clock (2,415 MHz median). One run each; the run-to-run spread over whole waves
+  was not measured.
+- Perplexity: WikiText-2 as above, same GPU and weights. GSM8K not run on this model.
+- One model, one GPU, one request shape. Shorter outputs make the prompt work a larger share of each wave.
+
+Reproduce with `python bench/rivals.py --kv auto,int4_per_token_head,kush4 --repeats 1 --tp-seconds 1` (about 40
+minutes on this GPU).
 
 ## Requirements
 
@@ -218,7 +249,7 @@ the format alone would give 3.46x. The exact key buffer grows with KV heads and 
 - **Works with:** chunked prefill, prefix caching, preemption, CUDA graphs, `torch.compile`, CPU offloading
   (below), and FP8 weights (`--quantization fp8`; on an L4 with Qwen2.5-7B, the 4-bit cache gave 1.90x the
   sustained output tokens/s of vLLM's default cache on the same FP8 weights: same 10 GiB KV budget, same method
-  as the table above).
+  as the table above, including its fixed-window caveat).
 - **Needs:** vLLM 0.31.x with its default model runner, an NVIDIA GPU, and a decoder-only model with full
   attention, head size 64, 128 or 256, running in fp16 or bf16.
 - **Refuses to start** (with an error saying why) for: speculative decoding, sliding-window attention, ALiBi,
@@ -459,6 +490,8 @@ pytest tests/test_cpu.py                # runs anywhere: format, kernels vs a re
 pytest tests/test_ragged.py             # runs anywhere: vLLM-style mixed batches against ground truth
 pytest tests/test_vllm_backend_cpu.py   # needs vLLM importable: the vLLM backend driven on CPU
 pytest tests/test_sglang_backend_cpu.py # runs anywhere (SGLang stubbed): the SGLang backend's bookkeeping
+pytest tests/test_quality_stats.py tests/test_rivals_cpu.py   # runs anywhere: benchmark statistics and reports
+pytest tests/test_steady_cpu.py         # needs vLLM importable: whole-wave throughput window, fake engine
 pytest tests/test_sglang_gpu.py -s     # NVIDIA GPU + SGLang: radix-cache prefixes that end mid-page
 pytest tests/test_gpu.py                # NVIDIA GPU: GPU vs CPU pages, decode vs reference, HF on GPU
 pytest tests/test_vllm_gpu.py -s       # NVIDIA GPU + vLLM: end-to-end serving (passkey retrieval, prefix caching, RAM tier)
@@ -475,6 +508,9 @@ python bench/headline.py --sweep
 # vLLM: quality matrix (perplexity and GSM8K, paired against bf16, with confidence intervals) and capacity
 python bench/quality.py --models Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen3-8B --out-dir quality
 python bench/quality.py --report quality
+
+# vLLM: sustained throughput of several cache formats, interleaved and repeated, GPU clocks logged
+python bench/rivals.py --model Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,turboquant_4bit_nc,kush4
 
 # vLLM: KV capacity, perplexity, passkey retrieval and throughput for several cache types
 python bench/vllm_compare.py --kv auto,kush4,kush8
