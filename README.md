@@ -215,7 +215,8 @@ byte-for-byte identical pages (tested with the rotation off; with it on, the rot
 ## 6. Requirements and installation
 
 - Python 3.10 or newer, PyTorch 2.5 or newer.
-- The Mojo compiler and MAX libraries from pip (`mojo`, `max-core`), installed as dependencies.
+- The Mojo compiler and MAX libraries from pip (`mojo` < 1.3, `max-core` < 26.8; the versions tested), installed
+  as dependencies.
 - GPU: NVIDIA compute capability 7.5 or newer (Turing and later; tensor cores on 8.0 and newer) and the NVIDIA
   driver. No CUDA toolkit or `nvcc`.
 - vLLM backend: vLLM 0.31.x. SGLang backend: SGLang 0.5.22. Hugging Face: transformers 5.0 or newer.
