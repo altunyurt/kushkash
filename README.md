@@ -446,6 +446,75 @@ about 2x around 64–96 tokens, about 3.2x at 1,000 tokens, and approaches the f
 
 ## 12. Tests and benchmarks
 
+### Reproduce the numbers in this README
+
+Setup, once, on a machine with an NVIDIA GPU (the times below are for the GPU named; models download on first use):
+
+```bash
+git clone https://github.com/altunyurt/kushkash && cd kushkash
+pip install ".[vllm,test]" datasets
+pytest tests/test_cpu.py tests/test_gpu.py tests/test_vllm_gpu.py -q    # correctness first: kernels, end-to-end vLLM
+```
+
+Each benchmark prints a table you can compare with the README's. Run one at a time, with nothing else on the GPU:
+vLLM sizes its cache from the memory it finds free.
+
+1. **Throughput against the other 4-bit formats** ([section 3](#3-measured-serving-throughput), first table).
+   About 40 minutes on an RTX PRO 6000; any GPU that fits the model works, the ratios are what to compare.
+
+   ```bash
+   python bench/rivals.py --model Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,kush4 --repeats 1 --tp-seconds 1
+   ```
+
+2. **Perplexity on the same weights** (section 3, last column). About 25 minutes on an L4.
+
+   ```bash
+   python bench/quality.py --models Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,kush4 --gsm8k-n 0 --out-dir q_awq
+   ```
+
+3. **vLLM's 8-bit and per-token 4-bit caches breaking Qwen2.5** ([section 4](#4-quality-compared-with-vllms-cache-formats)),
+   quick version: fewer perplexity windows, no GSM8K (wider intervals than the README's). About 15 minutes on an L4.
+
+   ```bash
+   python bench/quality.py --models Qwen/Qwen2.5-7B-Instruct --kv auto,fp8,int4_per_token_head,kush4 \
+       --gsm8k-n 0 --ppl-windows 32 --out-dir q_quick
+   ```
+
+4. **The full quality table** (section 4: every format, both models, GSM8K). About 3.5 hours on an L4.
+
+   ```bash
+   python bench/quality.py --models Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen3-8B --out-dir quality
+   python bench/quality.py --report quality                              # the tables again, from the saved runs
+   python bench/quality.py --report quality --base int4_per_token_head   # every format against another one
+   ```
+
+5. **Capacity with kushkash's buffers charged** (3.19x on Qwen2.5-7B, [Memory kushkash reserves](#memory-kushkash-reserves)).
+   About 1 minute each; compare the "GPU KV cache size" lines vLLM logs.
+
+   ```bash
+   python bench/mem_probe.py auto --max-len 4096
+   python bench/mem_probe.py kush4 --max-len 4096
+   ```
+
+6. **RAM as a second cache tier** ([System RAM as a second cache tier](#system-ram-as-a-second-cache-tier)).
+   About 35 minutes on an L4; needs about 12 GiB of free system RAM.
+
+   ```bash
+   python bench/offload_reuse.py
+   ```
+
+7. **The L4 and SGLang throughput tables** (section 3). Measured over a fixed window (see the caveat there).
+   About 75 and 45 minutes on an L4.
+
+   ```bash
+   python bench/headline.py --sweep
+   python bench/sglang_spike.py --model Qwen/Qwen2.5-7B-Instruct --mem 0.85 --max-reqs 384 --tp-out 1024   # needs SGLang 0.5.22
+   ```
+
+Results that differ from the README's, or come from other GPUs and models, are welcome as issues.
+
+### All tests and benchmarks
+
 ```bash
 pytest tests/test_cpu.py                # runs anywhere: format, kernels vs a reference, HF generation (tiny models)
 pytest tests/test_ragged.py             # runs anywhere: vLLM-style mixed batches against ground truth
