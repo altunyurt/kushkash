@@ -1,8 +1,9 @@
 # kushkash
 
 kushkash is a compressed KV cache for LLM inference. It stores attention keys and values in 4-bit or 8-bit form
-instead of 16-bit, and includes attention kernels, written in [Mojo](https://www.modular.com/mojo), that read the
-compressed cache directly, without unpacking it into a full-size copy first. The kernels run on NVIDIA GPUs and on
+instead of 16-bit, and includes a decode attention kernel, written in [Mojo](https://www.modular.com/mojo), that
+reads the compressed cache directly, without unpacking it first. Prompts that continue earlier context unpack that
+context, for the requests in the step only, into a workspace of bounded size. The kernels run on NVIDIA GPUs and on
 CPUs.
 
 ## 1. The core idea
@@ -571,7 +572,9 @@ bench/                 benchmarks
 
 kushkash is a cache format plus the kernels that write and read it. It does not schedule requests, sample tokens or
 run models; vLLM, SGLang or transformers do that. The attention kernels are part of it because a compressed cache
-is only useful if attention can read it without first unpacking it into a full-size copy.
+is only useful if attention can read it without first unpacking all of it into a full-size copy: decode reads it
+directly, and prompt processing unpacks only the earlier context of the requests in the step, into a bounded
+workspace (vLLM: 64 to 512 MiB by default; Hugging Face and `KUSHKASH_PREFILL=loop`: one block at a time).
 
 ## 14. Limits and open questions
 
