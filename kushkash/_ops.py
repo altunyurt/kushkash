@@ -100,6 +100,84 @@ class Ops:
                                job_page.data_ptr(), n_jobs, mode, cache.data_ptr(), bs, hs, tail_k.data_ptr(),
                                tail_idx.data_ptr(), block_table.data_ptr(), block_table.stride(0), H)
 
+    # ---------------------------------------------------------------- rotation
+    def fwht(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        """Walsh-Hadamard rotation of every D-row of contiguous x, in the kernels' canonical order
+        (kush/quant.mojo), bit-identical on CPU and GPU. out (contiguous, x's shape and dtype) may be x.
+        Same rotation as rotate(x, hadamard(D)) up to fp32 rounding; H @ H = I, so it also rotates back."""
+        D = self.D
+        if x.shape[-1] != D or not x.is_contiguous():
+            raise ValueError(f"fwht: x must be contiguous with last dim {D}")
+        out = torch.empty_like(x) if out is None else out
+        if out.shape != x.shape or out.dtype != x.dtype or not out.is_contiguous():
+            raise ValueError("fwht: out must be contiguous, with x's shape and dtype")
+        rows = x.numel() // D
+        if rows == 0:
+            return out
+        if self.gpu:
+            if x.dtype != self.dtype:
+                raise ValueError(f"fwht: x is {x.dtype}, these kernels take {self.dtype}")
+            self.k["fwht"](((rows + 3) // 4, 1, 1), 128, x.data_ptr(), out.data_ptr(), D, D, rows)
+        else:
+            if x.dtype != torch.float32:
+                raise ValueError("fwht: CPU kernels take fp32")
+            if out.data_ptr() != x.data_ptr():
+                out.copy_(x)
+            self._cpu.call("kush_cpu_fwht", D, out.data_ptr(), rows)
+        return out
+
+    # ---------------------------------------------------------------- unpack (prefill with history)
+    def unpack(self, cache: torch.Tensor, page_blk: torch.Tensor, page_dst: torch.Tensor, tail_blk: torch.Tensor,
+               tail_info: torch.Tensor, tail_k: torch.Tensor, k_new: torch.Tensor, v_new: torch.Tensor,
+               new_dst: torch.Tensor, kp: torch.Tensor, vp: torch.Tensor, rot: bool) -> None:
+        """One packed-prefill group's keys / values into kp, vp ([rows, Hkv, D], contiguous), one launch:
+        full history pages (block page_blk[i] -> rows page_dst[i] + 0..31), partial pages (block tail_blk[i],
+        tail_info[i] = (first row, tokens, tail slot): K from tail_k, V from the record) and the new chunk
+        (row j of k_new / v_new [n, Hkv, D] -> row new_dst[j]). int32 index tensors. rot: rotate history back
+        (canonical Walsh-Hadamard); new rows are copied as they are. Dequantization: fma(code, scale, bias) in
+        fp32, rounded once to kp's dtype."""
+        H, D = kp.shape[1], self.D
+        n_pages, n_tail, n_new = page_blk.numel(), tail_blk.numel(), new_dst.numel()
+        for t in (page_blk, page_dst, tail_blk, tail_info, new_dst):
+            if t.dtype != torch.int32 or not t.is_contiguous():
+                raise ValueError("unpack: index tensors must be contiguous int32")
+        if not (kp.is_contiguous() and vp.is_contiguous() and kp.shape == vp.shape and kp.shape[2] == D):
+            raise ValueError("unpack: kp / vp must be contiguous [rows, Hkv, D]")
+        for t in (k_new, v_new):
+            if t.shape[1:] != (H, D) or t.stride(2) != 1 or t.stride(1) != D:
+                raise ValueError("unpack: k_new / v_new must be [n, Hkv, D] with unit dim stride and head stride D")
+        if tail_info.numel() != 3 * n_tail or k_new.shape[0] < n_new or v_new.shape[0] < n_new:
+            raise ValueError("unpack: tail_info must hold 3 ints per partial page; k_new / v_new one row per new_dst")
+        if page_dst.numel() != n_pages:
+            raise ValueError("unpack: page_dst must hold one row per page_blk entry")
+        if not self.gpu:                              # values on the host: check bounds (on the GPU this would sync)
+            rows, slots = kp.shape[0], tail_k.shape[0]
+            info = tail_info.view(-1, 3)
+            bad = ((n_pages and (int(page_dst.min()) < 0 or int(page_dst.max()) + PAGE > rows))
+                   or (n_new and (int(new_dst.min()) < 0 or int(new_dst.max()) >= rows))
+                   or (n_tail and (int(info[:, 1].min()) < 1 or int(info[:, 1].max()) > PAGE
+                                   or int(info[:, 0].min()) < 0 or int((info[:, 0] + info[:, 1]).max()) > rows
+                                   or int(info[:, 2].min()) < 0 or int(info[:, 2].max()) >= slots)))
+            blocks = cache.shape[0]
+            bad = bad or any(t.numel() and (int(t.min()) < 0 or int(t.max()) >= blocks) for t in (page_blk, tail_blk))
+            if bad:
+                raise ValueError("unpack: an index is out of range (rows, blocks, tail slots or tokens per page)")
+        want = self.dtype if self.gpu else torch.float32
+        for t in (tail_k, k_new, v_new, kp, vp):
+            if t.dtype != want:
+                raise ValueError(f"unpack: tail_k, k_new, v_new, kp, vp must be {want}, got {t.dtype}")
+        if n_pages + n_tail + n_new == 0:
+            return
+        bs, hs = _byte_strides(cache)
+        args = (page_blk.data_ptr(), page_dst.data_ptr(), n_pages, tail_blk.data_ptr(), tail_info.data_ptr(), n_tail,
+                tail_k.data_ptr(), k_new.data_ptr(), v_new.data_ptr(), k_new.stride(0), v_new.stride(0),
+                new_dst.data_ptr(), n_new, kp.data_ptr(), vp.data_ptr(), int(rot))
+        if self.gpu:
+            grid = (n_pages + n_tail + (n_new + PAGE - 1) // PAGE, H, 1)
+            self.k["unpack"](grid, 128, cache.data_ptr(), bs, hs, H, *args)
+        else:
+            self._cpu.call("kush_cpu_unpack", D, self.bits, cache.data_ptr(), bs, hs, H, *args)
+
     # ---------------------------------------------------------------- decode
     def splits(self, num_seqs: int, num_kv_heads: int, max_full_pages: int) -> int:
         """Split-K factor: ~6 blocks per SM, power of two, <= 32, >= 4 pages per split (1 on CPU)."""
@@ -297,6 +375,65 @@ def hadamard(head_dim: int, device) -> torch.Tensor:
             h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
         _HADAMARD[key] = (h / math.sqrt(head_dim)).to(torch.float32).to(device)
     return _HADAMARD[key]
+
+
+FWHT_SCALE_BITS = {64: 0x3E000000, 128: 0x3DB504F3, 256: 0x3D800000}   # fp32 1/sqrt(D), as in kush/quant.mojo
+
+
+def fwht_reference(x: torch.Tensor) -> torch.Tensor:
+    """The kernels' canonical Walsh-Hadamard evaluation (kush/quant.mojo) in PyTorch fp32, for tests:
+    butterflies over strides 1, 2, ..., D/2 in that order, then one multiply by fp32 1/sqrt(D).
+    Bit-identical to Ops.fwht on CPU and GPU (fp32 adds and one multiply, no FMA)."""
+    D = x.shape[-1]
+    y = x.float().reshape(-1, D).clone()
+    h = 1
+    while h < D:
+        y = y.view(-1, D // (2 * h), 2, h)
+        y = torch.stack((y[:, :, 0] + y[:, :, 1], y[:, :, 0] - y[:, :, 1]), 2).reshape(-1, D)
+        h *= 2
+    scale = torch.tensor([FWHT_SCALE_BITS[D]], dtype=torch.int32).view(torch.float32).to(y.device)
+    return (y * scale).view(x.shape)
+
+
+def unpack_reference(records: torch.Tensor, page_blk, page_dst, tail_blk, tail_info, tail_k: torch.Tensor,
+                     k_new: torch.Tensor, v_new: torch.Tensor, new_dst, kp: torch.Tensor, vp: torch.Tensor,
+                     head_dim: int, bits: int, rot: bool) -> None:
+    """Ops.unpack in PyTorch, for tests: dequantization in fp64 rounded once to fp32 (equals fma(code, scale,
+    bias) whenever the fp64 sum is exact, true for fp16 scales / biases of similar magnitude), then the canonical
+    rotation, then one rounding to kp's dtype. records: [blocks, Hkv, RB] uint8; kp / vp written in place."""
+    D, P, H = head_dim, PAGE, records.shape[1]
+    dc = D if bits == 8 else D // 2
+    L = lambda t: [int(x) for x in t.reshape(-1).tolist()]
+
+    def deq(blk):
+        r = records[blk]                                                     # [H, RB]
+        kq = r[:, :P * dc].view(torch.int8).view(H, P, dc)
+        vq = r[:, P * dc:2 * P * dc].view(torch.int8).view(H, P, dc)
+        if bits == 4:
+            kq = torch.cat([kq.bitwise_left_shift(4).bitwise_right_shift(4), kq.bitwise_right_shift(4)], -1)
+            vq = torch.cat([vq.bitwise_left_shift(4).bitwise_right_shift(4), vq.bitwise_right_shift(4)], -1)
+        m = r[:, 2 * P * dc:].contiguous().view(torch.float16).double()       # [H, 2D + 2P]
+        k = (kq.double() * m[:, None, :D] + m[:, None, D:2 * D]).float()
+        v = (vq.double() * m[:, 2 * D:2 * D + P, None] + m[:, 2 * D + P:, None]).float()
+        return k, v                                                          # [H, P, D] fp32
+
+    def put(row, k, v):                                                      # k, v [H, D] fp32
+        if rot:
+            k, v = fwht_reference(k), fwht_reference(v)
+        kp[row], vp[row] = k.to(kp.dtype), v.to(vp.dtype)
+
+    for blk, d0 in zip(L(page_blk), L(page_dst)):
+        k, v = deq(blk)
+        for t in range(P):
+            put(d0 + t, k[:, t], v[:, t])
+    info = L(tail_info)
+    for i, blk in enumerate(L(tail_blk)):
+        d0, n, slot = info[3 * i:3 * i + 3]
+        _, v = deq(blk)
+        for t in range(n):
+            put(d0 + t, tail_k[slot, :, t].float(), v[:, t])
+    for j, d in enumerate(L(new_dst)):
+        kp[d], vp[d] = k_new[j], v_new[j]
 
 
 def _signs(head_dim: int, device, dtype: torch.dtype) -> torch.Tensor:

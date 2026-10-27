@@ -22,7 +22,7 @@ from std.math import exp
 from std.memory import alloc, Layout, stack_allocation
 from std.sys import simd_width_of
 from max.algorithm import sync_parallelize
-from kush.quant import PAGE, row_bytes, qparams, qcode, pack4, off_vq, off_ks, off_kb, off_vs, off_vb
+from kush.quant import PAGE, row_bytes, qparams, qcode, pack4, off_vq, off_ks, off_kb, off_vs, off_vb, fwht_scale, fwht_stages
 
 comptime P = PAGE
 comptime W = simd_width_of[DType.float32]()
@@ -76,6 +76,97 @@ def _cache(cache: Int64, bs: Int64, hs: Int64, tail_k: Int64, tail_idx: Int64,
            block_table: Int64, max_pages: Int64, hkv: Int64) -> _Cache:
     return _Cache(_p[Int8](cache), Int(bs), Int(hs), _p[Float32](tail_k), _p[Int32](tail_idx),
                   _p[Int32](block_table), Int(max_pages), Int(hkv))
+
+
+# ------------------------------------------------------------------ rotation
+@no_inline
+def _fwht_rows[D: Int](x: F32P, rows: Int):
+    """Walsh-Hadamard transform of `rows` contiguous fp32 rows of D values, in place, in the canonical
+    order of kush/quant.mojo (bit-identical to the GPU _fwht_warp). Not inlined on purpose: the scale
+    multiply ends in memory, so no caller can fuse it into an FMA with what it does next."""
+    var sc = V32(fwht_scale[D]())
+    for r in range(rows):
+        var p = x.unsafe_offset(r * D)
+        comptime for k in range(fwht_stages[D]()):          # h = 1, 2, ..., D/2
+            comptime h = 1 << k
+            comptime if h < W:                                # partner in the same vector: scalars
+                for i in range(D):
+                    if i & h == 0:
+                        var a = p[unsafe_offset=i]
+                        var b = p[unsafe_offset=i + h]
+                        p[unsafe_offset=i] = a + b
+                        p[unsafe_offset=i + h] = a - b
+            else:
+                for base in range(0, D, 2 * h):
+                    for j in range(base, base + h, W):
+                        var a = p.unsafe_load[width=W](j)
+                        var b = p.unsafe_load[width=W](j + h)
+                        p.unsafe_store(j, a + b)
+                        p.unsafe_store(j + h, a - b)
+        for j in range(0, D, W):
+            p.unsafe_store(j, p.unsafe_load[width=W](j) * sc)
+
+
+# ------------------------------------------------------------------ unpack (prefill with history)
+@always_inline
+def _code[D: Int, BITS: Int](row: I8P, c: Int) -> Float32:
+    """Code of dim c in one page row, as fp32 (exact). int4: dim c < D/2 is the low nibble of byte c,
+    dim c >= D/2 the high nibble of byte c - D/2."""
+    comptime if BITS == 8:
+        return Float32(row[unsafe_offset=c])
+    else:
+        var byte = row[unsafe_offset=c % (D // 2)]
+        return Float32((byte << 4) >> 4) if c < D // 2 else Float32(byte >> 4)
+
+
+def _unpack[D: Int, BITS: Int](cache: I8P, bs: Int, hs: Int, H: Int, page_blk: I32P, page_dst: I32P, n_pages: Int,
+                               tail_blk: I32P, tail_info: I32P, n_tail: Int, tail_k: F32P, k_new: F32P,
+                               v_new: F32P, ks_new: Int, vs_new: Int, new_dst: I32P, n_new: Int, kp: F32P,
+                               vp: F32P, rot: Bool):
+    """Same contract and arithmetic as the GPU kush_unpack (bit-identical): history pages and partial pages
+    dequantized with fma(code, scale, bias) in fp32, optionally rotated back, then the new chunk's rows."""
+    comptime DC = row_bytes[D, BITS]()
+    var rs = H * D
+    var kx = stack_allocation[D, Float32]()
+    var vx = stack_allocation[D, Float32]()
+    for b in range(n_pages + n_tail):
+        var page = b < n_pages
+        var i = b - n_pages
+        var blk = Int(page_blk[unsafe_offset=b]) if page else Int(tail_blk[unsafe_offset=i])
+        var dst0 = Int(page_dst[unsafe_offset=b]) if page else Int(tail_info[unsafe_offset=3 * i])
+        var n = P if page else Int(tail_info[unsafe_offset=3 * i + 1])
+        for h in range(H):
+            var rec = cache.unsafe_offset(blk * bs + h * hs)
+            var ksp = rec.unsafe_offset(off_ks[D, BITS]()).unsafe_bitcast[Float16]()
+            var kbp = rec.unsafe_offset(off_kb[D, BITS]()).unsafe_bitcast[Float16]()
+            var vsp = rec.unsafe_offset(off_vs[D, BITS]()).unsafe_bitcast[Float16]()
+            var vbp = rec.unsafe_offset(off_vb[D, BITS]()).unsafe_bitcast[Float16]()
+            var tk = 0
+            if not page:
+                tk = (Int(tail_info[unsafe_offset=3 * i + 2]) * H + h) * P * D
+            for t in range(n):
+                var vs = Float32(vsp[unsafe_offset=t])
+                var vb = Float32(vbp[unsafe_offset=t])
+                for c in range(D):
+                    if page:
+                        kx[unsafe_offset=c] = _code[D, BITS](rec.unsafe_offset(t * DC), c).fma(
+                            Float32(ksp[unsafe_offset=c]), Float32(kbp[unsafe_offset=c]))
+                    else:
+                        kx[unsafe_offset=c] = tail_k[unsafe_offset=tk + t * D + c]
+                    vx[unsafe_offset=c] = _code[D, BITS](rec.unsafe_offset(off_vq[D, BITS]() + t * DC), c).fma(vs, vb)
+                if rot:
+                    _fwht_rows[D](kx, 1)
+                    _fwht_rows[D](vx, 1)
+                var o = (dst0 + t) * rs + h * D
+                for c in range(0, D, W):
+                    kp.unsafe_store(o + c, kx.unsafe_load[width=W](c))
+                    vp.unsafe_store(o + c, vx.unsafe_load[width=W](c))
+    for j in range(n_new):
+        var o = Int(new_dst[unsafe_offset=j]) * rs
+        for h in range(H):
+            for c in range(0, D, W):
+                kp.unsafe_store(o + h * D + c, k_new.unsafe_load[width=W](j * ks_new + h * D + c))
+                vp.unsafe_store(o + h * D + c, v_new.unsafe_load[width=W](j * vs_new + h * D + c))
 
 
 # ------------------------------------------------------------------ write path
@@ -437,4 +528,35 @@ def kush_cpu_decode(d: Int64, bits: Int64, q: Int64, o: Int64, cache: Int64, bs:
             if bits == 8:
                 _decode[DD, 8](_p[Float32](q), _p[Float32](o), cc, _p[Int32](seq_lens), Int(group), sm, Int(n_seqs))
                 return 0
+    return -1
+
+
+@export
+def kush_cpu_fwht(d: Int64, x: Int64, rows: Int64) abi("C") -> Int32:
+    """Rotate `rows` contiguous fp32 rows of d values in place (H @ H = I: also rotates back)."""
+    comptime for di in range(len(_DIMS)):
+        comptime DD = _DIMS[di]
+        if Int(d) == DD:
+            _fwht_rows[DD](_p[Float32](x), Int(rows))
+            return 0
+    return -1
+
+
+@export
+def kush_cpu_unpack(d: Int64, bits: Int64, cache: Int64, bs: Int64, hs: Int64, hkv: Int64, page_blk: Int64,
+                    page_dst: Int64, n_pages: Int64, tail_blk: Int64, tail_info: Int64, n_tail: Int64,
+                    tail_k: Int64, k_new: Int64, v_new: Int64, k_stride: Int64, v_stride: Int64, new_dst: Int64,
+                    n_new: Int64, kp: Int64, vp: Int64, rot: Int64) abi("C") -> Int32:
+    comptime for di in range(len(_DIMS)):
+        comptime DD = _DIMS[di]
+        if Int(d) == DD:
+            comptime for bi in range(2):
+                comptime BB = 4 if bi == 0 else 8
+                if Int(bits) == BB:
+                    _unpack[DD, BB](_p[Int8](cache), Int(bs), Int(hs), Int(hkv), _p[Int32](page_blk),
+                                    _p[Int32](page_dst), Int(n_pages), _p[Int32](tail_blk), _p[Int32](tail_info),
+                                    Int(n_tail), _p[Float32](tail_k), _p[Float32](k_new), _p[Float32](v_new),
+                                    Int(k_stride), Int(v_stride), _p[Int32](new_dst), Int(n_new), _p[Float32](kp),
+                                    _p[Float32](vp), rot != 0)
+                    return 0
     return -1

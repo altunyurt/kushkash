@@ -202,10 +202,12 @@ over all channels, so the 4-bit codes lose less.
   GPUs it uses tensor cores; long sequences are split across thread blocks and combined at the end.
 - *Writes*: small kernels append decode tokens and write whole prompt chunks, quantizing pages as they fill.
 - *Prompt chunks that follow earlier context* (long prompts in chunks, multi-turn chats, prefix-cache hits): the
-  earlier context is unpacked with PyTorch and attended together with the new chunk: in vLLM into the prompt
-  workspace with FlashAttention, many requests per call; in SGLang into a per-step buffer with FlashInfer; in
-  Hugging Face, and vLLM with `KUSHKASH_PREFILL=loop`, a fixed-size block at a time merged with PyTorch's fused
-  attention.
+  earlier context is unpacked and attended together with the new chunk. In vLLM one Mojo kernel per group of requests
+  unpacks it straight into the prompt workspace, then FlashAttention runs over many requests per call (on an L4,
+  10–31% less attention time per layer than the earlier PyTorch unpacking for steps with earlier context, measured:
+  `bench/packed_microbench.py`, run once with `KUSHKASH_UNPACK=torch` and once without). In SGLang PyTorch unpacks it
+  into a per-step buffer for FlashInfer; in Hugging Face, and vLLM with `KUSHKASH_PREFILL=loop`, PyTorch unpacks a
+  fixed-size block at a time, merged with PyTorch's fused attention.
 - *Prompts with no earlier context* use FlashAttention in vLLM, FlashInfer in SGLang, and PyTorch's attention in
   Hugging Face.
 
@@ -287,17 +289,18 @@ runs one test step through kushkash, so the memory a step needs only while it ru
 | Buffer | What it is for | Size | Set by |
 |---|---|---|---|
 | Exact key buffer | Keys of each request's newest, still-filling 32-token block | about 225 MiB for Qwen2.5-7B, 576 MiB for Qwen3-8B, at 256 requests (calculated) | `--max-num-seqs` |
-| Prompt workspace | Unpacking earlier context when a prompt continues it (long prompts in chunks, prefix-cache hits) | about 0.1 GiB at `--max-model-len 4096`, up to about 0.55 GiB at 128k (calculated) | `KUSHKASH_PACK_MB` |
+| Prompt workspace | Unpacking earlier context when a prompt continues it (long prompts in chunks, prefix-cache hits) | 64 MiB at `--max-model-len 4096`, up to 512 MiB at 128k (calculated) | `KUSHKASH_PACK_MB` |
 
-- By default the workspace holds two full-length requests' earlier context (64 to 512 MiB), plus a fixed 32 MiB
-  area that earlier context is unpacked into piece by piece. It does not change the model's output. A step with
-  more earlier context than fits is processed in more groups: in a per-layer benchmark on an L4, a two-group step
-  took 2.5–3% longer in attention than with the old fixed 512 MiB; steps that fit were unchanged.
-- On the L4 with Qwen2.5-7B (`--gpu-memory-utilization 0.90`, `--max-model-len 4096`, 256 requests), kushkash
-  leaves 0.38 GiB less KV cache memory than vLLM's default (measured; about 0.33 GiB of it is the two buffers, the
-  rest smaller per-step reservations): the int4 cache holds 3.19x the tokens of vLLM's default, where the format
-  alone would give 3.46x. On Qwen3-8B it holds 2.86x. Setting `--max-num-seqs` to the concurrency you need shrinks
-  the exact key buffer in proportion.
+- By default the workspace holds two full-length requests' earlier context (64 to 512 MiB); a Mojo kernel unpacks
+  earlier context straight into it. Its size does not change the model's output. A step with more earlier context
+  than fits is processed in more groups: in a per-layer benchmark on an L4, a two-group step took 2.5–3% longer in
+  attention than with the old fixed 512 MiB; steps that fit were unchanged.
+- On the L4 with Qwen2.5-7B (`--gpu-memory-utilization 0.90`, `--max-model-len 4096`, 256 requests), kushkash leaves
+  0.38 GiB less KV cache memory than vLLM's default (measured on v0.4.8; about 0.33 GiB of it is the two buffers, the
+  rest smaller per-step reservations; v0.4.8's workspace also held a 32 MiB unpacking area, which v0.5.0 allocates
+  only with `KUSHKASH_UNPACK=torch`): the int4 cache holds 3.19x the tokens of vLLM's default, where the format alone
+  would give 3.46x. On Qwen3-8B it holds 2.86x. Setting `--max-num-seqs` to the concurrency you need shrinks the
+  exact key buffer in proportion.
 
 ### Settings
 
@@ -307,6 +310,7 @@ runs one test step through kushkash, so the memory a step needs only while it ru
 | `KUSHKASH_ROTATE` | `auto` | Hadamard rotation before storing ([How it works](#5-how-it-works)): `auto` = on for 4 bits only; `0` off; `1` on |
 | `KUSHKASH_PACK_MB` | `auto` | Prompt workspace in MiB (raised so one full-length request fits): `auto` = two full-length requests, 64 to 512 MiB; `0` = none, slower prompt processing |
 | `KUSHKASH_PREFILL` | `packed` | `loop` = process prompts one request at a time (slower, no workspace) |
+| `KUSHKASH_UNPACK` | `mojo` | `torch` = the earlier PyTorch unpacking of earlier context (slower, plus a 32 MiB area; for comparisons) |
 | `KUSHKASH_PROFILE_STEP` | `1` | `0` skips the test step vLLM's startup memory check runs through kushkash (not recommended) |
 | `KUSHKASH_MEM_STATS` | `0` | `N` = print PyTorch memory counters every N prompt steps (debugging) |
 

@@ -29,7 +29,7 @@ from max.gpu import thread_idx, block_idx, barrier, syncwarp
 from max.gpu.memory import AddressSpace
 from max.gpu.primitives import warp
 from max.gpu.compute.mma import mma, ld_matrix
-from kush.quant import PAGE, row_bytes, qparams, qcode, pack4, off_vq, off_ks, off_kb, off_vs, off_vb
+from kush.quant import PAGE, row_bytes, qparams, qcode, pack4, off_vq, off_ks, off_kb, off_vs, off_vb, fwht_scale
 
 comptime F32P = Pointer[Float32, MutAnyOrigin]
 comptime I8P = Pointer[Int8, MutAnyOrigin]
@@ -43,6 +43,73 @@ comptime XOR8 = UInt32(0x80808080)     # signed int8 code -> unsigned (c + 128)
 comptime XOR4 = UInt32(0x08080808)     # masked nibble (two's complement) -> unsigned (c + 8)
 comptime NIB = UInt32(0x0F0F0F0F)
 comptime H64 = UInt32(0x64646464)
+
+
+# ------------------------------------------------------------------ rotation
+@always_inline
+def _mul_rn(a: Float32, b: Float32) -> Float32:
+    """a * b rounded once, as its own instruction: inline PTX is opaque to LLVM and `.rn` keeps ptxas
+    from contracting it into an FMA with the caller's next add (kush/quant.mojo: rotation)."""
+    return inlined_assembly["mul.rn.f32 $0, $1, $2;", Float32, constraints="=f,f,f"](a, b)
+
+
+@always_inline
+def _fwht_warp[D: Int](x: SIMD[DType.float32, D // WARP], lane: Int) -> SIMD[DType.float32, D // WARP]:
+    """Walsh-Hadamard transform of one row held by a warp: lane holds x[i] = row[lane + i*32]
+    (the layout of _quantize_v_row). Canonical order (kush/quant.mojo), bit-identical to the CPU:
+    strides 1..16 cross lanes (shuffle_xor), strides 32..D/2 stay in a lane's registers."""
+    comptime R = D // WARP
+    var y = x
+    comptime for k in range(5):                               # h = 1, 2, 4, 8, 16: partner lane ^ h
+        comptime h = 1 << k
+        var upper = (lane & h) != 0
+        comptime for i in range(R):
+            var other = warp.shuffle_xor(y[i], UInt32(h))
+            y[i] = other - y[i] if upper else y[i] + other    # upper: a - b with a = partner
+    comptime if R >= 2:                                       # h = 32: register bit 0
+        comptime for i in range(0, R, 2):
+            var a = y[i]
+            var b = y[i + 1]
+            y[i] = a + b
+            y[i + 1] = a - b
+    comptime if R >= 4:                                       # h = 64: register bit 1
+        comptime for i in range(R):
+            comptime if i & 2 == 0:
+                var a = y[i]
+                var b = y[i + 2]
+                y[i] = a + b
+                y[i + 2] = a - b
+    comptime if R >= 8:                                       # h = 128: register bit 2
+        comptime for i in range(R):
+            comptime if i & 4 == 0:
+                var a = y[i]
+                var b = y[i + 4]
+                y[i] = a + b
+                y[i + 4] = a - b
+    comptime sc = fwht_scale[D]()
+    comptime for i in range(R):
+        y[i] = _mul_rn(y[i], sc)
+    return y
+
+
+def kush_fwht[D: Int, IN: DType](
+    x: Pointer[Scalar[IN], MutAnyOrigin], y: Pointer[Scalar[IN], MutAnyOrigin], x_stride: Int32,
+    y_stride: Int32, rows: Int32,
+):
+    """grid (ceil(rows / 4)), block 128: one warp per row. y[r] = rotated x[r] (D values per row,
+    row strides in elements; y may alias x). Tests and a stand-alone rotation for rows the
+    attention kernels do not rotate themselves."""
+    var lane = Int(thread_idx.x) % WARP
+    var r = Int(block_idx.x) * 4 + Int(thread_idx.x) // WARP
+    if r >= Int(rows):
+        return
+    comptime R = D // WARP
+    var v = SIMD[DType.float32, R]()
+    comptime for i in range(R):
+        v[i] = Float32(x[unsafe_offset=r * Int(x_stride) + lane + i * WARP])
+    v = _fwht_warp[D](v, lane)
+    comptime for i in range(R):
+        y[unsafe_offset=r * Int(y_stride) + lane + i * WARP] = v[i].cast[IN]()
 
 
 # ------------------------------------------------------------------ write path
@@ -207,6 +274,105 @@ def kush_write[D: Int, BITS: Int, IN: DType](
             return
         for t in range(max(ps, ctx), total):
             tail_k[unsafe_offset=tb + (t - ps) * D + d] = k_new[unsafe_offset=(q0 + t - ctx) * ks + h * D + d]
+
+
+# ------------------------------------------------------------------ unpack (prefill with history)
+@always_inline
+def _codes_row[D: Int, BITS: Int](row: I8P, lane: Int) -> SIMD[DType.float32, D // WARP]:
+    """Codes of one page row for the lane's dims lane + 32*i, as fp32 (exact). int4: byte j holds dim j
+    (low nibble) and dim j + D/2 (high), so a lane's first R/2 bytes give all R codes."""
+    comptime R = D // WARP
+    var c = SIMD[DType.float32, R]()
+    comptime if BITS == 8:
+        comptime for i in range(R):
+            c[i] = Float32(row[unsafe_offset=lane + i * WARP])
+    else:
+        comptime for i in range(R // 2):
+            var byte = row[unsafe_offset=lane + i * WARP]
+            c[i] = Float32((byte << 4) >> 4)
+            c[i + R // 2] = Float32(byte >> 4)
+    return c
+
+
+@always_inline
+def _store_row[D: Int, IN: DType](dst: Pointer[Scalar[IN], MutAnyOrigin], x: SIMD[DType.float32, D // WARP], lane: Int):
+    comptime for i in range(D // WARP):
+        dst[unsafe_offset=lane + i * WARP] = x[i].cast[IN]()
+
+
+def kush_unpack[D: Int, BITS: Int, IN: DType](
+    cache: I8P, block_stride: Int32, head_stride: Int32, hkv: Int32,
+    page_blk: I32P, page_dst: I32P, n_pages: Int32,
+    tail_blk: I32P, tail_info: I32P, n_tail: Int32, tail_k: Pointer[Scalar[IN], MutAnyOrigin],
+    k_new: Pointer[Scalar[IN], MutAnyOrigin], v_new: Pointer[Scalar[IN], MutAnyOrigin], k_stride: Int32,
+    v_stride: Int32, new_dst: I32P, n_new: Int32,
+    kp: Pointer[Scalar[IN], MutAnyOrigin], vp: Pointer[Scalar[IN], MutAnyOrigin], rot: Int32,
+):
+    """Builds a packed-prefill group's keys and values in kp / vp ([rows][Hkv][D], IN) in one launch.
+    grid (n_pages + n_tail + ceil(n_new / 32), Hkv), block 128 (4 warps; a warp does one token row at a time,
+    lane holding dims lane + 32*i). Block x:
+      < n_pages            full history page: record of block page_blk[x] -> rows page_dst[x] + t, t < 32
+      < n_pages + n_tail   partial page i: tail_info[3i..3i+2] = (first row, tokens n, tail slot); K rows from
+                           the exact tail (slot), V rows from the record of block tail_blk[i]
+      else                 32 rows of the new chunk: row j of k_new / v_new (row strides) -> row new_dst[j]
+    Dequantization is fma(code, scale, bias) in fp32 (scales and biases are fp16, exact in fp32), rounded once
+    to IN. rot != 0: history (pages and tail) is rotated back with the canonical Walsh-Hadamard transform
+    before rounding; new rows are copied as they are. Same arithmetic as the CPU _unpack: bit-identical."""
+    comptime R = D // WARP
+    comptime DC = row_bytes[D, BITS]()
+    var b = Int(block_idx.x)
+    var h = Int(block_idx.y)
+    var H = Int(hkv)
+    var w = Int(thread_idx.x) // WARP
+    var lane = Int(thread_idx.x) % WARP
+    var np = Int(n_pages)
+    var nt = Int(n_tail)
+    var rs = H * D                                         # row stride of kp / vp
+    if b < np + nt:
+        var page = b < np
+        var i = b - np
+        var rec = _rec(cache, Int(page_blk[unsafe_offset=b]) if page else Int(tail_blk[unsafe_offset=i]), h,
+                       block_stride, head_stride)
+        var dst0 = Int(page_dst[unsafe_offset=b]) if page else Int(tail_info[unsafe_offset=3 * i])
+        var n = P if page else Int(tail_info[unsafe_offset=3 * i + 1])
+        var vsp = rec.unsafe_offset(off_vs[D, BITS]()).unsafe_bitcast[Float16]()
+        var vbp = rec.unsafe_offset(off_vb[D, BITS]()).unsafe_bitcast[Float16]()
+        var ks = SIMD[DType.float32, R]()
+        var kb = SIMD[DType.float32, R]()
+        if page:                                           # per-channel K scale / bias: once per block
+            var ksp = rec.unsafe_offset(off_ks[D, BITS]()).unsafe_bitcast[Float16]()
+            var kbp = rec.unsafe_offset(off_kb[D, BITS]()).unsafe_bitcast[Float16]()
+            comptime for j in range(R):
+                ks[j] = Float32(ksp[unsafe_offset=lane + j * WARP])
+                kb[j] = Float32(kbp[unsafe_offset=lane + j * WARP])
+        var tk = 0
+        if not page:
+            tk = (Int(tail_info[unsafe_offset=3 * i + 2]) * H + h) * P * D
+        for t in range(w, n, 4):
+            var kx: SIMD[DType.float32, R]
+            if page:
+                kx = _codes_row[D, BITS](rec.unsafe_offset(t * DC), lane).fma(ks, kb)
+            else:
+                kx = SIMD[DType.float32, R]()
+                comptime for j in range(R):
+                    kx[j] = Float32(tail_k[unsafe_offset=tk + t * D + lane + j * WARP])
+            var vx = _codes_row[D, BITS](rec.unsafe_offset(off_vq[D, BITS]() + t * DC), lane).fma(
+                SIMD[DType.float32, R](Float32(vsp[unsafe_offset=t])), SIMD[DType.float32, R](Float32(vbp[unsafe_offset=t])))
+            if rot != 0:
+                kx = _fwht_warp[D](kx, lane)
+                vx = _fwht_warp[D](vx, lane)
+            var o = (dst0 + t) * rs + h * D
+            _store_row[D, IN](kp.unsafe_offset(o), kx, lane)
+            _store_row[D, IN](vp.unsafe_offset(o), vx, lane)
+    else:
+        var j0 = (b - np - nt) * P
+        for t in range(w, P, 4):
+            var j = j0 + t
+            if j < Int(n_new):
+                var o = Int(new_dst[unsafe_offset=j]) * rs + h * D
+                comptime for c in range(R):
+                    kp[unsafe_offset=o + lane + c * WARP] = k_new[unsafe_offset=j * Int(k_stride) + h * D + lane + c * WARP]
+                    vp[unsafe_offset=o + lane + c * WARP] = v_new[unsafe_offset=j * Int(v_stride) + h * D + lane + c * WARP]
 
 
 # ------------------------------------------------------------------ shared decode helpers

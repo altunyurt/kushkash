@@ -144,10 +144,12 @@ class GpuConfig:
             "write": f"kush_write[{D}, {B}, {IN}]",
             "decode": f"{dec}[{D}, {B}, {G}, {NW}, {IN}]",
             "combine": f"kush_combine[{D}, {G}, {IN}]",
+            "fwht": f"kush_fwht[{D}, {IN}]",
+            "unpack": f"kush_unpack[{D}, {B}, {IN}]",
         }
 
 
-_GEN = """from kush.gpu import kush_append, kush_write, kush_decode_tc, kush_decode, kush_combine
+_GEN = """from kush.gpu import kush_append, kush_write, kush_decode_tc, kush_decode, kush_combine, kush_fwht, kush_unpack
 from max.gpu.host.compile import get_gpu_target
 from std.compile import compile_info
 

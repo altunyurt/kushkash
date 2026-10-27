@@ -191,3 +191,42 @@ def test_generate_eos_async_stop(graph):
     assert torch.equal(out[:, :k + 1], ref[:, :k + 1])
     assert bool((out[0, k + 1:] == eos).all())
     assert out.shape[1] < ref.shape[1]                                 # stopped early
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_fwht_gpu_matches_cpu(D, dtype):
+    """GPU warp FWHT == CPU FWHT == the canonical PyTorch order, bit for bit (inputs exact in dtype)."""
+    from kushkash._ops import Ops, fwht_reference
+    g = torch.Generator().manual_seed(D)
+    x = (torch.randn(1001, D, generator=g) * torch.logspace(-3, 3, 1001)[:, None]).to(dtype)   # 1001: partial block
+    cpu = Ops(torch.device("cpu"), D, 4, 1, torch.float32).fwht(x.float())
+    assert torch.equal(cpu, fwht_reference(x.float()))
+    gpu = Ops(torch.device("cuda"), D, 4, 1, dtype)
+    y = gpu.fwht(x.cuda()).cpu()
+    want = cpu.to(dtype)
+    bad = (y.float().view(torch.int32) != want.float().view(torch.int32)) if dtype == torch.float32 else (y != want)
+    assert not bad.any(), f"{bad.sum().item()} of {bad.numel()} values differ from the CPU"
+    xc = x.cuda()
+    assert torch.equal(gpu.fwht(xc, out=xc).cpu(), y)                                  # in place
+
+
+@pytest.mark.parametrize("D,bits", [(64, 4), (128, 4), (256, 4), (128, 8), (64, 8)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rot", [False, True])
+def test_unpack_gpu_matches_reference(D, bits, dtype, rot):
+    """GPU kush_unpack == the PyTorch reference (== the CPU kernel) bit for bit, untouched rows untouched."""
+    from _unpack_case import unpack_case
+    from kushkash._ops import Ops, unpack_reference
+    c = unpack_case(D, bits, dtype, seed=D + bits)
+    names = ("page_blk", "page_dst", "tail_blk", "tail_info", "tail_k", "k_new", "v_new", "new_dst")
+    shape = (c["rows"], c["H"], D)
+    rk, rv = torch.full(shape, float("nan"), dtype=dtype), torch.full(shape, float("nan"), dtype=dtype)
+    unpack_reference(c["records"], *[c[n] for n in names], rk, rv, D, bits, rot)
+    kp, vp = rk.new_full(shape, float("nan")).cuda(), rv.new_full(shape, float("nan")).cuda()
+    Ops(torch.device("cuda"), D, bits, 1, dtype).unpack(c["records"].cuda(), *[c[n].cuda() for n in names],
+                                                        kp, vp, rot)
+    for got, want in ((kp.cpu(), rk), (vp.cpu(), rv)):
+        a, b = got.view(torch.int16 if dtype != torch.float32 else torch.int32), \
+            want.view(torch.int16 if dtype != torch.float32 else torch.int32)
+        assert torch.equal(a, b), f"{(a != b).sum().item()} of {a.numel()} values differ"

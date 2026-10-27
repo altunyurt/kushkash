@@ -11,7 +11,8 @@ Per step (decodes first, guaranteed by reorder_batch_threshold = 1):
                 for uniform single-token decode batches).
   prefill rows: attention over [quantized history + exact chunk] (flash-attn varlen when no
                 row has history; else, by default, history pages dequantized and packed with
-                the exact K tail and the chunk into flash-attn varlen calls, one per group of
+                the exact K tail and the chunk (one Mojo kush_unpack launch per group; KUSHKASH_UNPACK=torch:
+                the earlier PyTorch path) into flash-attn varlen calls, one per group of
                 rows that fits the packed-prefill workspace; KUSHKASH_PREFILL=loop,
                 KUSHKASH_PACK_MB=0 or no flash-attn: per row, history dequantized page-block by
                 page-block + log-sum-exp merge), then kush_write stores V rows, quantizes
@@ -69,6 +70,16 @@ def _prefill_mode() -> str:
     mode = os.environ.get("KUSHKASH_PREFILL", "packed")
     if mode not in ("loop", "packed"):
         raise ValueError("KUSHKASH_PREFILL must be loop or packed")
+    return mode
+
+
+def _unpack_mode() -> str:
+    """KUSHKASH_UNPACK: how packed prefill builds its keys / values. mojo (default): one kush_unpack launch per
+    group, straight into the workspace (dequantization in fp32, rounded once). torch: the earlier PyTorch path
+    (gather, dequantize slice by slice in the model dtype, scatter), kept for A/B comparisons."""
+    mode = os.environ.get("KUSHKASH_UNPACK", "mojo").strip().lower()
+    if mode not in ("mojo", "torch"):
+        raise ValueError("KUSHKASH_UNPACK must be mojo or torch")
     return mode
 
 
@@ -133,13 +144,15 @@ class _PackWorkspace:
     vLLM's activations (seen as CUDACachingAllocator OOM-retry warnings on long serving runs)."""
 
     def __init__(self, keys: int, slice_pages: int, num_kv_heads: int, head_size: int, bits: int,
-                 dtype: torch.dtype, device: torch.device):
+                 dtype: torch.dtype, device: torch.device, slices: bool = True):
         Hk, D, S = num_kv_heads, head_size, slice_pages
         row = Hk * D
         self.keys, self.slice_pages, self.bits = keys, S, bits
-        self.buf = torch.empty(2 * keys * row + 2 * S * PAGE * row, dtype=dtype, device=device)
+        self.buf = torch.empty(2 * keys * row + (2 * S * PAGE * row if slices else 0), dtype=dtype, device=device)
         self.k = self.buf[:keys * row].view(keys, Hk, D)
         self.v = self.buf[keys * row:2 * keys * row].view(keys, Hk, D)
+        if not slices:                                # kush_unpack writes straight into k / v
+            return
         o = 2 * keys * row
         self.sk = self.buf[o:o + S * PAGE * row].view(S, PAGE, Hk, D)              # dequantized slice / tail rows
         self.sv = self.buf[o + S * PAGE * row:].view(S, PAGE, Hk, D)
@@ -158,9 +171,10 @@ _PROFILE_OWNER: dict = {}
 
 def _pack_workspace(keys: int, slice_pages: int, num_kv_heads: int, head_size: int, bits: int, dtype: torch.dtype,
                     device: torch.device) -> _PackWorkspace:
-    key = (str(device), dtype, keys, slice_pages, num_kv_heads, head_size, bits)
+    slices = _unpack_mode() == "torch"
+    key = (str(device), dtype, keys, slice_pages, num_kv_heads, head_size, bits, slices)
     if key not in _PACK_WS:
-        _PACK_WS[key] = _PackWorkspace(keys, slice_pages, num_kv_heads, head_size, bits, dtype, device)
+        _PACK_WS[key] = _PackWorkspace(keys, slice_pages, num_kv_heads, head_size, bits, dtype, device, slices)
     return _PACK_WS[key]
 
 
@@ -248,10 +262,12 @@ class _Pack:
     page_blk: torch.Tensor            # (P,) physical block of each full history page
     page_dst0: torch.Tensor           # (P,) packed position of their first token (the rest follow)
     tail_blk: torch.Tensor            # (R,) block of each partial page (rows whose history ends mid-page)
-    tail_vsrc: torch.Tensor           # (t,) its tokens' rows in a slice of dequantized tail pages
-    tail_kidx: torch.Tensor           # (t * Hk,) their rows in tail_k viewed as [slots * Hk * 32, D]
-    tail_dst: torch.Tensor            # (t,) packed position
+    tail_info: torch.Tensor           # (R * 3,) int32 per partial page: first packed position, tokens, tail slot
+    tail_vsrc: torch.Tensor | None    # (t,) its tokens' rows in a slice of dequantized tail pages     (torch path)
+    tail_kidx: torch.Tensor | None    # (t * Hk,) their rows in tail_k viewed as [slots * Hk * 32, D]  (torch path)
+    tail_dst: torch.Tensor | None     # (t,) packed position                                          (torch path)
     new_dst: torch.Tensor             # (chunk tokens,) packed position of each chunk token
+    # index dtypes: int32 for kush_unpack (KUSHKASH_UNPACK=mojo), int64 for the torch path
 
 
 def _bits() -> int:
@@ -380,27 +396,36 @@ def _pack_plan(r0: int, r1: int, sl: np.ndarray, qlens: np.ndarray, req: np.ndar
     m = rem > 0
     rr = rem[m]
     tok = _ranges(rr)
-    t_row = np.repeat(np.arange(int(m.sum()), dtype=np.int64), rr)                # tail row of each tail token
-    tail_vsrc = (t_row % slice_pages) * PAGE + tok
-    t_slot = np.repeat(req[rows[m]].astype(np.int64), rr)
-    tail_kidx = (((t_slot * num_kv_heads)[:, None] + np.arange(num_kv_heads)) * PAGE + tok[:, None]).reshape(-1)
-    tail_dst = np.repeat(base[m] + full[m] * PAGE, rr) + tok
+    if _unpack_mode() == "torch":                     # per-token gather / scatter indices of the PyTorch path
+        t_row = np.repeat(np.arange(int(m.sum()), dtype=np.int64), rr)            # tail row of each tail token
+        tail_vsrc = (t_row % slice_pages) * PAGE + tok
+        t_slot = np.repeat(req[rows[m]].astype(np.int64), rr)
+        tail_kidx = (((t_slot * num_kv_heads)[:, None] + np.arange(num_kv_heads)) * PAGE + tok[:, None]).reshape(-1)
+        tail_dst = np.repeat(base[m] + full[m] * PAGE, rr) + tok
+    else:                                             # kush_unpack reads tail_info instead: nothing to build or upload
+        tail_vsrc = tail_kidx = tail_dst = np.empty(0, dtype=np.int64)
     new_dst = np.repeat(base + ctx, ql) + _ranges(ql)
+    tail_info = np.stack([base[m] + full[m] * PAGE, rr, req[rows[m]].astype(np.int64)], 1).reshape(-1)
     scalars = (r0, r1, int(cu_k[-1]), int(ql.max()), int(seg.max()), [0] + np.cumsum(rr).tolist())
-    return scalars, (cu_k, page_row, page_idx, page_dst0, rows[m], full[m], tail_vsrc, tail_kidx, tail_dst, new_dst)
+    return scalars, (cu_k, page_row, page_idx, page_dst0, rows[m], full[m], tail_vsrc, tail_kidx, tail_dst, new_dst,
+                     tail_info)
 
 
 def _pack_tensors(scalars, v, qd: torch.Tensor, bt: torch.Tensor) -> _Pack:
     """Device side of _Pack from the uploaded int32 views. Physical blocks are looked up here, once per step
     (the block table is final when the metadata is built), not once per layer."""
     r0, r1, total_k, max_q, max_k, tail_off = scalars
-    cu_k, page_row, page_idx, page_dst0, tail_row, tail_page, tail_vsrc, tail_kidx, tail_dst, new_dst = v
+    cu_k, page_row, page_idx, page_dst0, tail_row, tail_page, tail_vsrc, tail_kidx, tail_dst, new_dst, tail_info = v
+    cu_q = qd[r0:r1 + 1] - qd[r0:r0 + 1]
+    page_blk, tail_blk = bt[page_row, page_idx], bt[tail_row, tail_page]
+    if _unpack_mode() == "mojo":                      # int32 views of the upload: no int64 copies
+        return _Pack(r0=r0, r1=r1, total_k=total_k, max_q=max_q, max_k=max_k, tail_off=tail_off, cu_q=cu_q,
+                     cu_k=cu_k, page_blk=page_blk.int(), page_dst0=page_dst0, tail_blk=tail_blk.int(),
+                     tail_info=tail_info, tail_vsrc=None, tail_kidx=None, tail_dst=None, new_dst=new_dst)
     L = lambda t: t.long()
-    return _Pack(r0=r0, r1=r1, total_k=total_k, max_q=max_q, max_k=max_k, tail_off=tail_off,
-                 cu_q=qd[r0:r1 + 1] - qd[r0:r0 + 1], cu_k=cu_k,
-                 page_blk=bt[page_row, page_idx].long(), page_dst0=L(page_dst0),
-                 tail_blk=bt[tail_row, tail_page].long(), tail_vsrc=L(tail_vsrc), tail_kidx=L(tail_kidx),
-                 tail_dst=L(tail_dst), new_dst=L(new_dst))
+    return _Pack(r0=r0, r1=r1, total_k=total_k, max_q=max_q, max_k=max_k, tail_off=tail_off, cu_q=cu_q, cu_k=cu_k,
+                 page_blk=page_blk.long(), page_dst0=L(page_dst0), tail_blk=tail_blk.long(), tail_info=tail_info,
+                 tail_vsrc=L(tail_vsrc), tail_kidx=L(tail_kidx), tail_dst=L(tail_dst), new_dst=L(new_dst))
 
 
 def _prefill_host(nd: int, n: int, qsl: np.ndarray, sl: np.ndarray, req: np.ndarray,
@@ -812,6 +837,13 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
                                f"({ws.keys}); builder and backend disagree on KUSHKASH_PACK_MB / max_model_len")
         a, b = int(md.qsl_cpu[p.r0]), int(md.qsl_cpu[p.r1])
         kp, vp = ws.k[:p.total_k], ws.v[:p.total_k]
+        if p.tail_vsrc is None:                       # KUSHKASH_UNPACK=mojo: one launch builds kp / vp
+            self.ops.unpack(kv_cache, p.page_blk, p.page_dst0, p.tail_blk, p.tail_info, self.tail_k, k[a:b], v[a:b],
+                            p.new_dst, kp, vp, rot=False)
+            flash_attn_varlen_func(q=q[a:b], k=kp, v=vp, cu_seqlens_q=p.cu_q, cu_seqlens_k=p.cu_k,
+                                   max_seqlen_q=p.max_q, max_seqlen_k=p.max_k, softmax_scale=self.scale, causal=True,
+                                   out=out[a:b], **kw)
+            return
         rec = as_records(kv_cache)
         step = ws.slice_pages
         ar = self._page_arange(k.device)
@@ -888,7 +920,7 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
         jobs = 2 * rows + n_tokens // PAGE + 1
         tensors = 12 * rows + 16                      # allocations per group (<= rows groups), 512-byte rounding
         per_tail_tok = 12 * (2 + self.num_kv_heads)
-        return (36 * pages + 12 * n_tokens + per_tail_tok * (PAGE - 1) * rows + 64 * rows + 8 * jobs
+        return (36 * pages + 12 * n_tokens + per_tail_tok * (PAGE - 1) * rows + 76 * rows + 8 * jobs
                 + 512 * tensors)
 
     def _profile_step(self, query, key, value, output) -> None:

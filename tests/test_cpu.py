@@ -6,7 +6,8 @@ import torch
 import torch.nn.functional as F
 
 import kushkash as kk
-from kushkash._ops import dequant_records, hadamard, record_bytes, rotate, rotation_enabled
+from kushkash._ops import FWHT_SCALE_BITS, Ops, dequant_records, fwht_reference, hadamard, record_bytes, rotate, \
+    rotation_enabled
 from kushkash.cache import PAGE
 
 torch.manual_seed(0)
@@ -352,3 +353,116 @@ def test_kernel_param_types_from_mojo_source():
             param_types(fn, ptx_12[:-1], mojo)
         with pytest.raises(BuildError, match="Float32"):
             param_types(fn, ptx_12[:11] + ["u64"] + ptx_12[12:], mojo)
+
+
+def _fwht_inputs(D: int) -> torch.Tensor:
+    g = torch.Generator().manual_seed(D)
+    x = torch.randn(203, D, generator=g)
+    x[:50] *= torch.logspace(-6, 6, 50)[:, None]                  # magnitudes far apart
+    x[50, :] = 0
+    x[51, 7] = 1e30                                               # one huge outlier channel
+    x[52] = torch.arange(D, dtype=torch.float32) * 1e-3 + 1       # rounding-heavy sums
+    return x
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_fwht_cpu_canonical(D):
+    import numpy as np
+    assert np.float32(1 / np.sqrt(np.float64(D))).view(np.uint32) == FWHT_SCALE_BITS[D]
+    ops = Ops(torch.device("cpu"), D, 4, 1, torch.float32)
+    x = _fwht_inputs(D)
+    y = ops.fwht(x)
+    ref = fwht_reference(x)
+    assert torch.equal(y.view(torch.int32), ref.view(torch.int32)), \
+        f"{(y != ref).sum().item()} values differ from the canonical order"
+    dense = x.double() @ hadamard(D, "cpu").double()
+    assert ((y.double() - dense).norm(dim=1) <= 1e-6 * dense.norm(dim=1) + 1e-30).all()
+    back = ops.fwht(y.clone())
+    assert ((back - x).norm(dim=1) <= 1e-6 * x.norm(dim=1) + 1e-30).all()           # H @ H = I
+    z = x.clone()
+    assert ops.fwht(z, out=z) is z and torch.equal(z, y)                              # in place
+    assert ops.fwht(x[:0]).shape == (0, D)
+    with pytest.raises(ValueError):
+        ops.fwht(x.double())
+    with pytest.raises(ValueError):
+        ops.fwht(x.t().contiguous().t())
+
+
+def test_fwht_reference_matches_matrix():
+    for D in (64, 128, 256):
+        x = torch.randn(9, D)
+        assert torch.allclose(fwht_reference(x), x @ hadamard(D, "cpu"), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("rot", [False, True])
+def test_unpack_cpu_matches_reference(D, bits, rot):
+    """kush_cpu_unpack == the fp64 PyTorch reference, bit for bit; rows it must not write stay untouched."""
+    from _unpack_case import unpack_case
+    from kushkash._ops import unpack_reference
+    c = unpack_case(D, bits, torch.float32)
+    ops = Ops(torch.device("cpu"), D, bits, 1, torch.float32)
+    shape = (c["rows"], c["H"], D)
+    kp, vp = torch.full(shape, float("nan")), torch.full(shape, float("nan"))
+    rk, rv = kp.clone(), vp.clone()
+    args = [c[n] for n in ("page_blk", "page_dst", "tail_blk", "tail_info", "tail_k", "k_new", "v_new", "new_dst")]
+    ops.unpack(c["records"], *args, kp, vp, rot)
+    unpack_reference(c["records"], *args, rk, rv, D, bits, rot)
+    for got, want in ((kp, rk), (vp, rv)):
+        assert torch.equal(got.view(torch.int32), want.view(torch.int32)), \
+            f"{(got.view(torch.int32) != want.view(torch.int32)).sum().item()} values differ"
+    assert kp[96].isnan().all() and kp[162].isnan().all() and vp[232].isnan().all()      # gaps untouched
+    assert not kp[:96].isnan().any()
+
+
+def test_unpack_rejects_wrong_dtypes():
+    from _unpack_case import unpack_case
+    c = unpack_case(64, 4, torch.float32)
+    ops = Ops(torch.device("cpu"), 64, 4, 1, torch.float32)
+    names = ("page_blk", "page_dst", "tail_blk", "tail_info", "tail_k", "k_new", "v_new", "new_dst")
+    kp = torch.zeros(c["rows"], c["H"], 64)
+    for bad in ("tail_k", "k_new"):
+        args = [c[n].half() if n == bad else c[n] for n in names]
+        with pytest.raises(ValueError, match="must be torch.float32"):
+            ops.unpack(c["records"], *args, kp, kp.clone(), False)
+    with pytest.raises(ValueError, match="must be torch.float32"):
+        ops.unpack(c["records"], *[c[n] for n in names], kp.half(), kp.half(), False)
+
+
+def test_unpack_rejects_bad_indices():
+    from _unpack_case import unpack_case
+    c = unpack_case(64, 4, torch.float32)
+    ops = Ops(torch.device("cpu"), 64, 4, 1, torch.float32)
+    names = ("page_blk", "page_dst", "tail_blk", "tail_info", "tail_k", "k_new", "v_new", "new_dst")
+    kp = torch.zeros(c["rows"], c["H"], 64)
+
+    def call(**over):
+        ops.unpack(c["records"], *[over.get(n, c[n]) for n in names], kp, kp.clone(), False)
+    call()                                                                   # the valid case passes
+    i32 = lambda *x: torch.tensor(x, dtype=torch.int32)
+    for over in (dict(page_dst=c["page_dst"][:-1]),                          # length mismatch
+                 dict(page_dst=c["page_dst"] + c["rows"]),                    # rows past kp
+                 dict(new_dst=c["new_dst"] + c["rows"]),
+                 dict(page_blk=c["page_blk"] + c["records"].shape[0]),        # block past the cache
+                 dict(tail_info=torch.cat([i32(161, 33, 3), c["tail_info"][3:]])),   # > 32 tokens
+                 dict(tail_info=torch.cat([i32(161, 1, 99), c["tail_info"][3:]]))):  # tail slot past tail_k
+        with pytest.raises(ValueError):
+            call(**over)
+
+
+def test_unpack_rot_equals_rotating_back():
+    """rot=True == unpack without rotation, then fwht of every history row (the plan's dataflow)."""
+    from _unpack_case import unpack_case
+    c = unpack_case(128, 4, torch.float32, seed=3)
+    ops = Ops(torch.device("cpu"), 128, 4, 1, torch.float32)
+    args = [c[n] for n in ("page_blk", "page_dst", "tail_blk", "tail_info", "tail_k", "k_new", "v_new", "new_dst")]
+    shape = (c["rows"], c["H"], 128)
+    k0, v0, k1, v1 = (torch.zeros(shape) for _ in range(4))
+    ops.unpack(c["records"], *args, k0, v0, False)
+    ops.unpack(c["records"], *args, k1, v1, True)
+    hist = torch.cat([torch.arange(0, 96), torch.arange(97, 161), torch.tensor([161]), torch.arange(163, 211)])
+    assert torch.equal(k1[hist], ops.fwht(k0[hist].contiguous()))
+    assert torch.equal(v1[hist], ops.fwht(v0[hist].contiguous()))
+    new = c["new_dst"].long()
+    assert torch.equal(k1[new], k0[new]) and torch.equal(k1[new], c["k_new"])           # new rows: not rotated

@@ -63,12 +63,15 @@ STEPS = {
 }
 
 
-@pytest.mark.parametrize("bits,rot,mode", [(4, "1", "packed"), (8, "0", "packed"), (4, "1", "loop")])
+@pytest.mark.parametrize("bits,rot,mode", [(4, "1", "packed"), (8, "0", "packed"), (4, "1", "packed-torch"),
+                                           (4, "1", "loop")])
 def test_profile_step_bounds_real_steps(bits, rot, mode, monkeypatch):
-    if mode == "packed" and not kb._HAS_FA:
+    if mode.startswith("packed") and not kb._HAS_FA:
         pytest.skip("vLLM's flash-attn varlen kernel is not available")
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
     monkeypatch.setenv("KUSHKASH_ROTATE", rot)
+    monkeypatch.setenv("KUSHKASH_UNPACK", "torch" if mode == "packed-torch" else "mojo")
+    mode = mode.split("-")[0]
     monkeypatch.setenv("KUSHKASH_PREFILL", mode)
     monkeypatch.setenv("KUSHKASH_PACK_MB", "8")                       # 4096-key workspace, 8-page slices
     cfg = _cfg()
@@ -105,13 +108,15 @@ def test_profile_step_bounds_real_steps(bits, rot, mode, monkeypatch):
 
 
 @pytest.mark.parametrize("bits", [4, 8])
-def test_packed_step_allocations_do_not_grow_with_history(bits, monkeypatch):
+@pytest.mark.parametrize("unpack", ["mojo", "torch"])
+def test_packed_step_allocations_do_not_grow_with_history(bits, unpack, monkeypatch):
     """The packed path allocates nothing per slice of history: a step over 6 slices of history makes exactly as
     many allocations (and as many large ones) as a step over 1 slice. Per-slice allocations of varying size were
     what fragmented PyTorch's cache on long `vllm serve` runs."""
     if not kb._HAS_FA:
         pytest.skip("vLLM's flash-attn varlen kernel is not available")
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
+    monkeypatch.setenv("KUSHKASH_UNPACK", unpack)
     monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
     monkeypatch.setenv("KUSHKASH_PACK_MB", "8")                       # 8-page slices
     cfg = _cfg()

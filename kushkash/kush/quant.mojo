@@ -11,6 +11,8 @@
 #   BITS = 8 : byte j = code of dim j
 #   BITS = 4 : byte j = code of dim j (low nibble) | code of dim j + D/2 (high nibble)
 
+from std.memory import bitcast
+
 comptime PAGE = 32
 
 
@@ -83,3 +85,38 @@ def off_vs[D: Int, BITS: Int]() -> Int:
 @always_inline
 def off_vb[D: Int, BITS: Int]() -> Int:
     return off_ks[D, BITS]() + 4 * D + 2 * PAGE
+
+
+# ------------------------------------------------------------------ rotation (Walsh-Hadamard)
+# At 4 bits the cache holds K and V rotated by the orthonormal Walsh-Hadamard matrix H (Sylvester
+# order: H_1 = [1], H_2n = [[H_n, H_n], [H_n, -H_n]], scaled by 1/sqrt(D); symmetric, H @ H = I, so
+# the same transform rotates back). Every backend evaluates it in one canonical way, so rotated
+# values are bit-identical across CPU and GPU:
+#   1. butterflies in fp32 over strides h = 1, 2, 4, ..., D/2, in that order:
+#      (x[i], x[i + h]) <- (x[i] + x[i + h], x[i] - x[i + h]) for every i with bit h clear;
+#   2. one multiply by fwht_scale[D](), never fused into a later operation (an FMA there rounds
+#      differently, and only where a backend's compiler chooses to contract).
+# Butterflies over different strides commute in exact arithmetic, not in fp32: the order is fixed.
+
+@always_inline
+def fwht_scale[D: Int]() -> Float32:
+    """1/sqrt(D) rounded to fp32, as exact bits (no decimal-literal rounding in between)."""
+    comptime assert D == 64 or D == 128 or D == 256, "head_dim must be 64, 128 or 256"
+    comptime if D == 64:
+        return bitcast[DType.float32](UInt32(0x3E000000))      # 0.125
+    elif D == 128:
+        return bitcast[DType.float32](UInt32(0x3DB504F3))      # 0.088388346
+    else:
+        return bitcast[DType.float32](UInt32(0x3D800000))      # 0.0625
+
+
+@always_inline
+def fwht_stages[D: Int]() -> Int:
+    """log2(D): butterfly stages of the transform (strides 1 << k for k < fwht_stages)."""
+    comptime assert D == 64 or D == 128 or D == 256, "head_dim must be 64, 128 or 256"
+    comptime if D == 64:
+        return 6
+    elif D == 128:
+        return 7
+    else:
+        return 8

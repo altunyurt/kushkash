@@ -2,7 +2,7 @@
 from .cache import KushCache, MemoryStats, PAGE
 
 __all__ = ["KushCache", "MemoryStats", "PAGE", "KushHFCache", "enable", "generate", "build"]
-__version__ = "0.4.8"
+__version__ = "0.5.0"
 
 
 def __getattr__(name):                      # transformers is optional: import on demand

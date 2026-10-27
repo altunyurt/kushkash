@@ -17,6 +17,11 @@ _SIGS = {
     # d, bits, q, o, cache, block_stride, head_stride, tail_k, tail_idx, block_table, seq_lens,
     # max_pages, hkv, group, sm, n_seqs
     "kush_cpu_decode": [_I] * 14 + [_F, _I],
+    # d, x, rows
+    "kush_cpu_fwht": [_I] * 3,
+    # d, bits, cache, block_stride, head_stride, hkv, page_blk, page_dst, n_pages, tail_blk, tail_info, n_tail,
+    # tail_k, k_new, v_new, k_stride, v_stride, new_dst, n_new, kp, vp, rot
+    "kush_cpu_unpack": [_I] * 22,
 }
 
 

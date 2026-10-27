@@ -52,21 +52,23 @@ def fake_flash(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, 
 
 
 @pytest.mark.parametrize("fa,mode", [(False, "loop"), (True, "loop"), (True, "packed"), (True, "packed-fallback"),
-                                     (True, "packed-sliced")])
+                                     (True, "packed-sliced"), (True, "packed-small")])
 @pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("rot", [False, True])
 def test_backend_mixed_steps(bits, fa, mode, rot, monkeypatch):
     """loop: history rows per row with LSE merges; packed: all prefill rows in one (fake) flash-attn varlen call;
     packed-fallback: packed mode with a zero byte budget, so every step falls back to the loop path;
-    packed-sliced: a 256 KiB budget, so history is dequantized in 1-page slices and the workspace holds only
-    max_model_len keys: larger steps are split into several groups (never the loop path)."""
+    packed-sliced: the PyTorch unpack (KUSHKASH_UNPACK=torch) with a 256 KiB budget, so history is dequantized in
+    1-page slices and the workspace holds only max_model_len keys: larger steps are split into several groups
+    (never the loop path); packed-small: the same budget with the Mojo unpack (the default)."""
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
     monkeypatch.setenv("KUSHKASH_ROTATE", "1" if rot else "0")
     monkeypatch.setenv("KUSHKASH_PREFILL", mode.split("-")[0])
     if mode == "packed-fallback":
         monkeypatch.setenv("KUSHKASH_PACK_MB", "0")
-    if mode == "packed-sliced":                                       # 256 KiB: 1-page slices, a 768-key workspace
+    if mode in ("packed-sliced", "packed-small"):                     # 256 KiB: 1-page slices, a 768-key workspace
         monkeypatch.setattr(kb, "_pack_bytes", lambda: 256 << 10)
+    monkeypatch.setenv("KUSHKASH_UNPACK", "torch" if mode == "packed-sliced" else "mojo")
     dq_calls = []
     orig_dq = kb._dequant_pages
     monkeypatch.setattr(kb, "_dequant_pages", lambda *a, **kw: dq_calls.append(a[1]) or orig_dq(*a, **kw))
@@ -154,11 +156,13 @@ def test_backend_mixed_steps(bits, fa, mode, rot, monkeypatch):
             n = lens[r]
             tail, ref_tail = impl.tail_k[slot_of[r], :, :n % PAGE], exact[r][0][:, n // PAGE * PAGE:]
             assert torch.equal(tail, ref_tail) if not rot else torch.allclose(tail @ h, ref_tail, atol=1e-5)
-    assert bool(packed_calls) == (mode in ("packed", "packed-sliced"))  # the packed path ran (and only when asked)
-    if mode in ("packed", "packed-sliced"):
+    assert bool(packed_calls) == (mode in ("packed", "packed-sliced", "packed-small"))   # packed path ran iff asked
+    if mode in ("packed", "packed-sliced", "packed-small"):
         assert not loop_calls                                          # no loop fallback: big steps are grouped
-    if mode == "packed-sliced":
+    if mode in ("packed-sliced", "packed-small"):
         assert max(groups) > 1                                         # some steps needed several groups
+    if mode in ("packed", "packed-small"):
+        assert not dq_calls                                            # Mojo unpack: no PyTorch dequantization
     if mode == "packed-sliced":
         # page slices are <= 2 records; the partial-page read is one record per row (<= n_req). The exact slice
         # count is checked structurally in test_packed_slicing_is_exact
@@ -380,7 +384,9 @@ def test_pack_groups_split(monkeypatch):
 def test_packed_slices_exact(bits, monkeypatch):
     """Structural slice count: 330 cached tokens = 10 full pages + a 10-token partial page; a 1 MiB budget gives
     2-page slices (H=2, D=64, fp32: 32 KiB per page of K + V), so the packed step dequantizes exactly 5 page slices
-    of 2 records plus one partial-page read of 1 record, and matches the dequantized-history reference."""
+    of 2 records plus one partial-page read of 1 record, and matches the dequantized-history reference.
+    PyTorch unpack (KUSHKASH_UNPACK=torch): the slices exist only there."""
+    monkeypatch.setenv("KUSHKASH_UNPACK", "torch")
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
     monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
     monkeypatch.setenv("KUSHKASH_PACK_MB", "1")
@@ -430,7 +436,8 @@ def test_packed_slices_exact(bits, monkeypatch):
 def test_packed_slicing_is_exact(bits, monkeypatch):
     """Structural check of the sliced dequantization: one chunk over 200 tokens of history (6 full pages + 8 tokens).
     A 1 MiB budget gives 2-page slices: exactly [2, 2, 2] page records per call plus one partial-page call, and the
-    output is bit-identical to an unsliced pass (index_copy_ is a scatter, not a reduction)."""
+    output is bit-identical to an unsliced pass (index_copy_ is a scatter, not a reduction). PyTorch unpack."""
+    monkeypatch.setenv("KUSHKASH_UNPACK", "torch")
     monkeypatch.setenv("KUSHKASH_BITS", str(bits))
     monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
     monkeypatch.setattr(kb, "_HAS_FA", True)
@@ -545,9 +552,12 @@ def test_workspace_never_allocated_mid_serve(monkeypatch):
         impl._workspace(torch.device("cpu"))
 
 
-def test_plan_bytes_bound(monkeypatch):
+@pytest.mark.parametrize("unpack", ["mojo", "torch"])
+def test_plan_bytes_bound(unpack, monkeypatch):
     """_plan_bytes_bound (reserved by the profiling step) covers the device bytes of a real step's prefill plan:
-    the upload plus the int64 index copies, for the largest steps the scheduler can form."""
+    the upload plus the index tensors derived from it (int64 copies on the torch path), for the largest steps
+    the scheduler can form."""
+    monkeypatch.setenv("KUSHKASH_UNPACK", unpack)
     monkeypatch.setattr(kb, "_HAS_FA", True)
     monkeypatch.setenv("KUSHKASH_PREFILL", "packed")
     monkeypatch.setattr(kb, "_pack_bytes", lambda: 64 << 10)          # many groups
@@ -565,8 +575,9 @@ def test_plan_bytes_bound(monkeypatch):
         orig = b._ring.to_device
         b._ring.to_device = lambda arr, out=None, orig=orig: up.append(arr.nbytes) or orig(arr, out)
         md = b.build(0, _cam(ql, ctx, W=W))
-        fields = ("page_blk", "page_dst0", "tail_blk", "tail_vsrc", "tail_kidx", "tail_dst", "new_dst", "cu_q")
-        used = sum(up) + sum(getattr(p, f).nbytes for p in md.packs for f in fields)
+        fields = ("page_blk", "page_dst0", "tail_blk", "tail_info", "tail_vsrc", "tail_kidx", "tail_dst", "new_dst",
+                  "cu_q")
+        used = sum(up) + sum(getattr(p, f).nbytes for p in md.packs for f in fields if getattr(p, f) is not None)
         assert md.packs and used <= impl._plan_bytes_bound(sum(ql)), (used, impl._plan_bytes_bound(sum(ql)))
 
 
