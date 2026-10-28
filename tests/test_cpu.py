@@ -466,3 +466,36 @@ def test_unpack_rot_equals_rotating_back():
     assert torch.equal(v1[hist], ops.fwht(v0[hist].contiguous()))
     new = c["new_dst"].long()
     assert torch.equal(k1[new], k0[new]) and torch.equal(k1[new], c["k_new"])           # new rows: not rotated
+
+
+def test_check_config_rejects_sliding_window():
+    """A window that can bind must refuse, because the kernels apply a causal mask over the whole history and
+    kush_mask materializes none of transformers' window mask (transformers 5 has no use_sliding_window and Mistral
+    v0.1 has no layer_types, so the old check never fired). A window at or past max_position_embeddings never binds
+    and stays accepted."""
+    from types import SimpleNamespace
+    from transformers import MistralConfig, Phi3Config
+    from kushkash import hf
+    with pytest.raises(NotImplementedError, match="sliding-window"):
+        hf._check_config(MistralConfig())                                   # sliding_window 4096, no layer_types
+    hf._check_config(MistralConfig(sliding_window=None))                    # Mistral v0.2 / v0.3
+    hf._check_config(Phi3Config(sliding_window=262144, max_position_embeddings=131072))   # never binds
+    with pytest.raises(NotImplementedError, match="sliding-window"):
+        hf._check_config(Phi3Config(sliding_window=4096, max_position_embeddings=131072))
+    with pytest.raises(NotImplementedError, match="sliding-window"):
+        hf._check_config(MistralConfig(layer_types=["sliding_attention"] * 32))
+    with pytest.raises(NotImplementedError, match="sliding-window"):        # window, no maximum length to compare
+        hf._check_config(SimpleNamespace(sliding_window=4096))
+    with pytest.raises(NotImplementedError, match="sliding-window"):        # legacy flag only
+        hf._check_config(SimpleNamespace(use_sliding_window=True))
+    hf._check_config(SimpleNamespace(sliding_window=None, layer_types=["full_attention"] * 4))
+    # layer_types decide when present: transformers applies sliding_window only to "sliding_attention" layers
+    from transformers import Qwen2Config, Qwen2MoeConfig
+    hf._check_config(Qwen2MoeConfig())                                      # sliding_window 0, all full layers
+    hf._check_config(SimpleNamespace(sliding_window=1024, max_position_embeddings=131072,
+                                     layer_types=["full_attention"] * 4))   # e.g. Mellum, Laguna
+    hf._check_config(Qwen2Config(sliding_window=131072, use_sliding_window=False))   # Qwen2.5-7B-Instruct
+    with pytest.raises(NotImplementedError, match="sliding-window"):
+        hf._check_config(Qwen2Config(sliding_window=4096, use_sliding_window=True, max_window_layers=2,
+                                     num_hidden_layers=4))
+    hf._check_config(SimpleNamespace(sliding_window=0))                     # 0 = no window

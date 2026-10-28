@@ -158,10 +158,29 @@ def kush_mask(batch_size, q_length, kv_length, *args, attention_mask=None, **kwa
     return None
 
 
+def _window_binds(cfg) -> bool:
+    """True when the config's attention window can exclude tokens.
+    - layer_types present: it decides. transformers applies sliding_window only to "sliding_attention" layers of
+      such models, so any non-full layer type binds and a sliding_window next to all-full layer types does not
+      (Qwen2-MoE sets sliding_window 0 that way; Mellum, Laguna, Cohere Compass keep 512-4096).
+    - no layer_types (Mistral, Mixtral, Starcoder2, Phi-3 apply sliding_window to every layer): the legacy
+      use_sliding_window flag, or a sliding_window shorter than max_position_embeddings. A window at or past the
+      maximum length never binds; a window with no maximum length to compare against is treated as binding."""
+    types = getattr(cfg, "layer_types", None)
+    if types:
+        return any(t != "full_attention" for t in types)
+    if getattr(cfg, "use_sliding_window", False):
+        return True
+    w = getattr(cfg, "sliding_window", None)
+    if not w:                                         # None, or 0 (no window)
+        return False
+    mx = getattr(cfg, "max_position_embeddings", None)
+    return mx is None or w < mx
+
+
 def _check_config(config) -> None:
     cfg = config.get_text_config() if hasattr(config, "get_text_config") else config
-    types = getattr(cfg, "layer_types", None) or []
-    if any(t != "full_attention" for t in types) or getattr(cfg, "use_sliding_window", False):
+    if _window_binds(cfg):
         raise NotImplementedError("kushkash: sliding-window / hybrid attention layers are not supported")
     if getattr(cfg, "attn_logit_softcapping", None):
         raise NotImplementedError("kushkash: attention logit softcapping is not supported")

@@ -438,6 +438,9 @@ Limits:
   processed. Decode steps are not re-checked (that would slow down every token), so do not feed padded inputs to
   decode steps directly.
 - `KushHFCache(..., rotate=False)` turns the rotation off (default: `KUSHKASH_ROTATE`, on for 4 bits).
+- **Sliding-window models are rejected** by `enable()`: the kernels apply a causal mask over the whole history and
+  no window mask is built, so a window would silently be ignored. A window at or past the model's maximum length
+  never binds and is accepted.
 - One `KushHFCache` per generation. Every forward pass that uses kushkash attention must pass the cache as
   `past_key_values` with `use_cache=True`; otherwise it raises an error.
 - If PyTorch has no fused attention that returns log-sum-exp values, kushkash warns and uses a plain version whose
