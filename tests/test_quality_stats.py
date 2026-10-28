@@ -181,3 +181,50 @@ def test_polluted_base_marks_every_row(tmp_path):
     _fake_run(tmp_path, "m/d", "auto", nll, top1, g, gpu_guard={"status": "polluted"})
     _fake_run(tmp_path, "m/d", "kush4", nll, top1, g, kv_tokens=2880, gpu_guard={"status": "ok"})
     assert "2.88x (!)" in q.report(str(tmp_path), 10)
+
+
+COLD = """[   21.2s] Qwen/Qwen2.5-7B-Instruct kv=kush4: loading
+(EngineCore pid=1) INFO [monitor.py:53] torch.compile took 23.01 s in total
+(EngineCore pid=1) INFO [gpu_worker.py:955] ... Actual usage is 14.87 GiB for consumed memory (weights + non-torch), 1.31 GiB for peak activation, and 0.2 GiB for CUDAGraph memory.
+"""
+CACHED = """[   14.7s] Qwen/Qwen2.5-7B-Instruct kv=kush4: loading
+(EngineCore pid=2) INFO [decorators.py:312] Directly load AOT compilation from path /root/.cache/vllm/x/model
+(EngineCore pid=2) INFO [monitor.py:53] torch.compile took 0.26 s in total
+(EngineCore pid=2) INFO [gpu_worker.py:955] ... 14.92 GiB for consumed memory (weights + non-torch), 0.37 GiB for peak activation, and 0.2 GiB for CUDAGraph memory.
+"""
+
+
+def test_parse_startup():
+    assert q.parse_startup(COLD, "kush4") == {"compile_s": 23.01, "compile_cached": False, "peak_activation_gib": 1.31}
+    assert q.parse_startup(CACHED, "kush4") == {"compile_s": 0.26, "compile_cached": True, "peak_activation_gib": 0.37}
+    assert q.parse_startup(COLD + CACHED, "kush4")["compile_cached"] is True        # appended log: last attempt
+    assert q.parse_startup(CACHED + COLD, "kush4")["compile_cached"] is False
+    other = COLD.replace("kush4", "auto")
+    assert q.parse_startup(other + CACHED, "auto")["compile_cached"] is False         # stops at the next run
+    fast = COLD.replace("23.01", "0.9")                                               # cache hit without the AOT line
+    assert q.parse_startup(fast, "kush4")["compile_cached"] is True
+    eager = "kv=auto: loading\n(EngineCore) INFO ... 1.0 GiB for peak activation\n"
+    assert q.parse_startup(eager, "auto") == {"compile_s": None, "compile_cached": None, "peak_activation_gib": 1.0}
+    assert q.parse_startup("nothing from vLLM", "auto") is None
+
+
+def test_compile_cache_state_marks_capacity(tmp_path):
+    rng = np.random.default_rng(0)
+    nll = rng.uniform(1, 3, (8, 8)).astype(np.float32)
+    top1 = np.zeros((8, 8), np.int32)
+    g = np.ones(20, bool)
+    cold = {"compile_s": 23.0, "compile_cached": False, "peak_activation_gib": 1.31}
+    warm = {"compile_s": 0.3, "compile_cached": True, "peak_activation_gib": 0.37}
+    _fake_run(tmp_path, "m/e", "auto", nll, top1, g, startup=cold)
+    _fake_run(tmp_path, "m/e", "kush4", nll, top1, g, kv_tokens=3940, startup=warm)
+    _fake_run(tmp_path, "m/e", "kush8", nll, top1, g, kv_tokens=1850, startup=cold)
+    _fake_run(tmp_path, "m/e", "fp8", nll, top1, g, kv_tokens=1490, startup=None)          # unknown: not marked
+    # a run saved before the startup record: read from its log
+    md = os.path.join(tmp_path, q.slug("m/e"))
+    _fake_run(tmp_path, "m/e", "int8_per_token_head", nll, top1, g, kv_tokens=1570)
+    with open(os.path.join(md, "int8_per_token_head.log"), "w") as f:
+        f.write(CACHED.replace("kush4", "int8_per_token_head"))
+    rep = q.report(str(tmp_path), 10)
+    line = {l.split("|")[1].strip(): l for l in rep.splitlines() if l.startswith("| ")}
+    assert "| 3.94x (!) |" in line["kush4"] and "| 1.57x (!) |" in line["int8_per_token_head"]
+    assert "| 1.85x |" in line["kush8"] and "| 1.49x |" in line["fp8"]

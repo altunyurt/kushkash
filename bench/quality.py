@@ -18,6 +18,10 @@ other processes already hold at that point does not change it; memory they alloc
 counted as the engine's and shrinks the cache. Each run therefore records the other processes' GPU memory (nvidia-smi)
 before and after the engine starts; a row is marked (!) when that grew, or when mem / max_len / max_num_seqs differ
 from the base row. Not detected: memory another process allocates and frees again within the startup window.
+vLLM also counts its first torch.compile in the peak it reserves: a run that loads a cached compilation gets about
+0.9 GiB more KV cache (L4, Qwen2.5-7B, measured). Each run records torch.compile time, whether the compilation was
+cached and the peak activation memory (from vLLM's log); a row is marked (!) when its cache state differs from the
+base row's. Compare capacities from runs that all compiled cold (fresh ~/.cache/vllm) or all cached.
 """
 import argparse
 import gzip
@@ -148,6 +152,10 @@ def load_runs(d: str) -> dict:
             if not f.endswith(".json"):
                 continue
             meta = json.load(open(os.path.join(md, f)))
+            lp = os.path.join(md, f[:-5] + ".log")
+            if "startup" not in meta and os.path.exists(lp):          # runs saved before the startup record
+                with open(lp, errors="replace") as lf:
+                    meta["startup"] = parse_startup(lf.read(), meta.get("kv"))
             r = {"meta": meta}
             npz = os.path.join(md, f[:-5] + ".npz")
             if os.path.exists(npz):
@@ -185,9 +193,35 @@ def guard_status(before: dict[int, float], after: dict[int, float], ours: set[in
             "others_after_mib": round(oa), "others_grew_mib": round(oa - ob)}
 
 
+_COMPILE_S = re.compile(r"torch\.compile took ([\d.]+) s in total")
+_PEAK_GIB = re.compile(r"([\d.]+) GiB for peak activation")
+_AOT_LOAD = "Directly load AOT compilation"
+COMPILE_CACHED_S = 5.0             # a cold torch.compile of a 7-8B model takes ~20 s on an L4; a cache hit < 1 s
+
+
+def parse_startup(log_text: str, kv: str | None = None) -> dict | None:
+    """vLLM's startup lines in a run's log: torch.compile time, whether a cached compilation was loaded
+    (compile_cached: None when the log says nothing, e.g. enforce_eager) and the peak activation memory its profiling
+    reserved. Logs are appended per attempt: only the last attempt for `kv` counts."""
+    i = log_text.rfind(f"kv={kv}: loading") if kv else -1
+    seg = log_text[i:] if i >= 0 else log_text
+    nxt = re.search(r"kv=\S+: loading", seg[1:])                    # stop at the next run's start, if any
+    seg = seg[:nxt.start() + 1] if nxt else seg
+    comp, peak = _COMPILE_S.findall(seg), _PEAK_GIB.findall(seg)
+    if not comp and not peak and _AOT_LOAD not in seg:
+        return None
+    compile_s = float(comp[-1]) if comp else None
+    cached = True if _AOT_LOAD in seg else (compile_s < COMPILE_CACHED_S if compile_s is not None else None)
+    return {"compile_s": compile_s, "compile_cached": cached,
+            "peak_activation_gib": float(peak[-1]) if peak else None}
+
+
 def capacity_suspect(m: dict, base: dict) -> bool:
     """True when row m's KV capacity is not comparable with the base row's."""
     if any(r.get("gpu_guard", {}).get("status") == "polluted" for r in (m, base)):
+        return True
+    cached = [(r.get("startup") or {}).get("compile_cached") for r in (m, base)]
+    if None not in cached and cached[0] != cached[1]:
         return True
     return any(k in m and k in base and m[k] != base[k] for k in ("mem", "max_len", "max_num_seqs"))
 
@@ -237,8 +271,10 @@ def report(d: str, B: int = 10000, base_kv: str = "auto") -> str:
                   f"wrong, c = {base_kv} wrong / kv right; McNemar p < 0.05 -> GSM8K accuracy differs.",
                   "- hit max tokens: GSM8K answers cut off at --gsm8k-tokens (counted as wrong unless a boxed answer came "
                   "first).",
-                  "- (!) capacity not comparable: other processes' GPU memory grew while the engine started, or mem / "
-                  "max_len / max_num_seqs differ from the base row. Rows from before this check are not marked.", ""]
+                  "- (!) capacity not comparable: other processes' GPU memory grew while the engine started, mem / "
+                  "max_len / max_num_seqs differ from the base row, or one of the two loaded a cached torch.compile "
+                  "and the other compiled (vLLM counts the first compile in the memory it reserves). Rows from before "
+                  "these checks are not marked.", ""]
     return "\n".join(lines)
 
 
@@ -417,6 +453,18 @@ def main():
                     sys.stdout.buffer.write(chunk)
                     sys.stdout.flush()
                 rc = p.wait()
+            if rc == 0 and os.path.exists(done):        # record vLLM's startup state with the result
+                with open(os.path.join(md, kv + ".log"), errors="replace") as lf:
+                    st = parse_startup(lf.read(), kv)
+                with open(done) as f:
+                    meta = json.load(f)
+                meta["startup"] = st
+                with open(done + ".tmp", "w") as f:
+                    json.dump(meta, f)
+                os.replace(done + ".tmp", done)
+                if st and st.get("compile_cached"):
+                    log(f"{model} {kv}: vLLM loaded a cached torch.compile; its KV capacity is comparable only with "
+                        "runs that did too")
             log(f"{model} {kv}: " + ("done" if rc == 0 and os.path.exists(done) else f"FAILED (exit {rc})"))
     print(report(a.out_dir, a.bootstrap, a.base))
 
