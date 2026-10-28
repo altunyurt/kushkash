@@ -63,30 +63,32 @@ minutes on this GPU).
 
 ### Against vLLM's 16-bit cache (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31)
 
-Same GPU, same model, same 4 GiB KV cache budget for every cache type. Throughput is sustained output tokens/s
-over a fixed 300 s window with the queue kept full (2,048-token prompts, 2,048 output tokens each); each cache type
-is shown at its best `max_num_seqs`.
+Same GPU, same model, same 4 GiB KV cache budget for every cache type; kushkash v0.5.0 (4-bit rotation on). Output
+tokens/s with the queue kept full (2,048-token prompts, 2,048 output tokens each), measured over one whole wave as in
+the table above; each cache type is shown at its best `max_num_seqs`.
 
 | | vLLM default (bf16) | kushkash int4 | | kushkash int8 | |
 |---|---|---|---|---|---|
 | KV cache capacity (tokens) | 74,896 | 259,104 | **3.46x** | 138,912 | **1.85x** |
 | Requests that fit at 4k tokens each | 18 | 63 | **3.50x** | 33 | 1.83x |
-| Output tokens/s, sustained (fixed window, see below) | 256.0 | 619.3 | 2.42x | — | |
-| Requests in flight (mean) | 24.5 | 62.7 | 2.56x | — | |
-| Preemptions (work thrown away) in 300 s | 33 | 0 | | — | |
+| Output tokens/s, one whole wave | 256.1 | 669.2 | **2.61x** | — | |
+| Requests in flight (mean) | 24.6 | 69.2 | 2.81x | — | |
+| Time per step | 96 ms | 104 ms | | — | |
+| Preemptions (work thrown away) in the window | 32 | 8 | | — | |
+| `max_num_seqs` of that run | 256 (vLLM's default) | 71 | | — | |
 | Passkey retrieval, 8k / 16k | 10/10, 10/10 | 10/10, 10/10 | | 10/10, 10/10 | |
 
-- **The throughput ratio may be off by an amount not measured yet.** All requests have the same length, so they
-  finish and are replaced in waves, and a fixed window covers a different part of a wave for each cache type. The
-  table above measures over whole waves instead; this one has not been rerun that way.
+- Other settings, same run: vLLM's default cache capped at what fits (18) gave 223.3 tokens/s; kushkash int4 at
+  what fits (63) 650.9 (2.54x, no preemptions); at vLLM's default 256 it preempted 443 times, formed no whole wave
+  in 30 minutes, and gave 639.7.
+- One run per setting; run-to-run spread not measured. The older fixed-window figure for this table was 2.42x.
 - The 4 GiB is the cache alone; kushkash's own buffers come on top. Sized with `--gpu-memory-utilization`
   instead, which charges those buffers, the int4 cache holds 3.19x the tokens of vLLM's default
   ([section 4](#4-quality-compared-with-vllms-cache-formats)).
-- The int4 column was measured with the 4-bit rotation off; it is now on by default. In a separate run, turning
-  it on cost 1.5% of output tokens/s and improved perplexity from 6.0127 to 6.0105.
 - With more KV memory, or shorter requests, model weights take a larger share of each step and the ratio shrinks.
 
-Reproduce with `python bench/headline.py --sweep` (about 75 minutes on an L4).
+Reproduce with `python bench/headline.py --sweep` (about 80 minutes on an L4, 30 of them on kushkash at vLLM's
+default `max_num_seqs`).
 
 ### SGLang (Qwen2.5-7B-Instruct, NVIDIA L4, SGLang 0.5.22)
 
@@ -101,7 +103,9 @@ submitted at once), counted as tokens stream out.
 | Prefill tokens/s (6k-token prompts) | 3,532 | 3,559 | 1.01x | 3,595 | 1.02x |
 | Passkey retrieval, greedy answers | 6/6 | 6/6, identical | | 6/6, identical | |
 
-- Measured before the 4-bit rotation was on by default, and over a fixed window (same caveat as the table above).
+- Measured before the 4-bit rotation was on by default, and over a fixed window: requests of one length finish in
+  waves, and a fixed window covers a different part of a wave for each cache type, so the ratio may be off by an
+  amount not measured yet.
 - Every cache type gets the same share of GPU memory here, while the vLLM table above gives each the same fixed KV
   budget, so the two tables' ratios are not directly comparable.
 - The capacity ratio is below the format's 3.46x because the plugin takes its exact key buffer out of the same
@@ -151,6 +155,28 @@ default bf16 cache on the same inputs, token by token (perplexity) and question 
 
 Reproduce with `python bench/quality.py` (about 3.5 hours on an L4 for both models; `--report` prints these tables,
 `--base` compares against another format).
+
+### Long context (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31, kushkash 0.5.0)
+
+Does the small change above grow when a token has tens of thousands of compressed tokens behind it? Perplexity over
+WikiText-2 in 9 windows of 32,000 tokens (prompts in 2,048-token chunks), each part of the window compared with
+vLLM's bf16 cache on the same tokens:
+
+| Tokens into the window | 0–8k | 8k–16k | 16k–24k | 24k–32k | whole window |
+|---|---|---|---|---|---|
+| Δ perplexity, kushkash int4 [95% CI] | +0.0065 [+0.0024, +0.0102] | −0.0000 [−0.0030, +0.0028] | +0.0048 [+0.0013, +0.0080] | +0.0052 [+0.0020, +0.0081] | +0.0039 [+0.0019, +0.0059] |
+| Relative | +0.09% | 0.00% | +0.08% | +0.08% | +0.06% |
+
+- **The change does not accumulate with context:** the last 8k tokens change as much as the first 8k (bf16
+  perplexity 6.171 over the whole window; top-1 agreement 97.8%).
+- **Retrieval** (`bench/niah.py`): 128 needles "The special magic number for <key> is: <7 digits>" in real text, half
+  of them with keys that share the target's word (`amber-417` / `amber-471`), the target at 11 depths, 8k and 31k
+  tokens. kushkash int4 answered 44 of 44 like bf16; difference in the answer's log-probability +0.006 [−0.0004,
+  +0.017]. This model finds the needle every time with either cache, so this shows retrieval is not broken, not
+  that no drift exists.
+- One model, one text source, up to 32k tokens; 9 windows.
+
+Reproduce: [section 12](#reproduce-the-numbers-in-this-readme), item 8 (about 50 minutes for both).
 
 ## 5. How it works
 
@@ -205,9 +231,9 @@ over all channels, so the 4-bit codes lose less.
   earlier context is unpacked and attended together with the new chunk. In vLLM one Mojo kernel per group of requests
   unpacks it straight into the prompt workspace, then FlashAttention runs over many requests per call (on an L4,
   10–31% less attention time per layer than the earlier PyTorch unpacking for steps with earlier context, measured:
-  `bench/packed_microbench.py`, run once with `KUSHKASH_UNPACK=torch` and once without). In SGLang PyTorch unpacks it
-  into a per-step buffer for FlashInfer; in Hugging Face, and vLLM with `KUSHKASH_PREFILL=loop`, PyTorch unpacks a
-  fixed-size block at a time, merged with PyTorch's fused attention.
+  `bench/packed_microbench.py`, run once with `KUSHKASH_UNPACK=torch` and once without). In SGLang the same kernel
+  unpacks it into a per-step buffer for FlashInfer; in Hugging Face, and vLLM with `KUSHKASH_PREFILL=loop`, PyTorch
+  unpacks a fixed-size block at a time, merged with PyTorch's fused attention.
 - *Prompts with no earlier context* use FlashAttention in vLLM, FlashInfer in SGLang, and PyTorch's attention in
   Hugging Face.
 
@@ -319,7 +345,7 @@ runs one test step through kushkash, so the memory a step needs only while it ru
 - **Works with:** chunked prefill, prefix caching, preemption, CUDA graphs, `torch.compile`, CPU offloading (below),
   and FP8 weights (`--quantization fp8`; on an L4 with Qwen2.5-7B, the 4-bit cache gave 1.90x the sustained output
   tokens/s of vLLM's default cache on the same FP8 weights, same 10 GiB KV budget, measured over a fixed window
-  like the L4 table in [section 3](#3-measured-serving-throughput)) and AWQ weights.
+  before v0.5.0; see [Limits](#14-limits-and-open-questions)) and AWQ weights.
 - **Needs:** vLLM 0.31.x with its default model runner, an NVIDIA GPU, and a decoder-only model with full
   attention, head size 64, 128 or 256, in fp16 or bf16.
 - **Refuses to start** (with an error saying why) for: speculative decoding, sliding-window attention, ALiBi, logit
@@ -366,9 +392,9 @@ engine = sgl.Engine(model_path="Qwen/Qwen2.5-7B-Instruct", attention_backend="ku
 - **Leave `kv_cache_dtype` at `auto`;** choose 4 or 8 bits with `KUSHKASH_BITS`. `KUSHKASH_ROTATE` works as for vLLM.
 - **Decode steps run as CUDA graphs; prompt processing runs eagerly** (the plugin turns prefill CUDA graphs off).
 - **Leave GPU memory free for prompts that continue earlier context.** Unlike the vLLM backend, the SGLang backend
-  unpacks that context into a buffer it allocates per step, outside `mem_fraction_static`: up to about 1.2x
-  `KUSHKASH_PACK_MB` (512 MiB unless you set it). Larger steps, and `KUSHKASH_PREFILL=loop`, handle one request at a
-  time instead.
+  unpacks that context into a buffer it allocates per step, outside `mem_fraction_static`: up to `KUSHKASH_PACK_MB`
+  (512 MiB unless you set it; about 1.2x that with `KUSHKASH_UNPACK=torch`). Larger steps, and
+  `KUSHKASH_PREFILL=loop`, handle one request at a time instead.
 - **Supported:** radix (prefix) cache, chunked prefill, decode CUDA graphs. **Refused with an error:** speculative
   decoding, other quantized `kv_cache_dtype` values, ALiBi, attention sinks, logit soft-capping, hybrid /
   sliding-window / MLA models. **Not tested:** tensor parallelism, HiCache and prefill-decode disaggregation (the
@@ -509,13 +535,25 @@ vLLM sizes its cache from the memory it finds free.
    python bench/offload_reuse.py
    ```
 
-7. **The L4 and SGLang throughput tables** (section 3). Measured over a fixed window (see the caveat there).
-   About 75 and 45 minutes on an L4.
+7. **The L4 and SGLang throughput tables** (section 3). The L4 table is measured over whole waves, the SGLang table
+   over a fixed window (see the caveat there). About 80 and 45 minutes on an L4.
 
    ```bash
    python bench/headline.py --sweep
    python bench/sglang_spike.py --model Qwen/Qwen2.5-7B-Instruct --mem 0.85 --max-reqs 384 --tp-out 1024   # needs SGLang 0.5.22
    ```
+
+8. **Long context** ([section 4](#long-context-qwen25-7b-instruct-nvidia-l4-vllm-031-kushkash-050)). About 25
+   minutes each on an L4 (estimated).
+
+   ```bash
+   python bench/quality.py --models Qwen/Qwen2.5-7B-Instruct --kv auto,kush4 --win 32000 --max-len 32768 \
+       --ppl-windows 9 --gsm8k-n 0 --batched-tokens 2048 --mem 0.85 --out-dir q_long
+   python bench/niah.py --kv auto,kush4 --lengths 8192,32000 --per-cell 2 --needles 128 --out-dir niah128
+   ```
+
+   The per-quarter rows come from the saved per-token results (`q_long/*/*.npz`); `--report` prints the whole
+   window and its last quarter.
 
 Results that differ from the README's, or come from other GPUs and models, are welcome as issues.
 
@@ -526,7 +564,7 @@ pytest tests/test_cpu.py                # runs anywhere: format, kernels vs a re
 pytest tests/test_ragged.py             # runs anywhere: vLLM-style mixed batches against ground truth
 pytest tests/test_vllm_backend_cpu.py   # needs vLLM importable: the vLLM backend driven on CPU
 pytest tests/test_sglang_backend_cpu.py # runs anywhere (SGLang stubbed): the SGLang backend's bookkeeping
-pytest tests/test_quality_stats.py tests/test_rivals_cpu.py   # runs anywhere: benchmark statistics and reports
+pytest tests/test_quality_stats.py tests/test_rivals_cpu.py tests/test_niah_cpu.py   # runs anywhere: benchmark statistics and reports
 pytest tests/test_steady_cpu.py         # needs vLLM importable: whole-wave throughput window, fake engine
 pytest tests/test_sglang_gpu.py -s     # NVIDIA GPU + SGLang: radix-cache prefixes that end mid-page
 pytest tests/test_gpu.py                # NVIDIA GPU: GPU vs CPU pages, decode vs reference, HF on GPU
@@ -545,6 +583,7 @@ python bench/quality.py --report quality
 python bench/vllm_compare.py --kv auto,kush4,kush8     # capacity, perplexity, passkey, throughput per cache type
 python bench/offload_reuse.py                          # RAM tier: multi-turn time to first token
 python bench/offload_check.py                          # RAM tier: offloaded pages are correct
+python bench/niah.py                                   # long-context retrieval with distractors, 8k-32k, vs vLLM's cache
 python bench/sglang_spike.py --model Qwen/Qwen2.5-7B-Instruct --mem 0.85 --max-reqs 384 --tp-out 1024
 python bench/packed_microbench.py --max-len 4096       # prefill attention per layer (no model, no engine)
 python bench/mem_probe.py kush4                        # vLLM's memory accounting for one configuration
@@ -583,9 +622,8 @@ workspace (vLLM: 64 to 512 MiB by default; Hugging Face and `KUSHKASH_PREFILL=lo
 
 ## 14. Limits and open questions
 
-1. **The L4 throughput numbers (2.42x, 1.90x on FP8 weights, SGLang 2.12x) were measured over a fixed window**
-   and may be off by an amount not measured yet. Only the comparison against the other 4-bit formats was measured
-   over whole waves.
+1. **The FP8-weights (1.90x) and SGLang (2.12x) throughput numbers were measured over a fixed window** and may be
+   off by an amount not measured yet. The two vLLM tables in section 3 are measured over whole waves.
 2. **On models without a key bias (Qwen3-8B), `int4_per_token_head` holds more tokens than kushkash int4** (3.74x
    against 2.86x on an L4); kushkash's advantage there is perplexity and decode speed.
 3. **The throughput comparison against the other 4-bit formats is one model, one GPU, one request shape, one run
@@ -595,7 +633,8 @@ workspace (vLLM: 64 to 512 MiB by default; Hugging Face and `KUSHKASH_PREFILL=lo
 5. **GSM8K on Qwen3 varies between runs** more than its confidence intervals show.
 6. **All performance numbers are GPU numbers.** The CPU kernels exist and match the GPU's pages, but no CPU
    performance is claimed.
-7. **Not measured yet:** Llama models through vLLM or SGLang, datacenter GPUs (A100 / H100 / B200, including
+7. **Not measured yet:** contexts beyond 32k and long-context quality on models other than Qwen2.5-7B, Llama models
+   through vLLM or SGLang, datacenter GPUs (A100 / H100 / B200, including
    vLLM's `nvfp4` cache), tensor parallelism, GSM8K on AWQ weights, the RAM tier under concurrent sessions.
 
 Tried and ruled out (measured or reasoned): an 8-bit exact key buffer, low-rank values, per-layer bit widths,
