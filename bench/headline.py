@@ -1,9 +1,9 @@
 """Headline numbers: kushkash vs vLLM's own 16-bit cache, same GPU, same model, one command.
 
-    python bench/headline.py                                   # Qwen2.5-7B-Instruct, ~50 min on an L4
+    python bench/headline.py                                   # Qwen2.5-7B-Instruct, whole waves
     python bench/headline.py --reuse-accuracy old.jsonl        # throughput only, ~30 min
-    python bench/headline.py --quick                           # 2 min windows, ~35 min (rougher numbers)
-    python bench/headline.py --quick --reuse-accuracy old.jsonl  # ~20 min
+    python bench/headline.py --fixed-window                    # the earlier 300 s fixed window (biased, see below)
+    python bench/headline.py --quick                           # rougher accuracy runs (fewer perplexity windows)
     python bench/headline.py --summarize headline.jsonl        # re-print the table from saved results
     python bench/headline.py --quantization fp8 --kv-gib 10 --out headline_fp8.jsonl  # KV formats on FP8 weights
 
@@ -13,7 +13,12 @@ measured values and the ratio to vLLM's default cache. Every run gets the same K
   1. accuracy + capacity: auto, kush4, kush8
      (KV capacity in tokens as vLLM reports it, chunked-prefill perplexity, passkey retrieval at 8k / 16k)
   2. sustained serving throughput when the KV cache is the limit: 2048 prompt / 2048 output tokens per request,
-     queue kept full, output tok/s counted over a fixed window that opens at the first completion.
+     queue kept full, output tok/s counted from the first completion over whole waves (vllm_compare.py
+     --whole-waves: at least --tp-seconds, then up to the next wave boundary; default one wave). Requests of one
+     length finish in waves, so a fixed window (--fixed-window, the method behind the README's older L4 numbers)
+     covers a different part of a wave for each format and biases the ratio.
+     A run that preempts a lot (vLLM's cache at its default max_num_seqs) may never show a wave boundary: its window
+     then ends after 30 min and the summary flags it "NOT whole waves" (a long window keeps that bias small).
      vLLM's cache runs at its default max_num_seqs and capped at what fits its cache (KV tokens / 4096), and the
      table keeps its better run; kushkash runs capped (--sweep adds its default and cap+8 runs).
 Everything is measured; nothing in the table is computed from a formula except the ratios.
@@ -100,8 +105,14 @@ def summarize(path, seq_len=4096):
     print("\n".join(lines))
     print("\nAll throughput runs:")
     for r in tp:
+        win = (f"{r.get('waves')} whole wave(s)" if r.get("whole_waves") else
+               "NOT whole waves" if r.get("whole_waves") is False else "fixed window")
         print(f"  {r['kv']:>6} max_num_seqs={r.get('max_num_seqs')}: {r['throughput_out_tok_s']} out tok/s, "
-              f"preemptions {r['preemptions']}, running mean {r['mean_running']}, KV {r['kv_tokens']:,} tokens")
+              f"preemptions {r['preemptions']}, running mean {r['mean_running']}, KV {r['kv_tokens']:,} tokens, "
+              f"{r.get('window_s')} s, {win}")
+    if tp and not all(r.get("whole_waves") for r in tp):
+        print("\nWARNING: some throughput windows are not whole waves (fixed window, or no wave boundary reached): "
+              "the throughput ratio can be biased by where each window falls in a wave.")
     if len({r.get("kv_gib") for r in rows}) > 1 or None in {r.get("kv_gib") for r in rows}:
         print("\nWARNING: runs did not share one pinned KV budget (kv_gib); capacity ratios are not like for like.")
 
@@ -132,9 +143,10 @@ def main():
     meta = {"kushkash": kushkash.__version__, "gpu": gpu, "quantization": ARGS.quantization}
     open(out, "w").close()
     budget = ["--kv-gib", str(ARGS.kv_gib)]
-    ln, secs = 2048, (120 if ARGS.quick else ARGS.tp_seconds)
+    ln = 2048
+    secs = ARGS.tp_seconds if ARGS.tp_seconds is not None else ((120 if ARGS.quick else 300) if ARGS.fixed_window else 1)
     tp = budget + ["--only-throughput", "--tp-seconds", str(secs), "--tp-n", "1024", "--tp-len", str(ln),
-                   "--tp-out", str(ln), "--batched-tokens", "8192"]
+                   "--tp-out", str(ln), "--batched-tokens", "8192"] + ([] if ARGS.fixed_window else ["--whole-waves"])
     if ARGS.reuse_accuracy:                             # ppl / passkey / capacity from an earlier run, same budget
         old = [r for r in load(ARGS.reuse_accuracy) if r.get("phase") == "accuracy"]
         if not old or {r.get("kv_gib") for r in old} != {ARGS.kv_gib} or {r.get("model") for r in old} != {ARGS.model} \
@@ -169,7 +181,12 @@ if __name__ == "__main__":
     ap.add_argument("--reuse-accuracy", default=None, metavar="JSONL",
                     help="take ppl / passkey / capacity rows from an earlier headline run (same model and --kv-gib)")
     ap.add_argument("--sweep", action="store_true", help="also run kush4 at vLLM's default max_num_seqs and at cap+8")
-    ap.add_argument("--tp-seconds", type=float, default=300, help="sustained-throughput window per run")
+    ap.add_argument("--tp-seconds", type=float, default=None,
+                    help="throughput window per run: minimum length with whole waves (default 1 = one wave), fixed "
+                         "length with --fixed-window (default 300; 120 with --quick)")
+    ap.add_argument("--fixed-window", action="store_true",
+                    help="count throughput over a fixed --tp-seconds window instead of whole waves (biased; for "
+                         "comparing with older results)")
     ap.add_argument("--kv-gib", type=float, default=4.0,
                     help="KV cache budget for every run (4.0 fits a 7B bf16 model on a 24 GB L4; FP8 weights free "
                          "~6 GiB more)")
