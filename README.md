@@ -158,23 +158,24 @@ Reproduce with `python bench/quality.py` (about 3.5 hours on an L4 for both mode
 
 ### Long context (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31, kushkash 0.5.0)
 
-Does the small change above grow when a token has tens of thousands of compressed tokens behind it? Perplexity over
-WikiText-2 in 9 windows of 32,000 tokens (prompts in 2,048-token chunks), each part of the window compared with
-vLLM's bf16 cache on the same tokens:
+The comparison above uses 2,048-token windows. To see whether the +0.007 grows when a token has tens of thousands
+of compressed tokens behind it, the same comparison runs over WikiText-2 in 9 windows of 32,000 tokens (prompts
+still fed in 2,048-token chunks), reported per 8k quarter and over the whole window:
 
 | Tokens into the window | 0–8k | 8k–16k | 16k–24k | 24k–32k | whole window |
 |---|---|---|---|---|---|
 | Δ perplexity, kushkash int4 [95% CI] | +0.0065 [+0.0024, +0.0102] | −0.0000 [−0.0030, +0.0028] | +0.0048 [+0.0013, +0.0080] | +0.0052 [+0.0020, +0.0081] | +0.0039 [+0.0019, +0.0059] |
 | Relative | +0.09% | 0.00% | +0.08% | +0.08% | +0.06% |
 
-- **The change does not accumulate with context:** the last 8k tokens change as much as the first 8k (bf16
-  perplexity 6.171 over the whole window; top-1 agreement 97.8%).
-- **Retrieval** (`bench/niah.py`): 128 needles "The special magic number for <key> is: <7 digits>" in real text, half
-  of them with keys that share the target's word (`amber-417` / `amber-471`), the target at 11 depths, 8k and 31k
-  tokens. kushkash int4 answered 44 of 44 like bf16; difference in the answer's log-probability +0.006 [−0.0004,
-  +0.017]. This model finds the needle every time with either cache, so this shows retrieval is not broken, not
-  that no drift exists.
-- One model, one text source, up to 32k tokens; 9 windows.
+The last quarter is no worse than the first, so within 32k tokens the error does not pile up with context: bf16
+scores 6.171 over the window and kushkash int4 agrees with it on 97.8% of next-token predictions. `bench/niah.py`
+checks retrieval the same way: 44 prompts of about 8k and 32k tokens (7.8k and 31.6k measured), each with 128
+needles, about half of the distractors sharing the target's word; kushkash int4 answered all 44 as bf16 did, and
+the answer's log-probability differed by +0.006 [−0.0004, +0.017]. Qwen2.5-7B finds the needle every time with
+either cache, so this bounds the damage (at most 0.0004 lower log-probability on average, at 95%) rather than ruling
+it out.
+
+One model, one text source, 32k tokens at most.
 
 Reproduce: [section 12](#reproduce-the-numbers-in-this-readme), item 8 (about 50 minutes for both).
 
