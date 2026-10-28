@@ -213,9 +213,12 @@ def _step(world, slots, qlens, decode, gen, graph_pad=None):
     assert worst < 1e-3, worst
 
 
-@pytest.mark.parametrize("bits,packed,rot", [(4, False, False), (8, False, False), (4, True, False),
-                                             (8, True, False), (4, False, True), (4, True, True)])
-def test_sglang_backend_bookkeeping(sg, monkeypatch, bits, packed, rot):
+@pytest.mark.parametrize("bits,packed,rot,unpack", [(4, False, False, "mojo"), (8, False, False, "mojo"),
+                                                    (4, True, False, "mojo"), (8, True, False, "mojo"),
+                                                    (4, False, True, "mojo"), (4, True, True, "mojo"),
+                                                    (4, True, False, "torch"), (8, True, True, "torch")])
+def test_sglang_backend_bookkeeping(sg, monkeypatch, bits, packed, rot, unpack):
+    monkeypatch.setenv("KUSHKASH_UNPACK", unpack)
     w, gen = World(sg, monkeypatch, bits, packed=packed, rot=rot), torch.Generator().manual_seed(0)
     assert (w.be.rot is not None) == rot
     A, B, C = 3, 1, 5                                    # request-pool slots (not contiguous)
@@ -231,6 +234,8 @@ def test_sglang_backend_bookkeeping(sg, monkeypatch, bits, packed, rot):
     _step(w, [B], [40], decode=False, gen=gen)          # eager extend after graph steps
     _step(w, [A, C, B], [5, 33, 7], decode=False, gen=gen)  # several rows with mid-page history in one step
     assert (w.be.forward_metadata.pack is not None) == packed
+    if packed:
+        assert (w.be.forward_metadata.pack.tail_info is not None) == (unpack == "mojo")
     _step(w, [A, B, C], [1, 1, 1], decode=True, gen=gen)
 
 
@@ -312,12 +317,15 @@ def test_pack_plan_fuzz(sg):
         ctx = rng.integers(0, 2000, B).astype(np.int64)
         ctx[rng.integers(0, B)] = 0
         req = rng.permutation(64)[:B].astype(np.int64)
-        kv_indptr, page_row, page_idx, page_dst0, tail_row, tail_page, tail_slot, tail_src, tail_dst, new_dst = \
-            _pack_plan(ql, ctx, req)
+        kv_indptr, page_row, page_idx, page_dst0, tail_row, tail_page, tail_slot, tail_src, tail_dst, new_dst, \
+            tail_info = _pack_plan(ql, ctx, req)
         seg = ctx + ql
         base, full, rem = np.cumsum(seg) - seg, ctx // PAGE, ctx % PAGE
         assert list(kv_indptr) == [0] + list(np.cumsum(seg))
         assert (tail_slot == req[tail_row]).all() and (tail_page == full[tail_row]).all()
+        info = tail_info.reshape(-1, 3)                                 # kush_unpack: (first position, tokens, slot)
+        assert (info[:, 0] == base[tail_row] + full[tail_row] * PAGE).all()
+        assert (info[:, 1] == rem[tail_row]).all() and (info[:, 2] == req[tail_row]).all()
         for i in range(B):
             pos = {}
             for p in range(full[i]):

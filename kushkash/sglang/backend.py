@@ -6,11 +6,12 @@ vLLM backend (kushkash._ops.Ops); only the bookkeeping differs:
   block table : req_to_token[req, ::32] // 32   (SGLang's token slots -> physical pages)
   K-tail slot : req_pool_index                   (stable while a request runs, like vLLM's req_idx)
   seq_lens    : already count this step's tokens (decode: the new token is at seq_len - 1)
-Prefill (KUSHKASH_PREFILL=packed, the default): per layer, every row's history is dequantized into one packed
-buffer [history | exact K tail | new chunk] and attended with a single flashinfer ragged-prefill call (causal,
-queries aligned to the end of each row's keys), like the vLLM backend's packed path. Steps whose packed buffer
-exceeds KUSHKASH_PACK_MB (default 512) MiB, KUSHKASH_PREFILL=loop, or no flashinfer use the reference history path
-(per row: dequantize history page-blocks + log-sum-exp merge).
+Prefill (KUSHKASH_PREFILL=packed, the default): per layer, one Mojo kush_unpack launch builds a packed buffer
+[history | exact K tail | new chunk] for every row (KUSHKASH_UNPACK=torch: the earlier PyTorch gather / dequantize /
+scatter, slice by slice), attended with a single flashinfer ragged-prefill call (causal, queries aligned to the end
+of each row's keys), like the vLLM backend's packed path. Steps whose packed buffer exceeds KUSHKASH_PACK_MB
+(default 512) MiB, KUSHKASH_PREFILL=loop, or no flashinfer use the reference history path (per row: dequantize
+history page-blocks + log-sum-exp merge).
 """
 from __future__ import annotations
 
@@ -40,6 +41,14 @@ def _prefill_mode() -> str:
     return mode
 
 
+def _unpack_mode() -> str:
+    """KUSHKASH_UNPACK: mojo (default, one kush_unpack launch per layer) or torch (the earlier PyTorch path)."""
+    mode = os.environ.get("KUSHKASH_UNPACK", "mojo").strip().lower()
+    if mode not in ("mojo", "torch"):
+        raise ValueError("KUSHKASH_UNPACK must be mojo or torch")
+    return mode
+
+
 def _pack_bytes() -> int:
     """Budget for one layer's packed K + V buffer; history is dequantized into it in slices of <= 1/_PACK_SLICES
     of the budget, so the step's extra memory stays near (1 + 3 / _PACK_SLICES) x the budget. `auto` (the vLLM
@@ -57,24 +66,29 @@ def _ranges(lengths: np.ndarray) -> np.ndarray:
 
 @dataclass
 class _Pack:
-    """Where each key of the packed [history | tail | chunk] buffer comes from (device int64 index tensors)."""
+    """Where each key of the packed [history | tail | chunk] buffer comes from (device index tensors: int32 for
+    kush_unpack, int64 for KUSHKASH_UNPACK=torch)."""
     total_k: int
     kv_indptr: torch.Tensor     # [B + 1]
     page_row: torch.Tensor      # one entry per full history page: row, logical page, first packed position
     page_idx: torch.Tensor
     page_dst0: torch.Tensor
-    tail_row: torch.Tensor      # rows whose history ends mid-page: row, logical page, tail slot
+    tail_row: torch.Tensor      # rows whose history ends mid-page: row, logical page
     tail_page: torch.Tensor
-    tail_slot: torch.Tensor
-    tail_src: torch.Tensor      # per tail token: index into [R * 32] tail rows, packed position
-    tail_dst: torch.Tensor
     new_dst: torch.Tensor       # per chunk token: packed position
     qo_indptr_cpu: list
     kv_indptr_cpu: list
+    page_blk: torch.Tensor | None = None    # kush_unpack: physical block of each full page / partial page
+    tail_blk: torch.Tensor | None = None
+    tail_info: torch.Tensor | None = None   # kush_unpack: per partial page (first packed position, tokens, tail slot)
+    tail_slot: torch.Tensor | None = None   # torch path: tail slot per partial page
+    tail_src: torch.Tensor | None = None    # torch path: per tail token, index into [R * 32] tail rows
+    tail_dst: torch.Tensor | None = None    # torch path: per tail token, packed position
 
 
 def _pack_plan(qlens: np.ndarray, prefix: np.ndarray, req: np.ndarray):
-    """Host side of _Pack: int64 arrays (order as in _Pack, from kv_indptr to new_dst)."""
+    """Host side of _Pack, int64 arrays: kv_indptr, page_row, page_idx, page_dst0, tail_row, tail_page, tail_slot,
+    tail_src, tail_dst, new_dst, tail_info (3 per partial page: first packed position, tokens, tail slot)."""
     ql, ctx = qlens.astype(np.int64), prefix.astype(np.int64)
     seg = ctx + ql
     base = np.cumsum(seg) - seg
@@ -90,8 +104,9 @@ def _pack_plan(qlens: np.ndarray, prefix: np.ndarray, req: np.ndarray):
     tail_src = np.repeat(np.arange(int(m.sum()), dtype=np.int64), rr) * PAGE + tok
     tail_dst = np.repeat(base[m] + full[m] * PAGE, rr) + tok
     new_dst = np.repeat(base + ctx, ql) + _ranges(ql)
+    tail_info = np.stack([base[m] + full[m] * PAGE, rr, req[m].astype(np.int64)], 1).reshape(-1)
     return [kv_indptr, page_row, page_idx, page_dst0, rows[m], full[m], req[m].astype(np.int64), tail_src, tail_dst,
-            new_dst]
+            new_dst, tail_info]
 
 
 def _ragged_reference(q, k, v, qo_indptr, kv_indptr, scale):
@@ -246,7 +261,7 @@ class KushSGLangBackend(AttentionBackend):
             md.qsl_cpu, md.prefix_cpu = qsl.tolist(), [int(x) for x in prefix]
             rc = fb.req_pool_indices_cpu if getattr(fb, "req_pool_indices_cpu", None) is not None else req.cpu()
             md.req_cpu = [int(x) for x in rc]
-            md.pack = self._plan_pack(np.asarray(qlens), np.asarray(prefix), np.asarray(md.req_cpu), qsl)
+            md.pack = self._plan_pack(np.asarray(qlens), np.asarray(prefix), np.asarray(md.req_cpu), qsl, bt)
         self.forward_metadata = md
 
     def _flashinfer(self):
@@ -261,7 +276,7 @@ class KushSGLangBackend(AttentionBackend):
                     self._fi = None
         return self._fi
 
-    def _plan_pack(self, qlens, prefix, req, qsl) -> _Pack | None:
+    def _plan_pack(self, qlens, prefix, req, qsl, bt) -> _Pack | None:
         """Packed-prefill plan for this step, or None (loop path)."""
         if self.prefill_mode != "packed" or self.G is None:
             return None
@@ -272,13 +287,24 @@ class KushSGLangBackend(AttentionBackend):
         elem = torch.empty((), dtype=self.dtype).element_size()
         if 2 * total_k * self.Hk * self.D * elem > _pack_bytes():
             return None
-        parts = _pack_plan(qlens, prefix, req)
-        up = torch.from_numpy(np.concatenate(parts)).to(self.device)
+        (kv_indptr, page_row, page_idx, page_dst0, tail_row, tail_page, tail_slot, tail_src, tail_dst, new_dst,
+         tail_info) = _pack_plan(qlens, prefix, req)
+        mojo = _unpack_mode() == "mojo"
+        parts = [kv_indptr, page_row, page_idx, page_dst0, tail_row, tail_page, new_dst] + (
+            [tail_info] if mojo else [tail_slot, tail_src, tail_dst])
+        dt = np.int32 if mojo else np.int64            # kush_unpack takes int32 indices; torch indexing int64
+        up = torch.from_numpy(np.concatenate(parts).astype(dt)).to(self.device)
         views, o = [], 0
         for a in parts:
             views.append(up[o:o + len(a)])
             o += len(a)
-        p = _Pack(total_k, *views, qo_indptr_cpu=[int(x) for x in qsl], kv_indptr_cpu=[int(x) for x in parts[0]])
+        p = _Pack(total_k, *views[:7], qo_indptr_cpu=[int(x) for x in qsl], kv_indptr_cpu=[int(x) for x in kv_indptr])
+        if mojo:                                       # physical blocks once per step (int32, as the block table)
+            p.tail_info = views[7]
+            p.page_blk = bt[p.page_row, p.page_idx].contiguous()
+            p.tail_blk = bt[p.tail_row, p.tail_page].contiguous()
+        else:
+            p.tail_slot, p.tail_src, p.tail_dst = views[7:]
         if attn == "flashinfer":
             self._fi.begin_forward(torch.from_numpy(qsl.astype(np.int32)).to(self.device),
                                    p.kv_indptr.to(torch.int32), self.G * self.Hk, self.Hk, self.D,
@@ -332,7 +358,7 @@ class KushSGLangBackend(AttentionBackend):
         k3, v3 = _rows(k.view(-1, Hk, D)), _rows(v.view(-1, Hk, D))
         q3, k3, v3 = rotate(q3, self.rot), rotate(k3, self.rot), rotate(v3, self.rot)
         if md.pack is not None:
-            out = self._prefill_packed(q3, k3, v3, cache, tail, md, float(layer.scaling))
+            out = self._prefill_packed(q3, k3, v3, cache, tail, md, float(layer.scaling), ops)
         else:
             out = self._prefill_loop(q3, k3, v3, cache, tail, md, float(layer.scaling))
         if save_kv_cache:
@@ -340,12 +366,18 @@ class KushSGLangBackend(AttentionBackend):
                       tail)
         return rotate(out, self.rot).reshape(-1, Hq * D)
 
-    def _prefill_packed(self, q3, k3, v3, cache, tail, md, scale):
+    def _prefill_packed(self, q3, k3, v3, cache, tail, md, scale, ops):
         """One attention call over packed [dequantized history | exact K tail | chunk] keys for all rows.
         Reads the cache before this step's write."""
         p, Hk, D = md.pack, self.Hk, self.D
         kp = k3.new_empty(p.total_k, Hk, D)
         vp = v3.new_empty(p.total_k, Hk, D)
+        if p.tail_info is not None:                    # one kush_unpack launch builds kp / vp (pages stay rotated)
+            ops.unpack(cache, p.page_blk, p.page_dst0, p.tail_blk, p.tail_info, tail, k3, v3, p.new_dst, kp, vp,
+                       rot=False)
+            if self.ragged_attention is not None:
+                return self.ragged_attention(q3, kp, vp, p.qo_indptr_cpu, p.kv_indptr_cpu, scale)
+            return self._fi.forward(q3.contiguous(), kp, vp, causal=True, sm_scale=scale)
         bt = md.block_table
         n_pages = p.page_row.numel()
         per_page = 2 * PAGE * Hk * D * k3.element_size()
