@@ -174,6 +174,9 @@ def test_rejects_unsupported_configs(monkeypatch):
     monkeypatch.setattr(kb, "get_current_vllm_config", lambda: cfg)
     with pytest.raises(NotImplementedError, match="kv_cache_dtype"):
         kb.KushAttentionImpl(4, 64, 0.125, num_kv_heads=2, kv_cache_dtype="fp8")
+    with pytest.raises(NotImplementedError, match="dual-chunk"):                # Qwen2.5-*-1M config left in
+        kb.KushAttentionImpl(4, 64, 0.125, num_kv_heads=2, layer_idx=0,
+                             dual_chunk_attention_config={"chunk_size": 262144})
     spec = make_cfg(max_seqs=4, max_len=256)
     spec.speculative_config = SimpleNamespace(num_speculative_tokens=3)
     with pytest.raises(NotImplementedError, match="speculative"):

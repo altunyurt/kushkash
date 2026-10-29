@@ -47,6 +47,25 @@ def slug(model: str) -> str:
     return model.replace("/", "__")
 
 
+def plain_attention(cfg):
+    """hf_overrides hook: drop dual_chunk_attention_config (Qwen2.5-*-1M models). vLLM 0.31 has no dual-chunk
+    attention backend but still hands that config to the attention backend, so FlashAttention fails on
+    `layer_idx`. Without it the model runs plain RoPE, which Qwen documents as accurate up to 262,144 tokens."""
+    if getattr(cfg, "dual_chunk_attention_config", None) is not None:
+        delattr(cfg, "dual_chunk_attention_config")
+    return cfg
+
+
+def engine_overrides(model: str) -> dict:
+    """Extra LLM() arguments the model's config needs under vLLM 0.31 ({} for ordinary models)."""
+    from transformers import AutoConfig
+    if getattr(AutoConfig.from_pretrained(model), "dual_chunk_attention_config", None) is None:
+        return {}
+    log(f"{model}: dual_chunk_attention_config dropped (no dual-chunk backend in vLLM; plain RoPE, "
+        "accurate to 262,144 tokens per Qwen)")
+    return {"hf_overrides": plain_attention}
+
+
 # ---------------------------------------------------------------- answer parsing
 
 _NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
@@ -238,11 +257,17 @@ def report(d: str, B: int = 10000, base_kv: str = "auto") -> str:
             lines.append(f"## {model}\nno `{base_kv}` row: nothing to compare against\n")
             continue
         base = rows[base_kv]
-        order = [k for k in KV_DEFAULT if k in rows] + sorted(k for k in rows if k not in KV_DEFAULT)
         bm = base["meta"]
+        bw, bs = bm.get("win"), bm.get("split", "test")     # unknown (older runs) never excludes: only known mismatches
+        off = sorted(k for k, r in rows.items() if k != base_kv and (
+            (r["meta"].get("win") is not None and bw is not None and r["meta"]["win"] != bw) or
+            (r["meta"].get("split") is not None and bs is not None and r["meta"]["split"] != bs)))
+        order = [k for k in KV_DEFAULT if k in rows and k not in off] + \
+                sorted(k for k in rows if k not in KV_DEFAULT and k not in off)
         lines += [f"## {model}", f"vLLM {bm.get('vllm')}, weights {bm.get('quantization') or 'checkpoint dtype'}, "
-                  f"ppl {bm.get('ppl_windows')} x {bm.get('win')} tokens, GSM8K n={bm.get('gsm8k_n')}, "
-                  f"bootstrap B={B}", "",
+                  f"ppl {bm.get('ppl_windows')} x {bm.get('win')} tokens"
+                  + ("" if bm.get("split", "test") == "test" else f" ({bm['split']} split)") +
+                  f", GSM8K n={bm.get('gsm8k_n')}, bootstrap B={B}", "",
                   f"| kv | KV tokens | x {base_kv} | ppl | Δppl vs {base_kv} [95% CI] | Δppl last ¼ | top-1 agree | "
                   f"GSM8K % [95% CI] | hit max tokens | Δ pts vs {base_kv} [95% CI] | b / c | McNemar p |",
                   "|---|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -274,7 +299,9 @@ def report(d: str, B: int = 10000, base_kv: str = "auto") -> str:
                   "- (!) capacity not comparable: other processes' GPU memory grew while the engine started, mem / "
                   "max_len / max_num_seqs differ from the base row, or one of the two loaded a cached torch.compile "
                   "and the other compiled (vLLM counts the first compile in the memory it reserves). Rows from before "
-                  "these checks are not marked.", ""]
+                  "these checks are not marked.",
+                  *([f"- not compared: {', '.join(off)} (different --win / --split from `{base_kv}`)"] if off else []),
+                  ""]
     return "\n".join(lines)
 
 
@@ -325,6 +352,7 @@ def run_one(a):
     if a.kv.startswith("kush"):
         os.environ["KUSHKASH_BITS"] = a.kv[4:]
         extra = {"kv_cache_dtype": "auto", "attention_backend": "CUSTOM"}
+    extra.update(engine_overrides(a.model))
     apps0 = compute_apps()                            # before the engine (no CUDA in this process)
     log(f"{a.model} kv={a.kv}: loading")
     llm = LLM(model=a.model, max_model_len=a.max_len, gpu_memory_utilization=a.mem, enable_prefix_caching=False,
@@ -338,8 +366,8 @@ def run_one(a):
             "this run's KV capacity is not comparable")
     cc = llm.llm_engine.vllm_config.cache_config
     meta = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "kv_tokens": cc.kv_cache_size_tokens,
-            "quantization": a.quantization, "win": a.win, "batched_tokens": a.batched_tokens,
-            "mem": a.mem, "max_len": a.max_len,
+            "quantization": a.quantization, "win": a.win, "split": a.split, "batched_tokens": a.batched_tokens,
+            "mem": a.mem, "max_len": a.max_len, "dual_chunk_dropped": "hf_overrides" in extra,
             "max_num_seqs": llm.llm_engine.vllm_config.scheduler_config.max_num_seqs, "gpu_guard": guard,
             "env": {k: v for k, v in os.environ.items() if k.startswith(("KUSHKASH_", "VLLM_", "PYTORCH_CUDA"))}}
     if a.kv.startswith("kush"):
@@ -349,7 +377,7 @@ def run_one(a):
     arrays = {}
 
     # 1. perplexity, per token
-    text = "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"])
+    text = "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=a.split)["text"])
     ids = tok(text).input_ids
     n = min(a.ppl_windows, len(ids) // a.win)
     nll = np.zeros((n, a.win - 1), np.float32)
@@ -417,6 +445,9 @@ def main():
     ap.add_argument("--mem", type=float, default=0.90)
     ap.add_argument("--batched-tokens", type=int, default=256, help="prefill chunk (small = ppl reads the cache)")
     ap.add_argument("--win", type=int, default=2048)
+    ap.add_argument("--split", default="test",
+                    help="WikiText-2 split for the perplexity text: test (~300k tokens, 2 windows at --win 131072), "
+                         "train (~2M, 16 windows at 131072)")
     ap.add_argument("--ppl-windows", type=int, default=128)
     ap.add_argument("--gsm8k-n", type=int, default=-1, help="-1 = all 1,319, 0 = off")
     ap.add_argument("--gsm8k-tokens", type=int, default=1024)

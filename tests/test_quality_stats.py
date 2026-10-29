@@ -228,3 +228,36 @@ def test_compile_cache_state_marks_capacity(tmp_path):
     line = {l.split("|")[1].strip(): l for l in rep.splitlines() if l.startswith("| ")}
     assert "| 3.94x (!) |" in line["kush4"] and "| 1.57x (!) |" in line["int8_per_token_head"]
     assert "| 1.85x |" in line["kush8"] and "| 1.49x |" in line["fp8"]
+
+
+def test_dual_chunk_config_dropped(monkeypatch):
+    """Qwen2.5-*-1M: vLLM 0.31 passes dual_chunk_attention_config to FlashAttention (TypeError on layer_idx)."""
+    import transformers
+    from transformers import PretrainedConfig
+    one_m = PretrainedConfig(dual_chunk_attention_config={"chunk_size": 262144, "local_size": 8192})
+    plain = PretrainedConfig()
+    assert not hasattr(q.plain_attention(one_m), "dual_chunk_attention_config")
+    assert q.plain_attention(plain) is plain
+    cfgs = {"m/1M": PretrainedConfig(dual_chunk_attention_config={"chunk_size": 1}), "m/plain": PretrainedConfig()}
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", lambda name, **kw: cfgs[name])
+    assert q.engine_overrides("m/1M") == {"hf_overrides": q.plain_attention}
+    assert q.engine_overrides("m/plain") == {}
+
+
+def test_report_skips_rows_with_another_window_or_split(tmp_path):
+    """Rows over a different --win or text split are not paired with the base row: their per-token arrays are not
+    the same tokens (a 16-token window shift would crash on shape, a different split would pair silently)."""
+    rng = np.random.default_rng(0)
+    nll = rng.uniform(1, 3, (4, 8)).astype(np.float32)
+    top1, g = np.zeros((4, 8), np.int32), np.ones(10, bool)
+    _fake_run(tmp_path, "m/w", "auto", nll, top1, g, win=8)
+    _fake_run(tmp_path, "m/w", "kush4", nll * 1.01, top1, g, win=8)
+    _fake_run(tmp_path, "m/w", "kush8", nll, top1, g, win=16)
+    _fake_run(tmp_path, "m/w", "fp8", nll, top1, g, win=8, split="train")
+    rep = q.report(str(tmp_path), 10)
+    assert "| kush4 |" in rep and "| kush8 |" not in rep and "| fp8 |" not in rep
+    assert "not compared: fp8, kush8 (different --win / --split" in rep
+    assert "(test split)" not in rep                              # the base row is the test split: no suffix
+    _fake_run(tmp_path, "m/v", "auto", nll, top1, g, win=8, split="train")
+    _fake_run(tmp_path, "m/v", "kush4", nll, top1, g, win=8, split="train")
+    assert "(train split)" in q.report(str(tmp_path), 10)

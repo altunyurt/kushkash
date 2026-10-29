@@ -34,7 +34,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from quality import boot_mean_ci, mcnemar_exact, slug  # noqa: E402
+from quality import boot_mean_ci, engine_overrides, mcnemar_exact, slug  # noqa: E402
 
 try:                                                   # quality.py with the compile-cache record (optional)
     from quality import parse_startup  # noqa: E402
@@ -259,13 +259,14 @@ def run_one(a):
     if a.kv.startswith("kush"):
         os.environ["KUSHKASH_BITS"] = a.kv[4:]
         extra = {"kv_cache_dtype": "auto", "attention_backend": "CUSTOM"}
+    extra.update(engine_overrides(a.model))
     log(f"{a.model} kv={a.kv}: loading (max_model_len {max_len})")
     llm = LLM(model=a.model, max_model_len=max_len, gpu_memory_utilization=a.mem, enable_prefix_caching=False,
               enable_chunked_prefill=True, max_num_batched_tokens=a.batched_tokens, seed=0, **extra)
     meta = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "lengths": lengths, "depths": a.depths,
             "per_cell": a.per_cell, "needles": a.needles, "seed": a.seed, "batched_tokens": a.batched_tokens,
             "mem": a.mem, "kv_tokens": llm.llm_engine.vllm_config.cache_config.kv_cache_size_tokens,
-            "cases_sha": cases_sha(cases),
+            "cases_sha": cases_sha(cases), "dual_chunk_dropped": "hf_overrides" in extra,
             "env": {k: v for k, v in os.environ.items() if k.startswith(("KUSHKASH_", "VLLM_"))}}
     if a.kv.startswith("kush"):
         import kushkash

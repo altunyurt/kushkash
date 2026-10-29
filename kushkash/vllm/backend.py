@@ -591,6 +591,8 @@ class KushAttentionImpl(AttentionImpl[KushMetadata]):
         unsupported = [name for name, bad in [
             ("ALiBi", alibi_slopes is not None), ("sliding window", sliding_window is not None),
             ("logits soft-cap", bool(logits_soft_cap)), ("attention sinks", kwargs.get("sinks") is not None),
+            ("dual-chunk attention (Qwen2.5-*-1M: drop dual_chunk_attention_config, e.g. hf_overrides)",
+             kwargs.get("dual_chunk_attention_config") is not None),
             ("cross-layer KV sharing", kv_sharing_target_layer_name is not None),
             (f"attention type {attn_type}", attn_type != AttentionType.DECODER),
             (f"kv_cache_dtype={kv_cache_dtype} (use auto; choose 4/8 bits with KUSHKASH_BITS)",
