@@ -446,8 +446,8 @@ def main():
     ap.add_argument("--batched-tokens", type=int, default=256, help="prefill chunk (small = ppl reads the cache)")
     ap.add_argument("--win", type=int, default=2048)
     ap.add_argument("--split", default="test",
-                    help="WikiText-2 split for the perplexity text: test (~300k tokens, 2 windows at --win 131072), "
-                         "train (~2M, 16 windows at 131072)")
+                    help="WikiText-2 split for the perplexity text: test (~300k tokens, 2 windows at --win 130000), "
+                         "train (~2M, ~16 windows at 130000)")
     ap.add_argument("--ppl-windows", type=int, default=128)
     ap.add_argument("--gsm8k-n", type=int, default=-1, help="-1 = all 1,319, 0 = off")
     ap.add_argument("--gsm8k-tokens", type=int, default=1024)
@@ -455,6 +455,9 @@ def main():
     ap.add_argument("--model", help=argparse.SUPPRESS)
     ap.add_argument("--one", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if not a.report and a.win >= a.max_len:
+        ap.error(f"--win {a.win} must be smaller than --max-len {a.max_len} (each window is a prompt that needs one "
+                 "output token)")
     if a.report:
         print(report(a.report, a.bootstrap, a.base))
         return

@@ -261,3 +261,11 @@ def test_report_skips_rows_with_another_window_or_split(tmp_path):
     _fake_run(tmp_path, "m/v", "auto", nll, top1, g, win=8, split="train")
     _fake_run(tmp_path, "m/v", "kush4", nll, top1, g, win=8, split="train")
     assert "(train split)" in q.report(str(tmp_path), 10)
+
+
+def test_window_must_fit_max_len(monkeypatch, capsys):
+    """A window is a prompt plus one output token: --win == --max-len fails only after the model loaded."""
+    monkeypatch.setattr(sys, "argv", ["quality.py", "--win", "131072", "--max-len", "131072", "--kv", "auto"])
+    with pytest.raises(SystemExit):
+        q.main()
+    assert "must be smaller than --max-len" in capsys.readouterr().err

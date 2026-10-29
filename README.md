@@ -353,9 +353,20 @@ runs one test step through kushkash, so the memory a step needs only while it ru
   soft-capping, attention sinks, MLA models, cross-layer KV sharing, micro-batching (`--enable-dbo`,
   `--ubatch-size`).
 - **Qwen2.5-*-1M models** carry `dual_chunk_attention_config`, which vLLM 0.31 has no backend for (and which would
-  change the position encoding under kushkash). Drop it to run them:
-  `--hf-overrides '{"dual_chunk_attention_config": null}'`. Without it the model uses plain RoPE, which Qwen
-  documents as accurate to 262,144 tokens.
+  change the position encoding under kushkash). Drop it to run them: save the model's `config.json` without that key
+  in a folder and pass `--hf-config-path <folder>` (the weights still load from the model). Without it the model uses
+  plain RoPE, which Qwen documents as accurate to 262,144 tokens. `bench/quality.py` and `bench/niah.py` do this for
+  you.
+
+  ```bash
+  python -c "import json, os; from huggingface_hub import hf_hub_download as get
+  c = json.load(open(get('Qwen/Qwen2.5-7B-Instruct-1M', 'config.json'))); c.pop('dual_chunk_attention_config')
+  os.makedirs('q1m-config', exist_ok=True); json.dump(c, open('q1m-config/config.json', 'w'), indent=2)"
+  vllm serve Qwen/Qwen2.5-7B-Instruct-1M --hf-config-path q1m-config --max-model-len 131072 ...
+  ```
+
+  `--hf-overrides '{"dual_chunk_attention_config": null}'` is not enough: vLLM then still applies the model's
+  `sparse_attention_config.json` to the null value and fails with a `TypeError`.
 
 ### System RAM as a second cache tier
 
