@@ -352,6 +352,10 @@ runs one test step through kushkash, so the memory a step needs only while it ru
 - **Refuses to start** (with an error saying why) for: speculative decoding, sliding-window attention, ALiBi, logit
   soft-capping, attention sinks, MLA models, cross-layer KV sharing, micro-batching (`--enable-dbo`,
   `--ubatch-size`).
+- **Qwen2.5-*-1M models** carry `dual_chunk_attention_config`, which vLLM 0.31 has no backend for (and which would
+  change the position encoding under kushkash). Drop it to run them:
+  `--hf-overrides '{"dual_chunk_attention_config": null}'`. Without it the model uses plain RoPE, which Qwen
+  documents as accurate to 262,144 tokens.
 
 ### System RAM as a second cache tier
 
