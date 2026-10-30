@@ -240,6 +240,10 @@ over all channels, so the 4-bit codes lose less.
 
 The CPU kernels use the same format and arithmetic as the GPU kernels: given the same inputs, both produce
 byte-for-byte identical pages (tested with the rotation off; with it on, the rotation itself may round differently).
+Attention outputs are not bit-identical across devices: the tensor-core decode kernel (sm_80 and newer, head size 128
+or 256) multiplies q by the per-channel key scales in fp16 and sums on tensor cores, while the CPU kernels and the
+CUDA-core kernel keep that product in fp32. The extra rounding is small next to the 4-bit codes' own error (score
+error rms 0.0018 vs 0.0013 before, against 0.49 from quantization; emulated, head size 128).
 
 ## 6. Requirements and installation
 
@@ -608,6 +612,7 @@ python bench/packed_microbench.py --max-len 4096       # prefill attention per l
 python bench/mem_probe.py kush4                        # vLLM's memory accounting for one configuration
 python bench/bench_e2e.py --model Qwen/Qwen2.5-1.5B-Instruct --batch 4 --prompt 8192 --new 128   # HF vs DynamicCache
 python bench/bench_decode.py                           # decode kernel time (optionally vs FlashInfer)
+python bench/bench_decode.py --shape 128,4096 --only kush4 --profile   # one shape; --profile for Nsight Compute
 ```
 
 In `vllm_compare.py`, `--kv` takes vLLM's own `kv_cache_dtype` values (such as `auto` or `fp8`) and `kush4` /

@@ -408,6 +408,14 @@ def _w_to_h4[HALF: Int](w: UInt32) -> SIMD[DType.float16, 4]:
 
 
 @always_inline
+def _nib[SHIFT: Int](w: UInt32) -> UInt32:
+    """Nibbles at bit SHIFT of each byte, two's complement -> unsigned (c + 8): ((w >> SHIFT) & 0x0F0F0F0F) ^
+    0x08080808 as one LOP3 (lut 0x6A = (a & b) ^ c); written out, the compiler emits an AND and an XOR."""
+    var x = w >> UInt32(SHIFT) if SHIFT else w
+    return inlined_assembly["lop3.b32 $0, $1, $2, $3, 0x6A;", UInt32, constraints="=r,r,r,r"](x, NIB, XOR4)
+
+
+@always_inline
 def _split_range(full: Int, n_splits: Int, z: Int) -> Tuple[Int, Int]:
     """[start, end) in pages for split z: ceil(full / n_splits) pages each. A split can come out
     empty (more splits than pages), which the callers handle as a no-op."""
@@ -509,7 +517,10 @@ def _load_page_tc[D: Int, BITS: Int](
     kw: Pointer[UInt32, MutUntrackedOrigin], vw: Pointer[UInt32, MutUntrackedOrigin],
 ):
     """K rows nt*8 + g (nt = 0..3): 16 bytes per chunk at c*64 + t*16 -> kw[(nt*NC + c)*4 + j].
-    V: this lane's own row (token = lane) -> vw. All loads 16-byte, issued together."""
+    V: 512-byte slabs, lane L takes bytes 16L.. of slab j -> vw[j*4 ..] (token row j*RPI + L // CH, 16-byte chunk
+    L % CH, CH = DC // 16 chunks per row): every load instruction reads 512 contiguous bytes. (One row per lane, the
+    earlier layout, read 16 bytes per 64-byte row per instruction: 2x the sectors, ncu A100.) All loads 16-byte,
+    issued together."""
     comptime DC = row_bytes[D, BITS]()
     comptime NC = DC // 64
     var g = lane // 4
@@ -519,11 +530,11 @@ def _load_page_tc[D: Int, BITS: Int](
             var w4 = rec.unsafe_offset((nt * 8 + g) * DC + c * 64 + tid * 16).unsafe_bitcast[UInt32]().unsafe_load[width=4, alignment=16]()
             comptime for j in range(4):
                 kw[unsafe_offset=(nt * NC + c) * 4 + j] = w4[j]
-    var vp = rec.unsafe_offset(off_vq[D, BITS]() + lane * DC).unsafe_bitcast[UInt32]()
-    comptime for c4 in range(0, DC // 4, 4):
-        var v4 = vp.unsafe_load[width=4, alignment=16](c4)
-        comptime for j in range(4):
-            vw[unsafe_offset=c4 + j] = v4[j]
+    var vp = rec.unsafe_offset(off_vq[D, BITS]() + lane * 16).unsafe_bitcast[UInt32]()
+    comptime for j in range(DC // 16):
+        var v4 = vp.unsafe_load[width=4, alignment=16](j * 128)
+        comptime for k in range(4):
+            vw[unsafe_offset=j * 4 + k] = v4[k]
 
 
 @always_inline
@@ -575,6 +586,8 @@ def kush_decode_tc[D: Int, BITS: Int, G: Int, NW: Int, IN: DType](
     comptime PREFETCH = BITS == 4
     comptime STAGE = P * VS
     comptime TA = 4 * size_of[Scalar[IN]]()          # alignment of a 4-wide tail load
+    comptime CH = DC // 16                            # 16-byte V chunks per token row
+    comptime RPI = WARP // CH                         # V rows per 512-byte load slab
     comptime assert NW * STAGE * 2 >= NW * G * D * 4, "merge scratch must fit in the V staging buffer"
     var s = Int(block_idx.x)
     var h = Int(block_idx.y)
@@ -587,18 +600,26 @@ def kush_decode_tc[D: Int, BITS: Int, G: Int, NW: Int, IN: DType](
     var tid = lane % 4
     var hv = g < G
     var gq = min(g, G - 1)
+    var vrow = lane // CH
+    var vch = lane % CH
     var n = Int(seq_lens[unsafe_offset=s])
     var tail_n = n % P
     var rng = _split_range(n // P, NS, z)
     var bt = block_table.unsafe_offset(s * Int(max_pages))
 
     var qsm = stack_allocation[G * D, Float32, address_space=AddressSpace.SHARED, alignment=16]()
+    var qh = stack_allocation[G * D, Float16, address_space=AddressSpace.SHARED, alignment=16]()
     var stage_all = stack_allocation[NW * STAGE, Float16, address_space=AddressSpace.SHARED, alignment=16]()
     var ewt = stack_allocation[G * P, Float32, address_space=AddressSpace.SHARED, alignment=16]()
     var c_m = stack_allocation[NW * G, Float32, address_space=AddressSpace.SHARED]()
     var c_l = stack_allocation[NW * G, Float32, address_space=AddressSpace.SHARED]()
     var qbase = (s * H + h) * G * D
     _load_q[D, G, NW, IN](q, qbase, sm, qsm)
+    # fp16 copy of q * sm for the A fragments (step 1 multiplies by k_scale in fp16: 2 HMUL2 per k-tile instead of
+    # 4 fp16->fp32 conversions, 4 FMUL and 2 packs). The K-bias dot stays in fp32 on qsm.
+    for i in range(Int(thread_idx.x), G * D, NW * WARP):
+        qh[unsafe_offset=i] = qsm[unsafe_offset=i].cast[DType.float16]()
+    barrier()
     var vst = stage_all.unsafe_offset(w_id * STAGE)
 
     var o = stack_allocation[MT * 4, Float32]()        # O^T accumulators (dim, head) per lane
@@ -636,29 +657,38 @@ def kush_decode_tc[D: Int, BITS: Int, G: Int, NW: Int, IN: DType](
         else:
             _load_page_tc[D, BITS](rec, lane, kw, vw)
 
-        # 1. A fragments Q' = fp16(q * sm * k_scale) at this lane's dims; K bias dot in fp32
-        var kbs_part = Float32(0)
-        comptime for kt in range(KT):
-            var base = _kphys[D, BITS, kt](tid)
-            var ks4 = ksp.unsafe_load[width=4, alignment=8](base).cast[DType.float32]()
-            var kb4 = kbp.unsafe_load[width=4, alignment=8](base).cast[DType.float32]()
-            var q4 = qsm.unsafe_load[width=4, alignment=16](gq * D + base) if hv else SIMD[DType.float32, 4](0)
-            var a4 = (q4 * ks4).cast[DType.float16]()
-            afr.unsafe_store(kt * 8, SIMD[DType.float16, 8](a4[0], a4[1], 0, 0, a4[2], a4[3], 0, 0))
-            kbs_part += (q4 * kb4).reduce_add()
-        var kbs = _quad_sum(kbs_part)
+        # 1. A fragments Q' = fp16(q * sm) * k_scale in fp16 at this lane's dims; K bias dot in fp32. The 4 k-tiles of a
+        #    group cover 16 contiguous dims of this lane: one 32-byte load each for k_scale and k_bias
+        var kbs4 = SIMD[DType.float32, 4](0)
+        comptime for kg in range(KT // 4):
+            var base0 = _kphys[D, BITS, kg * 4](tid)
+            var ks16 = ksp.unsafe_load[width=16, alignment=16](base0)
+            var kb16 = kbp.unsafe_load[width=16, alignment=16](base0)
+            comptime for j in range(4):
+                comptime kt = kg * 4 + j
+                comptime assert _kphys[D, BITS, kt](0) == _kphys[D, BITS, kg * 4](0) + 4 * j, "k-tile group not contiguous"
+                var kb4 = kb16.slice[4, offset=4 * j]().cast[DType.float32]()
+                var q4 = qsm.unsafe_load[width=4, alignment=16](gq * D + base0 + 4 * j) if hv else SIMD[DType.float32, 4](0)
+                var qh4 = qh.unsafe_load[width=4, alignment=8](gq * D + base0 + 4 * j) if hv else SIMD[DType.float16, 4](0)
+                var a4 = qh4 * ks16.slice[4, offset=4 * j]()
+                afr.unsafe_store(kt * 8, SIMD[DType.float16, 8](a4[0], a4[1], 0, 0, a4[2], a4[3], 0, 0))
+                kbs4 = q4.fma(kb4, kbs4)
+        var kbs = _quad_sum(kbs4.reduce_add())
 
-        # 2. stage this lane's V row (token = lane) as exact fp16 codes
-        comptime for i in range(0, NVW, 2):
-            var w0 = vw[unsafe_offset=i]
-            var w1 = vw[unsafe_offset=i + 1]
-            comptime if BITS == 8:
-                vst.unsafe_store[alignment=16](lane * VS + 4 * i, _w_to_h4[HALF](w0 ^ XOR8).join(_w_to_h4[HALF](w1 ^ XOR8)))
-            else:
-                vst.unsafe_store[alignment=16](lane * VS + 4 * i,
-                    _w_to_h4[HALF]((w0 & NIB) ^ XOR4).join(_w_to_h4[HALF]((w1 & NIB) ^ XOR4)))
-                vst.unsafe_store[alignment=16](lane * VS + D // 2 + 4 * i,
-                    _w_to_h4[HALF](((w0 >> 4) & NIB) ^ XOR4).join(_w_to_h4[HALF](((w1 >> 4) & NIB) ^ XOR4)))
+        # 2. stage the V chunks this lane loaded (_load_page_tc) as exact fp16 codes: slab j, row j*RPI + vrow,
+        #    words vch*4 .. vch*4+3 of that row
+        comptime for j in range(DC // 16):
+            var row = (j * RPI + vrow) * VS
+            comptime for k in range(0, 4, 2):
+                var w0 = vw[unsafe_offset=j * 4 + k]
+                var w1 = vw[unsafe_offset=j * 4 + k + 1]
+                var col = 4 * (vch * 4 + k)
+                comptime if BITS == 8:
+                    vst.unsafe_store[alignment=16](row + col, _w_to_h4[HALF](w0 ^ XOR8).join(_w_to_h4[HALF](w1 ^ XOR8)))
+                else:
+                    vst.unsafe_store[alignment=16](row + col, _w_to_h4[HALF](_nib[0](w0)).join(_w_to_h4[HALF](_nib[0](w1))))
+                    vst.unsafe_store[alignment=16](row + D // 2 + col,
+                        _w_to_h4[HALF](_nib[4](w0)).join(_w_to_h4[HALF](_nib[4](w1))))
 
         # 3. QK^T: 4 token tiles x KT k-tiles
         comptime for nt in range(4):
@@ -671,9 +701,9 @@ def kush_decode_tc[D: Int, BITS: Int, G: Int, NW: Int, IN: DType](
                     comptime kk = kt if kt < HT else kt - HT
                     var wv = kw[unsafe_offset=(nt * NC + kk // 4) * 4 + kk % 4]
                     comptime if kt < HT:
-                        bfr = _w_to_h4[HALF]((wv & NIB) ^ XOR4)
+                        bfr = _w_to_h4[HALF](_nib[0](wv))
                     else:
-                        bfr = _w_to_h4[HALF](((wv >> 4) & NIB) ^ XOR4)
+                        bfr = _w_to_h4[HALF](_nib[4](wv))
                 mma(acc, afr.unsafe_load[width=8](kt * 8), bfr, acc)
             sacc[unsafe_offset=nt * 2 + 0] = acc[0] + kbs if hv else Float32(0)
             sacc[unsafe_offset=nt * 2 + 1] = acc[1] + kbs if hv else Float32(0)
@@ -697,7 +727,10 @@ def kush_decode_tc[D: Int, BITS: Int, G: Int, NW: Int, IN: DType](
         l = l * corr + _quad_sum(rsum)
         vbacc = vbacc * corr + _quad_sum(rvb)
         m = mn
-        _rescale_ot[MT](o, warp.shuffle_idx(corr, UInt32(tid * 8)), warp.shuffle_idx(corr, UInt32(tid * 8 + 4)))
+        var ca = warp.shuffle_idx(corr, UInt32(tid * 8))
+        var cb = warp.shuffle_idx(corr, UInt32(tid * 8 + 4))
+        if ca != 1 or cb != 1:                  # no running max moved (most pages of a long context): exact skip
+            _rescale_ot[MT](o, ca, cb)
         syncwarp()
 
         # 5. PV: O^T[dims x heads] += V^T . P^T

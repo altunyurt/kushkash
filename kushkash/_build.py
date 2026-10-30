@@ -127,7 +127,7 @@ class GpuConfig:
         D, G = self.head_dim, self.group
         for nw in (4, 2, 1):
             if self.tensor_cores:
-                smem = G * D * 4 + nw * PAGE * (D + 8) * 2 + G * PAGE * 4 + 2 * nw * G * 4
+                smem = G * D * 6 + nw * PAGE * (D + 8) * 2 + G * PAGE * 4 + 2 * nw * G * 4   # q fp32 + fp16
             else:
                 dc = D if self.bits == 8 else D // 2
                 stage = nw * PAGE * (dc // 4 + 4)
