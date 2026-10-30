@@ -181,19 +181,28 @@ Reproduce: [section 12](#reproduce-the-numbers-in-this-readme), item 8 (about 50
 
 ### Under serving load (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31, kushkash 0.5.5)
 
-The tables above score windows with little else running. `bench/ppl_load.py` scores the same 16 windows of 2,048
-tokens alone, then again while the GPU decodes enough other requests to fill the cache (78 requests for kushkash int4,
-15 for bf16):
+Does perplexity change when the server is busy? `bench/ppl_load.py` scores the same 16 WikiText-2 windows of 2,048
+tokens twice: on an idle server, then while other requests fill the cache.
 
-- Perplexity does not move with load: kushkash int4 6.9643 alone, 6.9642 loaded, Δ −0.0002 [−0.0055, +0.0057];
-  bf16 −0.00001. kushkash int4 minus bf16 is +0.0061 alone and +0.0060 loaded.
-- **Per-token outputs are not batch-invariant.** Under load, 94.9% of kushkash int4's per-token log-probabilities
-  change (mean 0.036, at most 1.51 nats), against 0.2% for bf16; the changes average out. Likely cause (not
-  verified): load moves where a prompt is cut into chunks, and keys in the current chunk are read exact while
-  earlier ones come from 4-bit pages. Greedy output for the same prompt can therefore differ between a quiet and a
-  busy server.
+|  | bf16 | kushkash int4 |
+|---|---|---|
+| Other requests running | 15 | 78 |
+| Perplexity, idle | 6.9582 | 6.9643 |
+| Perplexity, busy | 6.9582 | 6.9642 |
+| Change [95% CI] | −0.00001 (CI within ±0.00003) | −0.0002 [−0.0055, +0.0057] |
+| Tokens whose score changed | 0.2% | 94.9% |
 
-One model, one GPU, one run (about 30 minutes): `python bench/ppl_load.py --kv auto,kush4`.
+Perplexity is the same idle or busy, for both caches.
+
+Single tokens are a different story. With kushkash int4, almost every token's log-probability moves a little when
+the server is busy (0.036 nats on average, up to 1.51 on a single token), and the moves cancel out. In practice, the
+same prompt can get a slightly different answer from an idle server than from a busy one, even with greedy decoding.
+
+Likely reason (not verified): vLLM feeds a long prompt in chunks, and where it cuts depends on what else is running.
+Keys in the current chunk are exact; earlier keys come from the 4-bit cache. Move the cut and some keys switch
+between exact and 4-bit.
+
+One model, one GPU, one run, about 30 minutes: `python bench/ppl_load.py --kv auto,kush4`.
 
 ## 5. How it works
 
