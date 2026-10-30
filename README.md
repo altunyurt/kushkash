@@ -179,6 +179,22 @@ One model, one text source, 32k tokens at most.
 
 Reproduce: [section 12](#reproduce-the-numbers-in-this-readme), item 8 (about 50 minutes for both).
 
+### Under serving load (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31, kushkash 0.5.5)
+
+The tables above score windows with little else running. `bench/ppl_load.py` scores the same 16 windows of 2,048
+tokens alone, then again while the GPU decodes enough other requests to fill the cache (78 requests for kushkash int4,
+15 for bf16):
+
+- Perplexity does not move with load: kushkash int4 6.9643 alone, 6.9642 loaded, Δ −0.0002 [−0.0055, +0.0057];
+  bf16 −0.00001. kushkash int4 minus bf16 is +0.0061 alone and +0.0060 loaded.
+- **Per-token outputs are not batch-invariant.** Under load, 94.9% of kushkash int4's per-token log-probabilities
+  change (mean 0.036, at most 1.51 nats), against 0.2% for bf16; the changes average out. Likely cause (not
+  verified): load moves where a prompt is cut into chunks, and keys in the current chunk are read exact while
+  earlier ones come from 4-bit pages. Greedy output for the same prompt can therefore differ between a quiet and a
+  busy server.
+
+One model, one GPU, one run (about 30 minutes): `python bench/ppl_load.py --kv auto,kush4`.
+
 ## 5. How it works
 
 **Pages.** The cache is split into pages of 32 tokens, one per layer, KV head and block of tokens. Each page is one
@@ -613,6 +629,7 @@ python bench/mem_probe.py kush4                        # vLLM's memory accountin
 python bench/bench_e2e.py --model Qwen/Qwen2.5-1.5B-Instruct --batch 4 --prompt 8192 --new 128   # HF vs DynamicCache
 python bench/bench_decode.py                           # decode kernel time (optionally vs FlashInfer)
 python bench/bench_decode.py --shape 128,4096 --only kush4 --profile   # one shape; --profile for Nsight Compute
+python bench/ppl_load.py --kv auto,kush4             # perplexity alone vs under serving load (same windows)
 ```
 
 In `vllm_compare.py`, `--kv` takes vLLM's own `kv_cache_dtype` values (such as `auto` or `fp8`) and `kush4` /
@@ -654,7 +671,8 @@ workspace (vLLM: 64 to 512 MiB by default; Hugging Face and `KUSHKASH_PREFILL=lo
    each.**
 4. **kushkash int8's capacities** were measured with the old fixed workspace (current default: calculated, not
    measured).
-5. **GSM8K on Qwen3 varies between runs** more than its confidence intervals show.
+5. **GSM8K on Qwen3 varies between runs** more than its confidence intervals show. kushkash int4's per-token outputs
+   also depend on server load (section 4, "Under serving load"); perplexity does not.
 6. **All performance numbers are GPU numbers.** The CPU kernels exist and match the GPU's pages, but no CPU
    performance is claimed.
 7. **Not measured yet:** contexts beyond 32k and long-context quality on models other than Qwen2.5-7B, Llama models

@@ -269,3 +269,34 @@ def test_window_must_fit_max_len(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         q.main()
     assert "must be smaller than --max-len" in capsys.readouterr().err
+
+
+def test_ppl_load_report(tmp_path):
+    """bench/ppl_load.py: background sizing, paired stats and the report on synthetic runs."""
+    import ppl_load as pl
+    assert pl.background_count(236864, 16 * 2048, 2560, 256, 16) == (236864 - int(1.1 * 32768)) // 2560
+    assert pl.background_count(74672, 16 * 2048, 2560, 256, 16) == 15
+    assert pl.background_count(30000, 16 * 2048, 2560, 256, 16) == 0           # no room: windows alone
+    assert pl.background_count(10 ** 7, 16 * 2048, 2560, 256, 16) == 240        # capped by max_num_seqs
+    rng = np.random.default_rng(0)
+    alone = rng.uniform(1, 3, (8, 64)).astype(np.float32)
+    s = pl.window_stats(alone, alone)
+    assert s["dppl"] == 0 and s["max_abs"] == 0 and s["changed"] == 0
+    md = tmp_path / "m__x"
+    md.mkdir()
+    for kv, shift in (("auto", 0.0), ("kush4", 0.01)):
+        loaded = alone + shift + rng.normal(0, 1e-4, alone.shape).astype(np.float32)
+        np.savez(md / f"{kv}.npz", alone=alone + shift, loaded=loaded, alone2=alone + shift)
+        (md / f"{kv}.json").write_text(json.dumps({"kv_tokens": 1000, "background": 3}))
+    rep = pl.report(str(tmp_path), 200)
+    assert "## m/x" in rep and "| auto | 1,000 | 3 |" in rep and "| yes |" in rep
+    assert "kush4 - auto: alone +" in rep and "loaded +" in rep
+
+
+def test_ppl_load_rejects_one_chunk_windows(monkeypatch, capsys):
+    """--batched-tokens >= --win: a lone window is one chunk and never reads the KV cache (first L4 run, 2026-10-30)."""
+    import ppl_load as pl
+    monkeypatch.setattr(sys, "argv", ["ppl_load.py", "--batched-tokens", "2048", "--win", "2048"])
+    with pytest.raises(SystemExit):
+        pl.main()
+    assert "never reads the KV cache" in capsys.readouterr().err
