@@ -175,9 +175,35 @@ the answer's log-probability differed by +0.006 [−0.0004, +0.017]. Qwen2.5-7B 
 either cache, so this bounds the damage (at most 0.0004 lower log-probability on average, at 95%) rather than ruling
 it out.
 
-One model, one text source, 32k tokens at most.
+One model, one text source.
 
 Reproduce: [section 12](#reproduce-the-numbers-in-this-readme), item 8 (about 50 minutes for both).
+
+### 64k and 128k (Qwen2.5-7B-Instruct-1M, Llama-3.1-8B-Instruct, vLLM 0.31, kushkash 0.5.3–0.5.5)
+
+Past 32k, two models built for long context. Perplexity in windows of 130,000 tokens, on two kinds of text, against
+the same models at 2,048 tokens:
+
+| Relative Δ perplexity, kushkash int4 | Qwen2.5-7B-Instruct-1M | Llama-3.1-8B-Instruct |
+|---|---|---|
+| PG-19 books, 2k (100 windows) | +0.07% | +0.17% |
+| PG-19 books, 128k (18 windows) | +0.10% | +0.14% |
+| WikiText-2 train, 128k (19 / 18 windows) | +0.09% | +0.16% |
+
+- **No measurable growth with context.** On PG-19, the four 32k quarters of a 128k window stay between +0.08% and
+  +0.12% (Qwen) and +0.11% and +0.16% (Llama).
+- **Llama's larger change is the model's own level:** it is the same at 2k. Qwen-1M sits a little higher at 128k than
+  at 2k on both texts; the intervals overlap, so this is within noise, but a small length effect is not ruled out.
+- PG-19 (public-domain books, less likely to be memorized) is harder text than WikiText: bf16 perplexity 9.3 and 10.0
+  against 6.7. The relative change is about the same.
+- **Retrieval** (`bench/niah.py`, 44 prompts per model at about 64k and 128k, 32 needles): Llama answered the same
+  43 of 44 with both caches. Qwen-1M answered 44 with bf16 and 43 with kushkash int4: one 128k prompt flipped, the
+  one bf16 was least sure of (McNemar p = 1, not significant). It is the only retrieval miss kushkash int4 has shown.
+- **Capacity at 128k:** 3.3–3.4x the tokens of bf16 (Qwen-1M on the RTX PRO 6000: 30.9 requests of 128k against 9.1).
+- Qwen2.5-*-1M runs with plain RoPE ([Compatibility](#compatibility)). GPUs: A100 40 / 80 GB for 128k perplexity,
+  RTX PRO 6000 for retrieval, L4 for 2k. One run per setting.
+
+Reproduce: [section 12](#reproduce-the-numbers-in-this-readme), item 9.
 
 ### Under serving load (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31, kushkash 0.5.5)
 
@@ -603,6 +629,19 @@ vLLM sizes its cache from the memory it finds free.
    The per-quarter rows come from the saved per-token results (`q_long/*/*.npz`); `--report` prints the whole
    window and its last quarter.
 
+9. **64k and 128k** ([section 4](#64k-and-128k-qwen25-7b-instruct-1m-llama-31-8b-instruct-vllm-031-kushkash-053055)).
+   The 128k runs fit an A100 40 GB at `--mem 0.85`; the 2k run fits an L4. Times not measured.
+
+   ```bash
+   M=Qwen/Qwen2.5-7B-Instruct-1M,unsloth/Llama-3.1-8B-Instruct
+   python bench/quality.py --models $M --kv auto,kush4 --split pg19 --win 130000 --max-len 131072 \
+       --ppl-windows 100 --batched-tokens 8192 --mem 0.85 --gsm8k-n 0 --out-dir q_pg19_128k
+   python bench/quality.py --models $M --kv auto,kush4 --split pg19 --ppl-windows 100 --gsm8k-n 0 --out-dir q_pg19_2k
+   python bench/quality.py --models $M --kv auto,kush4 --split train --win 130000 --max-len 131072 \
+       --ppl-windows 19 --batched-tokens 8192 --mem 0.85 --gsm8k-n 0 --out-dir q_wiki_128k
+   python bench/niah.py --models $M --kv auto,kush4 --lengths 64000,128000 --per-cell 2 --out-dir niah_long
+   ```
+
 Results that differ from the README's, or come from other GPUs and models, are welcome as issues.
 
 ### All tests and benchmarks
@@ -684,9 +723,9 @@ workspace (vLLM: 64 to 512 MiB by default; Hugging Face and `KUSHKASH_PREFILL=lo
    also depend on server load (section 4, "Under serving load"); perplexity does not.
 6. **All performance numbers are GPU numbers.** The CPU kernels exist and match the GPU's pages, but no CPU
    performance is claimed.
-7. **Not measured yet:** contexts beyond 32k and long-context quality on models other than Qwen2.5-7B, Llama models
-   through vLLM or SGLang, datacenter GPUs (A100 / H100 / B200, including
-   vLLM's `nvfp4` cache), tensor parallelism, GSM8K on AWQ weights, the RAM tier under concurrent sessions.
+7. **Not measured yet:** contexts beyond 128k, long context on more than two model families, Llama models through
+   SGLang, H100 / B200 (including vLLM's `nvfp4` cache), tensor parallelism, GSM8K on AWQ weights, the RAM tier under
+   concurrent sessions. The 64k / 128k numbers are one run per setting.
 
 Tried and ruled out (measured or reasoned): an 8-bit exact key buffer, low-rank values, per-layer bit widths,
 lower bits for older pages, 3 bits everywhere, page skipping, special treatment of the first tokens, and the

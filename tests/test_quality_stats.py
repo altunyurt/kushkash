@@ -300,3 +300,20 @@ def test_ppl_load_rejects_one_chunk_windows(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         pl.main()
     assert "never reads the KV cache" in capsys.readouterr().err
+
+
+def test_book_windows_one_per_long_book():
+    """--split pg19: one window per book, only books with >= win tokens, from the start, never spanning books."""
+    books = [list(range(10)), list(range(100, 103)), list(range(200, 208)), list(range(300, 320))]
+    assert q.book_windows(books, 8, 10) == [list(range(8)), list(range(200, 208)), list(range(300, 308))]
+    assert q.book_windows(books, 8, 2) == [list(range(8)), list(range(200, 208))]
+    assert q.book_windows(books, 50, 10) == []
+
+
+def test_report_labels_pg19(tmp_path):
+    nll = np.random.default_rng(0).uniform(1, 3, (4, 8)).astype(np.float32)
+    top1, g = np.zeros((4, 8), np.int32), np.ones(10, bool)
+    _fake_run(tmp_path, "m/p", "auto", nll, top1, g, win=8, split="pg19")
+    _fake_run(tmp_path, "m/p", "kush4", nll * 1.01, top1, g, win=8, split="pg19")
+    rep = q.report(str(tmp_path), 10)
+    assert "(PG-19 test books)" in rep and "| kush4 |" in rep

@@ -2,6 +2,8 @@
 
 Per model x kv_cache_dtype: same weights, same inputs, greedy. Every row is compared with the model's `auto` row.
   ppl    wikitext-2 test, N x 2k windows, chunked prefill (256-token chunks: later chunks read the cache).
+         --split pg19: PG-19 test books instead (emozilla/pg19-test, 100 public-domain books the models are less
+         likely to have memorized than Wikipedia), one window per book long enough, from the book's start.
          Per-token NLL saved -> paired delta vs auto, 95% CI by bootstrap over windows; top-1 agreement with auto.
   gsm8k  1,319 test questions, zero-shot CoT, greedy (decode reads the cache) -> accuracy with Wilson CI;
          paired vs auto: exact McNemar p and a bootstrap CI of the accuracy difference.
@@ -266,7 +268,7 @@ def report(d: str, B: int = 10000, base_kv: str = "auto") -> str:
                 sorted(k for k in rows if k not in KV_DEFAULT and k not in off)
         lines += [f"## {model}", f"vLLM {bm.get('vllm')}, weights {bm.get('quantization') or 'checkpoint dtype'}, "
                   f"ppl {bm.get('ppl_windows')} x {bm.get('win')} tokens"
-                  + ("" if bm.get("split", "test") == "test" else f" ({bm['split']} split)") +
+                  + {"test": "", "pg19": " (PG-19 test books)"}.get(bm.get("split", "test"), f" ({bm.get('split')} split)") +
                   f", GSM8K n={bm.get('gsm8k_n')}, bootstrap B={B}", "",
                   f"| kv | KV tokens | x {base_kv} | ppl | Δppl vs {base_kv} [95% CI] | Δppl last ¼ | top-1 agree | "
                   f"GSM8K % [95% CI] | hit max tokens | Δ pts vs {base_kv} [95% CI] | b / c | McNemar p |",
@@ -337,6 +339,24 @@ def own_pids() -> set[int]:
     return ours
 
 
+PG19 = "emozilla/pg19-test"
+
+
+def book_windows(books, win: int, n: int) -> list:
+    """First `win` tokens of each book that has at least `win` tokens, at most n. One window per book keeps the
+    windows independent (the bootstrap's unit); windows never span two books."""
+    return [b[:win] for b in books if len(b) >= win][:n]
+
+
+def ppl_windows(tok, split: str, win: int, n: int) -> list:
+    from datasets import load_dataset
+    if split == "pg19":
+        books = load_dataset(PG19, split="test")["text"]
+        return book_windows([tok(t).input_ids for t in books], win, n)
+    ids = tok("\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)["text"])).input_ids
+    return [ids[w * win:(w + 1) * win] for w in range(min(n, len(ids) // win))]
+
+
 def run_one(a):
     import numpy as np
     from datasets import load_dataset
@@ -377,14 +397,15 @@ def run_one(a):
     arrays = {}
 
     # 1. perplexity, per token
-    text = "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=a.split)["text"])
-    ids = tok(text).input_ids
-    n = min(a.ppl_windows, len(ids) // a.win)
+    windows = ppl_windows(tok, a.split, a.win, a.ppl_windows)
+    n = len(windows)
+    if n == 0:
+        raise SystemExit(f"no {a.split} text of {a.win} tokens")
     nll = np.zeros((n, a.win - 1), np.float32)
     top1 = np.zeros((n, a.win - 1), np.int32)
     log(f"1/2 perplexity: {n} x {a.win} tokens, prefill chunks of {a.batched_tokens}")
     for s in range(0, n, 16):                         # 16 windows per call keeps prompt-logprob objects small
-        wins = [ids[w * a.win:(w + 1) * a.win] for w in range(s, min(n, s + 16))]
+        wins = windows[s:s + 16]
         outs = llm.generate([TokensPrompt(prompt_token_ids=w) for w in wins],
                             SamplingParams(max_tokens=1, prompt_logprobs=1), use_tqdm=False)
         for j, (w, o) in enumerate(zip(wins, outs)):
@@ -445,9 +466,9 @@ def main():
     ap.add_argument("--mem", type=float, default=0.90)
     ap.add_argument("--batched-tokens", type=int, default=256, help="prefill chunk (small = ppl reads the cache)")
     ap.add_argument("--win", type=int, default=2048)
-    ap.add_argument("--split", default="test",
-                    help="WikiText-2 split for the perplexity text: test (~300k tokens, 2 windows at --win 130000), "
-                         "train (~2M, ~16 windows at 130000)")
+    ap.add_argument("--split", default="test", choices=["test", "train", "pg19"],
+                    help="perplexity text: WikiText-2 test (~300k tokens, 2 windows at --win 130000) or train (~2M, "
+                         "~16 windows at 130000); pg19 = PG-19 test books, one window per book (see top)")
     ap.add_argument("--ppl-windows", type=int, default=128)
     ap.add_argument("--gsm8k-n", type=int, default=-1, help="-1 = all 1,319, 0 = off")
     ap.add_argument("--gsm8k-tokens", type=int, default=1024)
