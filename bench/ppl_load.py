@@ -16,6 +16,16 @@ otherwise a lone window is scored in one chunk and never touches the cache.
   python bench/ppl_load.py --kv auto,kush4                 # ~30 min on an L4 (Qwen2.5-7B), estimate
   python bench/ppl_load.py --report pplload
 
+Long windows (--serial): windows that do not fit the cache together are scored one at a time under load. For each
+window, the background requests are submitted first and the window last; the background prompts are prefilled
+first, then the window's chunks are scheduled while the background decodes. --bg-out -1 sizes the background output
+so that it outlasts both phases (2x margin). The alone passes are serial too: windows scored together share each
+step's token budget, so their chunks are smaller, fewer keys are read exact from the current chunk, and a cache with
+more room (more windows at once) would be scored with different chunking than one with less.
+
+  python bench/ppl_load.py --model Qwen/Qwen2.5-7B-Instruct-1M --split pg19 --win 130000 --max-len 131072 \
+      --batched-tokens 8192 --windows 8 --mem 0.85 --serial --out-dir pplload_128k
+
 Report per format: Δppl loaded - alone (paired, bootstrap over windows), per-token |Δ NLL| (max, mean), share of
 tokens whose NLL changed, alone == alone2; and each format minus auto, alone vs under load.
 """
@@ -28,7 +38,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from quality import boot_mean_ci, engine_overrides, log, slug  # noqa: E402
+from quality import boot_mean_ci, engine_overrides, log, ppl_windows, slug  # noqa: E402
 
 
 def background_count(kv_tokens: int, window_tokens: int, bg_len: int, max_num_seqs: int, n_windows: int) -> int:
@@ -36,6 +46,14 @@ def background_count(kv_tokens: int, window_tokens: int, bg_len: int, max_num_se
     max_num_seqs."""
     room = kv_tokens - int(1.1 * window_tokens)
     return max(0, min(room // bg_len, max_num_seqs - n_windows))
+
+
+def serial_bg_out(win: int, bg_prompt: int, batched_tokens: int, max_bg: int) -> int:
+    """Background output length for --serial: twice the steps of (prefilling every background prompt, then the
+    window's chunks while each step's budget also carries one decode token per background request), plus 64."""
+    bg_prefill = -(-max_bg * bg_prompt // batched_tokens)
+    window = -(-win // max(64, batched_tokens - max_bg))
+    return 2 * (bg_prefill + window) + 64
 
 
 def window_stats(a, b, B: int = 10000) -> dict:
@@ -74,11 +92,21 @@ def run_one(a):
     vc = llm.llm_engine.vllm_config
     kv_tokens, max_seqs = vc.cache_config.kv_cache_size_tokens, vc.scheduler_config.max_num_seqs
 
-    test = tok("\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"])).input_ids
+    wins = ppl_windows(tok, a.split, a.win, a.windows)
+    n = len(wins)
+    if n == 0:
+        raise SystemExit(f"no {a.split} text of {a.win} tokens")
     train = tok("\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="train")["text"])).input_ids
-    n = min(a.windows, len(test) // a.win)
-    wins = [test[w * a.win:(w + 1) * a.win] for w in range(n)]
-    nbg = a.bg if a.bg >= 0 else background_count(kv_tokens, n * a.win, a.bg_prompt + a.bg_out, max_seqs, n)
+    concurrent = 1 if a.serial else n                  # windows in flight during the loaded pass
+    if a.bg_out < 0:
+        a.bg_out = serial_bg_out(a.win, a.bg_prompt, a.batched_tokens, max_seqs - 1) if a.serial else 512
+    if a.bg_prompt + a.bg_out > a.max_len:
+        raise SystemExit(f"--bg-prompt {a.bg_prompt} + background output {a.bg_out} must fit --max-len {a.max_len}")
+    nbg = a.bg if a.bg >= 0 else background_count(kv_tokens, concurrent * a.win, a.bg_prompt + a.bg_out, max_seqs,
+                                                   concurrent)
+    if nbg == 0:
+        log("WARNING: no room for background requests: 'loaded' is not loaded" +
+            ("" if a.serial else " (try --serial)"))
     rng = np.random.default_rng(0)
     starts = rng.integers(0, len(train) - a.bg_prompt, nbg)
     bg = [train[s:s + a.bg_prompt] for s in starts]
@@ -94,17 +122,32 @@ def run_one(a):
         return arr
 
     log(f"alone: {n} x {a.win} tokens")
-    alone = nll_of(llm.generate([TokensPrompt(prompt_token_ids=w) for w in wins], sp_win, use_tqdm=False))
+    def lone():
+        if a.serial:
+            return nll_of([llm.generate([TokensPrompt(prompt_token_ids=w)], sp_win, use_tqdm=False)[0] for w in wins])
+        return nll_of(llm.generate([TokensPrompt(prompt_token_ids=w) for w in wins], sp_win, use_tqdm=False))
+
+    alone = lone()
     log(f"loaded: {nbg} background requests ({a.bg_prompt} + {a.bg_out} tokens) + the {n} windows "
         f"(KV {kv_tokens:,} tokens, max_num_seqs {max_seqs})")
-    prompts = [TokensPrompt(prompt_token_ids=p) for p in bg] + [TokensPrompt(prompt_token_ids=w) for w in wins]
-    outs = llm.generate(prompts, [sp_bg] * nbg + [sp_win] * n, use_tqdm=False)
-    loaded = nll_of(outs[nbg:])
+    bgp = [TokensPrompt(prompt_token_ids=p) for p in bg]
+    if a.serial:
+        outs = []
+        for j, w in enumerate(wins):
+            log(f"   window {j + 1}/{n}")
+            outs.append(llm.generate(bgp + [TokensPrompt(prompt_token_ids=w)], [sp_bg] * nbg + [sp_win],
+                                     use_tqdm=False)[nbg])
+        loaded = nll_of(outs)
+    else:
+        outs = llm.generate(bgp + [TokensPrompt(prompt_token_ids=w) for w in wins], [sp_bg] * nbg + [sp_win] * n,
+                            use_tqdm=False)
+        loaded = nll_of(outs[nbg:])
     log("alone again")
-    alone2 = nll_of(llm.generate([TokensPrompt(prompt_token_ids=w) for w in wins], sp_win, use_tqdm=False))
+    alone2 = lone()
     np.savez_compressed(os.path.join(out, f"{a.kv}.npz"), alone=alone, loaded=loaded, alone2=alone2)
     meta = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "kv_tokens": kv_tokens, "max_num_seqs": max_seqs,
-            "windows": n, "win": a.win, "background": nbg, "bg_prompt": a.bg_prompt, "bg_out": a.bg_out,
+            "windows": n, "win": a.win, "split": a.split, "serial": a.serial, "background": nbg,
+            "bg_prompt": a.bg_prompt, "bg_out": a.bg_out,
             "batched_tokens": a.batched_tokens, "mem": a.mem, "max_len": a.max_len,
             "env": {k: v for k, v in os.environ.items() if k.startswith(("KUSHKASH_", "VLLM_"))}}
     if a.kv.startswith("kush"):
@@ -157,7 +200,10 @@ def main():
     ap.add_argument("--win", type=int, default=2048)
     ap.add_argument("--bg", type=int, default=-1, help="background requests (-1: fill the KV cache, see docstring)")
     ap.add_argument("--bg-prompt", type=int, default=2048)
-    ap.add_argument("--bg-out", type=int, default=512)
+    ap.add_argument("--bg-out", type=int, default=-1, help="background output tokens (-1: 512, or sized for --serial)")
+    ap.add_argument("--split", default="test", choices=["test", "pg19"],
+                    help="window text: WikiText-2 test, or PG-19 test books (one window per book)")
+    ap.add_argument("--serial", action="store_true", help="loaded pass: one window at a time (long windows)")
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--mem", type=float, default=0.90)
     ap.add_argument("--batched-tokens", type=int, default=256,
@@ -175,7 +221,7 @@ def main():
     if a.batched_tokens >= a.win:
         ap.error(f"--batched-tokens {a.batched_tokens} must be smaller than --win {a.win}: a window scored in one chunk "
                  "attends only to itself and never reads the KV cache, so 'alone' would not test the format")
-    if a.bg_prompt + a.bg_out > a.max_len:
+    if a.bg_out >= 0 and a.bg_prompt + a.bg_out > a.max_len:
         ap.error("--bg-prompt + --bg-out must fit --max-len")
     if a.one:
         return run_one(a)
@@ -185,8 +231,8 @@ def main():
             log(f"{kv}: saved, skipped")
             continue
         cmd = [sys.executable, "-u", __file__, "--one", "--kv", kv] + [
-            x for k, v in vars(a).items() if k not in ("one", "kv", "report") and v is not None
-            for x in (f"--{k.replace('_', '-')}", str(v))]
+            x for k, v in vars(a).items() if k not in ("one", "kv", "report") and v is not None and v is not False
+            for x in ((f"--{k.replace('_', '-')}",) if v is True else (f"--{k.replace('_', '-')}", str(v)))]
         subprocess.run(cmd, check=True)
     print(report(a.out_dir, a.bootstrap))
 

@@ -6,6 +6,18 @@ reads the compressed cache directly, without unpacking it first. Prompts that co
 context, for the requests in the step only, into a workspace of bounded size. The kernels run on NVIDIA GPUs and on
 CPUs.
 
+**In short** (measured on Qwen2.5, Qwen3 and Llama-3.1, 7–8B models):
+
+- int4 holds 2.9–3.5x more tokens than a 16-bit cache (the higher end at long context lengths), for about 0.1%
+  higher perplexity; GSM8K accuracy unchanged.
+- That cost does not measurably grow up to 128k tokens. A fully loaded server moves it by about +0.01% at 128k,
+  within run-to-run noise ([quality](#4-quality-compared-with-vllms-cache-formats)).
+- Serving throughput 2.6x a 16-bit cache on an L4 and 2.2x on an RTX PRO 6000
+  ([throughput](#3-measured-serving-throughput)).
+- Not covered: hybrid, MLA and sliding-window models (refused), H100 / B200, tensor parallelism, models above 8B.
+  Outputs are not batch-invariant: the same prompt can give slightly different text on a busy server
+  ([limits](#14-limits-and-open-questions)).
+
 ## 1. The core idea
 
 - **Compression:** int4 stores a token in 3.46x less memory than a 16-bit cache, int8 in 1.86x less (the format
@@ -205,10 +217,10 @@ the same models at 2,048 tokens:
 
 Reproduce: [section 12](#reproduce-the-numbers-in-this-readme), item 9.
 
-### Under serving load (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31, kushkash 0.5.5)
+### Under serving load (vLLM 0.31, kushkash 0.5.5–0.5.6)
 
 Does perplexity change when the server is busy? `bench/ppl_load.py` scores the same 16 WikiText-2 windows of 2,048
-tokens twice: on an idle server, then while other requests fill the cache.
+tokens twice: on an idle server, then while other requests fill the cache (Qwen2.5-7B-Instruct, NVIDIA L4).
 
 |  | bf16 | kushkash int4 |
 |---|---|---|
@@ -228,7 +240,34 @@ Likely reason (not verified): vLLM feeds a long prompt in chunks, and where it c
 Keys in the current chunk are exact; earlier keys come from the 4-bit cache. Move the cut and some keys switch
 between exact and 4-bit.
 
-One model, one GPU, one run, about 30 minutes: `python bench/ppl_load.py --kv auto,kush4`.
+**At 128k** (Qwen2.5-7B-Instruct-1M, A100 40 GB): the same test on 8 PG-19 books of 130,000 tokens, each book scored
+on its own next to a full cache of other requests (255 for kushkash int4, 79 for bf16).
+
+|  | bf16 | kushkash int4 |
+|---|---|---|
+| Perplexity, idle | 9.2156 | 9.2245 |
+| Perplexity, busy | 9.2156 | 9.2257 |
+| Change [95% CI] | +0.00003 | +0.0012 [−0.0003, +0.0025] |
+| kushkash int4 vs bf16 | — | +0.10% idle, +0.11% busy |
+
+- Load adds about +0.01% to kushkash int4's +0.10%, and adds it evenly over the 130,000 tokens: nothing builds up
+  toward the end of the book. The interval includes 0. Single tokens move as at 2k (up to 2.08 nats).
+- **This missed the bar set before the run** (a change of at most 0.001). We picked 0.001 because at 2k, idle and
+  busy differed by only 0.0002, so anything five times that would have meant load really hurts. At 128k that bar
+  turned out to be smaller than the noise: two busy runs with identical settings differed by 0.0017 from each other.
+  We report the miss rather than move the bar afterwards.
+- **Why it ran twice.** In the first run, the idle pass scored all 8 books at once while the busy pass scored them
+  one by one. Books scored at once share each step's work, so each book was fed in smaller pieces, and smaller
+  pieces mean more keys come from the 4-bit cache (see above). That run compared two ways of cutting the books, not
+  idle against busy. The second run, shown here, scores one book at a time in both passes.
+
+One model per run, one run each; `--model` takes any model vLLM serves:
+
+```bash
+python bench/ppl_load.py --kv auto,kush4          # 2k, Qwen2.5-7B-Instruct, about 30 minutes on an L4
+python bench/ppl_load.py --model Qwen/Qwen2.5-7B-Instruct-1M --kv auto,kush4 --split pg19 --serial \
+    --win 130000 --max-len 131072 --batched-tokens 8192 --windows 8 --mem 0.85 --out-dir pplload_128k   # A100 40 GB
+```
 
 ## 5. How it works
 

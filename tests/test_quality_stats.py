@@ -317,3 +317,21 @@ def test_report_labels_pg19(tmp_path):
     _fake_run(tmp_path, "m/p", "kush4", nll * 1.01, top1, g, win=8, split="pg19")
     rep = q.report(str(tmp_path), 10)
     assert "(PG-19 test books)" in rep and "| kush4 |" in rep
+
+
+def test_ppl_load_serial(monkeypatch):
+    """--serial: background output outlasts prefilling the background and the window; flags reach the subprocess."""
+    import ppl_load as pl
+    # 255 background prompts of 2,048 tokens = 64 steps of 8,192; window 130,000 / (8,192 - 255) = 17 steps
+    assert pl.serial_bg_out(130000, 2048, 8192, 255) == 2 * (64 + 17) + 64
+    assert pl.serial_bg_out(2048, 2048, 256, 255) == 2 * (2040 + 32) + 64      # tiny budget: floor of 64 per step
+    seen = []
+    monkeypatch.setattr(pl.subprocess, "run", lambda cmd, check: seen.append(cmd))
+    monkeypatch.setattr(pl, "report", lambda d, b: "")
+    monkeypatch.setattr(sys, "argv", ["ppl_load.py", "--kv", "auto", "--serial", "--out-dir", "/nonexistent/x"])
+    pl.main()
+    assert "--serial" in seen[0] and "True" not in seen[0] and "--split" in seen[0]
+    monkeypatch.setattr(sys, "argv", ["ppl_load.py", "--kv", "auto", "--out-dir", "/nonexistent/x"])
+    seen.clear()
+    pl.main()
+    assert "--serial" not in seen[0] and "False" not in seen[0]
