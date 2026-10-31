@@ -335,3 +335,24 @@ def test_ppl_load_serial(monkeypatch):
     seen.clear()
     pl.main()
     assert "--serial" not in seen[0] and "False" not in seen[0]
+
+
+def test_compare_runs(tmp_path):
+    """--compare: per-token differences between two runs of the same windows."""
+    rng = np.random.default_rng(0)
+    nll = rng.uniform(1, 3, (6, 16)).astype(np.float32)
+    top1, g = np.zeros((6, 16), np.int32), np.ones(10, bool)
+    a, b = tmp_path / "a", tmp_path / "b"
+    _fake_run(a, "m/x", "auto", nll, top1, g)
+    _fake_run(b, "m/x", "auto", nll, top1, g)
+    moved, t2 = nll.copy(), top1.copy()
+    moved[:, ::2] += 0.01
+    t2[0, :4] = 1
+    _fake_run(a, "m/x", "kush4", nll, top1, g)
+    _fake_run(b, "m/x", "kush4", moved, t2, g)
+    _fake_run(b, "m/x", "fp8", nll[:, :8], top1[:, :8], g)
+    rep = q.compare_runs(str(a), str(b), 200)
+    line = {l.split("|")[1].strip(): l for l in rep.splitlines() if l.startswith("| ")}
+    assert "| 0.0% | 0.000 / 0.00 | 0.00% |" in line["auto"]
+    assert "| 50.0% | 0.005 / 0.01 | 4.17% |" in line["kush4"]
+    assert "fp8" not in line                                         # only in one run

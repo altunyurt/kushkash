@@ -15,7 +15,8 @@ CPUs.
 - Serving throughput 2.6x a 16-bit cache on an L4 and 2.2x on an RTX PRO 6000
   ([throughput](#3-measured-serving-throughput)).
 - Not covered: hybrid, MLA and sliding-window models (refused), H100 / B200, tensor parallelism, models above 8B.
-  Outputs are not batch-invariant: the same prompt can give slightly different text on a busy server
+  Outputs are not batch-invariant, with a 16-bit cache too: the same prompt can give slightly different text on a
+  busy server. kushkash int4 changes the model's top choice at about 1.7x as many positions
   ([limits](#14-limits-and-open-questions)).
 
 ## 1. The core idea
@@ -232,13 +233,25 @@ tokens twice: on an idle server, then while other requests fill the cache (Qwen2
 
 Perplexity is the same idle or busy, for both caches.
 
-Single tokens are a different story. With kushkash int4, almost every token's log-probability moves a little when
-the server is busy (0.036 nats on average, up to 1.51 on a single token), and the moves cancel out. In practice, the
-same prompt can get a slightly different answer from an idle server than from a busy one, even with greedy decoding.
+Single tokens are a different story, for both caches: in vLLM, a token's score depends on what else the server is
+doing. Two things move it. Each was measured on its own (same model and windows, one run each), and perplexity
+stayed the same every time:
 
-Likely reason (not verified): vLLM feeds a long prompt in chunks, and where it cuts depends on what else is running.
-Keys in the current chunk are exact; earlier keys come from the 4-bit cache. Move the cut and some keys switch
-between exact and 4-bit.
+| What changes | bf16 | kushkash int4 |
+|---|---|---|
+| Where prompts are cut (one other request running): tokens moved | 0.4%, mean 0.0001 nats | 90.3%, mean 0.032 nats |
+| Total tokens per step (224 instead of 256): tokens moved | 99.4%, mean 0.023 nats | 99.7%, mean 0.039 nats |
+| Total tokens per step: positions where the top choice changed | 1.2% | 2.0% |
+
+- **Where the cuts fall** matters only to kushkash: keys in the chunk being processed are read exact, earlier keys
+  come from the 4-bit cache, so moving a cut moves some keys between the two. bf16 reads the same stored keys
+  wherever the cut is. The busy test above (0.2% against 94.9%) shows this effect: other requests' tokens took part
+  of each step, so the prompt was fed in smaller chunks cut elsewhere, but every step still held 256 tokens in total.
+- **Total tokens per step** change the shapes of the matrix multiplications, and with them the rounding: every
+  cache is affected. A real server changes both as its load changes.
+- So the same prompt can get a slightly different greedy answer from an idle and a busy server even with a 16-bit
+  cache. kushkash int4 changes the top choice at about 1.7x as many positions (2.0% against 1.2%); a single token's
+  score moves by up to about 2 nats.
 
 **At 128k** (Qwen2.5-7B-Instruct-1M, A100 40 GB): the same test on 8 PG-19 books of 130,000 tokens, each book scored
 on its own next to a full cache of other requests (255 for kushkash int4, 79 for bf16).
@@ -265,6 +278,10 @@ One model per run, one run each; `--model` takes any model vLLM serves:
 
 ```bash
 python bench/ppl_load.py --kv auto,kush4          # 2k, Qwen2.5-7B-Instruct, about 30 minutes on an L4
+python bench/ppl_load.py --kv auto,kush4 --bg 1 --out-dir pplload_bg1     # cuts moved, steps still full
+for n in 256 224; do python bench/quality.py --models Qwen/Qwen2.5-7B-Instruct --kv auto,kush4 --gsm8k-n 0 \
+    --ppl-windows 32 --batched-tokens $n --out-dir q_c$n; done
+python bench/quality.py --compare q_c256 q_c224   # total tokens per step: per-token differences between the runs
 python bench/ppl_load.py --model Qwen/Qwen2.5-7B-Instruct-1M --kv auto,kush4 --split pg19 --serial \
     --win 130000 --max-len 131072 --batched-tokens 8192 --windows 8 --mem 0.85 --out-dir pplload_128k   # A100 40 GB
 ```
@@ -691,6 +708,7 @@ pytest tests/test_ragged.py             # runs anywhere: vLLM-style mixed batche
 pytest tests/test_vllm_backend_cpu.py   # needs vLLM importable: the vLLM backend driven on CPU
 pytest tests/test_sglang_backend_cpu.py # runs anywhere (SGLang stubbed): the SGLang backend's bookkeeping
 pytest tests/test_quality_stats.py tests/test_rivals_cpu.py tests/test_niah_cpu.py   # runs anywhere: benchmark statistics and reports
+pytest tests/test_smoke_models.py       # runs anywhere: smoke_models.py config check and verdicts
 pytest tests/test_steady_cpu.py         # needs vLLM importable: whole-wave throughput window, fake engine
 pytest tests/test_sglang_gpu.py -s     # NVIDIA GPU + SGLang: radix-cache prefixes that end mid-page
 pytest tests/test_gpu.py                # NVIDIA GPU: GPU vs CPU pages, decode vs reference, HF on GPU
@@ -760,8 +778,8 @@ workspace (vLLM: 64 to 512 MiB by default; Hugging Face and `KUSHKASH_PREFILL=lo
    each.**
 4. **kushkash int8's capacities** were measured with the old fixed workspace (current default: calculated, not
    measured).
-5. **GSM8K on Qwen3 varies between runs** more than its confidence intervals show. kushkash int4's per-token outputs
-   also depend on server load (section 4, "Under serving load"); perplexity does not.
+5. **GSM8K on Qwen3 varies between runs** more than its confidence intervals show. Per-token outputs depend on
+   server load with either cache, more with kushkash int4 (section 4, "Under serving load"); perplexity does not.
 6. **All performance numbers are GPU numbers.** The CPU kernels exist and match the GPU's pages, but no CPU
    performance is claimed.
 7. **Not measured yet:** contexts beyond 128k, long context on more than two model families, Llama models through

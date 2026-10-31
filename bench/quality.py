@@ -186,6 +186,33 @@ def load_runs(d: str) -> dict:
     return runs
 
 
+def compare_runs(d1: str, d2: str, B: int = 10000) -> str:
+    """Per-token differences between two runs of the same windows (e.g. --batched-tokens 256 vs 224), per model and
+    cache type: perplexity of each, Δ [95% CI, bootstrap over windows], tokens whose NLL changed, mean / max abs
+    change, positions where the top-1 token changed."""
+    import numpy as np
+    r1, r2, lines = load_runs(d1), load_runs(d2), []
+    for model in sorted(set(r1) & set(r2)):
+        lines += [f"## {model}: {d1} -> {d2}", "",
+                  "| kv | ppl | ppl | Δ [95% CI] | tokens changed | mean / max abs Δ NLL | top-1 changed |",
+                  "|---|---|---|---|---|---|---|"]
+        for kv in [k for k in r1[model] if k in r2[model]]:
+            a, b = r1[model][kv], r2[model][kv]
+            if "nll" not in a or "nll" not in b or a["nll"].shape != b["nll"].shape:
+                lines.append(f"| {kv} | not comparable (missing or different windows) | | | | | |")
+                continue
+            x, y = a["nll"].astype(np.float64), b["nll"].astype(np.float64)
+            d = y - x
+            p1, p2 = math.exp(x.mean()), math.exp(y.mean())
+            lo, hi = boot_mean_ci(d.mean(axis=1), B)
+            flips = f"{100 * (a['top1'] != b['top1']).mean():.2f}%" if "top1" in a and "top1" in b else "—"
+            lines.append(f"| {kv} | {p1:.4f} | {p2:.4f} | {p2 - p1:+.4f} [{p1 * (math.exp(lo) - 1):+.4f}, "
+                         f"{p1 * (math.exp(hi) - 1):+.4f}] | {100 * (d != 0).mean():.1f}% | "
+                         f"{np.abs(d).mean():.3f} / {np.abs(d).max():.2f} | {flips} |")
+        lines.append("")
+    return "\n".join(lines) if lines else f"no model in both {d1} and {d2}"
+
+
 GUARD_MIB = 64                     # other processes' growth during engine startup that marks a capacity as polluted
 
 
@@ -459,6 +486,8 @@ def main():
     ap.add_argument("--kv", default=",".join(KV_DEFAULT), help="comma list; auto is always run first")
     ap.add_argument("--out-dir", default="quality")
     ap.add_argument("--report", metavar="DIR", help="print the markdown report for DIR and exit (no GPU)")
+    ap.add_argument("--compare", nargs=2, metavar=("DIR1", "DIR2"),
+                    help="per-token differences between two runs of the same windows, then exit (no GPU)")
     ap.add_argument("--bootstrap", type=int, default=10000)
     ap.add_argument("--base", default="auto", help="report: the row every other row is compared with (paired)")
     ap.add_argument("--quantization", default=None, help="weights, e.g. fp8")
@@ -481,6 +510,9 @@ def main():
                  "output token)")
     if a.report:
         print(report(a.report, a.bootstrap, a.base))
+        return
+    if a.compare:
+        print(compare_runs(*a.compare, a.bootstrap))
         return
     if a.one:
         return run_one(a)
