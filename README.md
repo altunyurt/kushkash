@@ -717,6 +717,8 @@ python bench/bench_e2e.py --model Qwen/Qwen2.5-1.5B-Instruct --batch 4 --prompt 
 python bench/bench_decode.py                           # decode kernel time (optionally vs FlashInfer)
 python bench/bench_decode.py --shape 128,4096 --only kush4 --profile   # one shape; --profile for Nsight Compute
 python bench/ppl_load.py --kv auto,kush4             # perplexity alone vs under serving load (same windows)
+python bench/smoke_models.py --check-only            # which models kushkash would refuse, from config.json (no GPU)
+python bench/smoke_models.py --delete-after          # does each model start and answer sanely with kushkash int4
 ```
 
 In `vllm_compare.py`, `--kv` takes vLLM's own `kv_cache_dtype` values (such as `auto` or `fp8`) and `kush4` /
