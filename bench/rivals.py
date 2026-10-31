@@ -18,6 +18,11 @@ apart from a slow format.
 
 Reported per format: median output tokens/s over the repeats, its range, and the median of the per-repeat ratios
 to the first format (paired within a repeat). Everything is measured except the ratios.
+
+Format check: after the capacity pass, a kushkash row must hold at least 2x (kush4) / 1.2x (kush8) the tokens of the
+`auto` row, or the run stops: a backend that silently fell back to vLLM's own cache would otherwise produce a
+throughput table near 1.0x and exit 0 (lowest measured so far: kush4 2.86x, kush8 1.33x with the old workspace, both
+Qwen3-8B on an L4, README section 4). Without an `auto` row there is nothing to compare: a warning, no stop.
 """
 import argparse
 import json
@@ -108,6 +113,23 @@ def compare(args: list[str], tmp: str) -> list[dict]:
     return load(tmp)
 
 
+MIN_RATIO = {"kush4": 2.0, "kush8": 1.2}           # vs auto's KV tokens: below this the format is not really on
+
+
+def format_check(cap: dict) -> list:
+    """Problems with the capacity pass: kushkash rows that hold too few tokens against `auto` (see module doc)."""
+    base = (cap.get("auto") or {}).get("kv_tokens")
+    if not base and any(kv in MIN_RATIO for kv in cap):
+        print("WARNING: no auto capacity row: cannot check that the kushkash backend is on", flush=True)
+    bad = []
+    for kv, r in cap.items():
+        need, got = MIN_RATIO.get(kv), r.get("kv_tokens")
+        if need and base and got and got < need * base:
+            bad.append(f"{kv} holds {got / base:.2f}x the tokens of auto (expected >= {need}x): is the kushkash "
+                       "backend really on?")
+    return bad
+
+
 def queue_len(seqs: int) -> int:
     """Requests queued per run: the cache's worth plus enough to keep it full for the whole window. A 300 s window
     on a 96 GB GPU completes ~1.5x max_num_seqs requests (RTX PRO 6000, 2026-10-26: 1,024 drained at 460)."""
@@ -125,6 +147,9 @@ def run():
                 r.update(phase="capacity", mem=ARGS.mem)
                 append(out, r)
                 cap[kv] = r
+    bad = format_check(cap)
+    if bad:
+        sys.exit("format check failed, no throughput runs:\n  " + "\n  ".join(bad))
     seqs = {kv: max(1, cap[kv]["kv_tokens"] // SEQ) for kv in kvs}
     print("max_num_seqs per format (KV tokens // 4,096): " + ", ".join(f"{k} {v}" for k, v in seqs.items()), flush=True)
     have = {(r["kv"], r["rep"]) for r in done if r.get("phase") == "throughput"}
@@ -193,6 +218,8 @@ def summarize(path):
     if drained:
         print("- WARNING: mean requests in flight < 95% of max_num_seqs (queue ran low, tok/s understated): "
               + ", ".join(f"{r['kv']} rep {r['rep']} ({r['mean_running']:.0f} of {r['max_num_seqs']})" for r in drained))
+    for b in format_check(cap):
+        print(f"- WARNING: {b}")
     partial = [r for r in tp if r.get("whole_waves") is False]
     if partial:
         print("- WARNING: window not closed at a wave boundary: " + ", ".join(f"{r['kv']} rep {r['rep']}" for r in partial))

@@ -352,7 +352,60 @@ def test_compare_runs(tmp_path):
     _fake_run(b, "m/x", "kush4", moved, t2, g)
     _fake_run(b, "m/x", "fp8", nll[:, :8], top1[:, :8], g)
     rep = q.compare_runs(str(a), str(b), 200)
-    line = {l.split("|")[1].strip(): l for l in rep.splitlines() if l.startswith("| ")}
+    line = {}
+    for l in rep.splitlines():                                       # first table: perplexity
+        if l.startswith("| "):
+            line.setdefault(l.split("|")[1].strip(), l)
     assert "| 0.0% | 0.000 / 0.00 | 0.00% |" in line["auto"]
     assert "| 50.0% | 0.005 / 0.01 | 4.17% |" in line["kush4"]
     assert "fp8" not in line                                         # only in one run
+
+
+def test_compare_runs_gsm8k(tmp_path):
+    """--compare on GSM8K-only runs (--ppl-windows 0): answer text / number changes and right <-> wrong flips."""
+    import gzip
+    a, b = tmp_path / "a", tmp_path / "b"
+    ok1 = np.array([True] * 6 + [False] * 4)
+    ok2 = ok1.copy()
+    ok2[0], ok2[1] = False, False                                     # two right -> wrong, none wrong -> right
+    for d, ok in ((a, ok1), (b, ok2)):
+        md = os.path.join(d, q.slug("m/x"))
+        os.makedirs(md)
+        np.savez_compressed(os.path.join(md, "kush4.npz"), gsm8k=ok)
+        json.dump({"model": "m/x", "kv": "kush4", "ppl": None, "ppl_windows": 0, "gsm8k_n": 10, "vllm": "t"},
+                  open(os.path.join(md, "kush4.json"), "w"))
+        recs = [{"i": i, "pred": float(i if ok[i] or d == a else -1),
+                 "text": f"t{i}" + ("x" if d == b and i < 3 else "")} for i in range(10)]
+        with gzip.open(os.path.join(md, "kush4.gsm8k.jsonl.gz"), "wt") as f:      # one run reversed: pairing must
+            f.writelines(json.dumps(r) + "\n" for r in (reversed(recs) if d == b else recs))   # go by index
+    rep = q.compare_runs(str(a), str(b), 200)
+    row = next(l for l in rep.splitlines() if l.startswith("| kush4 "))
+    assert "| 60.00 | 40.00 | 3 / 10 (30.0%) |" in row and "| 2 / 0 |" in row
+    assert "tokens changed" not in rep                                  # no perplexity table without nll
+
+
+def test_gsm8k_skip_and_ppl_off_header(tmp_path):
+    """--ppl-windows 0: GSM8K still runs (ppl None is not a reason to skip); the report says 'ppl off'."""
+    assert q.gsm8k_skip(400, None, 50.0) is None
+    assert q.gsm8k_skip(0, None, 50.0) == "off"
+    assert q.gsm8k_skip(400, 180.0, 50.0) == "skipped: ppl > 50"
+    assert q.gsm8k_skip(400, 7.5, 50.0) is None
+    g = np.array([True, False, True])
+    for kv in ("auto", "kush4"):
+        md = os.path.join(tmp_path, q.slug("m/x"))
+        os.makedirs(md, exist_ok=True)
+        np.savez_compressed(os.path.join(md, kv + ".npz"), gsm8k=g)
+        json.dump({"model": "m/x", "kv": kv, "ppl": None, "ppl_windows": 0, "win": 2048, "gsm8k_n": 3, "vllm": "t"},
+                  open(os.path.join(md, kv + ".json"), "w"))
+    rep = q.report(str(tmp_path), 50)
+    assert "ppl off" in rep and "ppl 0 x" not in rep and "| kush4 |" in rep
+
+
+def test_report_header_old_run_without_ppl_windows(tmp_path):
+    """Runs saved before ppl_windows was recorded: '?' windows, never 'None' and never 'ppl off'."""
+    g = np.array([True, False])
+    nll, top1 = np.ones((2, 4), np.float32), np.zeros((2, 4), np.int32)
+    for kv in ("auto", "kush4"):
+        _fake_run(tmp_path, "m/o", kv, nll, top1, g, ppl_windows=None)
+    rep = q.report(str(tmp_path), 50)
+    assert "ppl ? x 9 tokens" in rep and "None" not in rep.split("\n")[1] and "ppl off" not in rep

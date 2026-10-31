@@ -10,6 +10,10 @@ Times the installed kushkash (pip install ".[vllm]" per ref; an editable install
 Decode steps never use the prompt workspace, so only prefill rows that continue earlier context are timed.
 Prints ms per layer call (median of --iters, CUDA events), the same x --layers per step, and the number of packed
 groups the step was split into (more groups = workspace too small for the step's history).
+
+Before timing, every step's packed output is checked against the per-row loop path (KUSHKASH_PREFILL=loop, PyTorch
+unpacking) on the same cache state: a packed path that is fast but wrong fails here (relative error > --tol) instead
+of reporting a speed-up.
 """
 import argparse
 import os
@@ -24,6 +28,7 @@ ap.add_argument("--bits", type=int, default=4)
 ap.add_argument("--iters", type=int, default=100)
 ap.add_argument("--layers", type=int, default=28)
 ap.add_argument("--max-len", type=int, default=17408, help="max_model_len (sizes the auto workspace)")
+ap.add_argument("--tol", type=float, default=2e-2, help="max relative error, packed vs loop output (norm ratio)")
 a = ap.parse_args()
 os.environ["KUSHKASH_BITS"] = str(a.bits)
 os.environ.setdefault("KUSHKASH_PREFILL", "packed")
@@ -59,6 +64,10 @@ impl = kb.KushAttentionImpl(H * G, D, D ** -0.5, num_kv_heads=H)
 if not cuda:
     impl.fa_version = None
 builder = kb.KushMetadataBuilder(SimpleNamespace(num_kv_heads=H, head_size=D), ["l0"], cfg, dev)
+_mode = os.environ["KUSHKASH_PREFILL"]
+os.environ["KUSHKASH_PREFILL"] = "loop"              # reference: the per-row loop path, same impl and cache
+ref_builder = kb.KushMetadataBuilder(SimpleNamespace(num_kv_heads=H, head_size=D), ["l0"], cfg, dev)
+os.environ["KUSHKASH_PREFILL"] = _mode
 
 g = torch.Generator(device="cpu").manual_seed(0)
 pages = MAX_LEN // PAGE
@@ -120,7 +129,22 @@ for name, rows in STEPS.items():
         continue
     md = builder.build(0, cam(rows))                 # metadata once per step, as in vLLM (shared by layers)
     groups = len(getattr(md, "packs", None) or [])
-    tail = impl.tail_k.clone()
+    tail, kv0 = impl.tail_k.clone(), kv.clone()      # forward writes pages and the K tail: restore before each run
+    if groups:
+        res = {}
+        for tag, m in (("loop", ref_builder.build(0, cam(rows))), ("packed", md)):
+            impl.tail_k.copy_(tail)
+            kv.copy_(kv0)
+            o = torch.empty_like(out[:n_tok])
+            impl.forward(None, q[:n_tok], k[:n_tok], v[:n_tok], kv, m, output=o)
+            res[tag] = o.float()
+        kv.copy_(kv0)
+        err = float((res["packed"] - res["loop"]).norm() / res["loop"].norm())
+        if not err <= a.tol:
+            raise SystemExit(f"  {name}: packed output differs from the loop path (relative error {err:.2e} > "
+                             f"{a.tol:g}): not timing a wrong kernel")
+    else:
+        err = None
     times = []
     for i in range(a.iters + 5):
         impl.tail_k.copy_(tail)                      # same state every call (the write mutates the K tail)
@@ -136,6 +160,8 @@ for name, rows in STEPS.items():
     if cuda:
         ms = statistics.median(times)
         print(f"  {name:34s} {n_tok:5d} tok  {groups} groups  {ms:7.3f} ms/layer  {ms * a.layers:7.1f} ms/step "
-              f"(p10 {np.percentile(times, 10):.3f}, p90 {np.percentile(times, 90):.3f})")
+              f"(p10 {np.percentile(times, 10):.3f}, p90 {np.percentile(times, 90):.3f})"
+              + (f"  vs loop {err:.1e}" if err is not None else ""))
     else:
-        print(f"  {name:34s} {n_tok:5d} tok  ran ({groups} packed groups)")
+        print(f"  {name:34s} {n_tok:5d} tok  ran ({groups} packed groups)"
+              + (f", vs loop {err:.1e}" if err is not None else ""))

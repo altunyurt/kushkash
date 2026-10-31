@@ -136,3 +136,26 @@ def test_summary_uses_throughput_run_capacity(tmp_path, capsys):
     assert "| 1,923,712 | 3.39x | 463 | 4,993.2 |" in line["kush4"]
     assert "| 2,124,800 | 3.74x | 520 | 3,080.6 |" in line["int4_per_token_head"]
     assert "| 2.22x |" in line["kush4"] and "WARNING" not in out
+
+
+def test_format_check_stops_a_fallen_back_backend(stub, monkeypatch, capsys):
+    """A kushkash row that holds about as many tokens as auto (backend silently not on) stops the run before any
+    throughput is measured; healthy ratios pass."""
+    out, calls = stub
+    assert rv.format_check({"auto": {"kv_tokens": 1000}, "kush4": {"kv_tokens": 2860},
+                            "kush8": {"kv_tokens": 1330}}) == []              # README: kush8 1.33x on Qwen3-8B
+    assert len(rv.format_check({"auto": {"kv_tokens": 1000}, "kush8": {"kv_tokens": 1000}})) == 1
+    assert len(rv.format_check({"auto": {"kv_tokens": 1000}, "kush4": {"kv_tokens": 1010}})) == 1
+    assert rv.format_check({"kush4": {"kv_tokens": 1000}}) == []                 # no auto row: warn, do not stop
+    assert "no auto capacity row" in capsys.readouterr().out
+    real = rv.compare
+
+    def fallen_back(args, tmp):
+        rows = real(args, tmp)
+        if "--capacity-only" in args and rows[0]["kv"] == "kush4":
+            rows[0]["kv_tokens"] = 28544                                         # same as auto
+        return rows
+    monkeypatch.setattr(rv, "compare", fallen_back)
+    with pytest.raises(SystemExit, match="kush4 holds 1.00x"):
+        rv.run()
+    assert not any("@" in c for c in calls)                                      # no throughput run started

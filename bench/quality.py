@@ -187,16 +187,19 @@ def load_runs(d: str) -> dict:
 
 
 def compare_runs(d1: str, d2: str, B: int = 10000) -> str:
-    """Per-token differences between two runs of the same windows (e.g. --batched-tokens 256 vs 224), per model and
-    cache type: perplexity of each, Δ [95% CI, bootstrap over windows], tokens whose NLL changed, mean / max abs
-    change, positions where the top-1 token changed."""
+    """Differences between two runs of the same inputs (e.g. --batched-tokens 256 vs 224), per model and cache type.
+    Perplexity: ppl of each, Δ [95% CI, bootstrap over windows], tokens whose NLL changed, mean / max abs change,
+    positions where the top-1 token changed. GSM8K: accuracy of each, answers whose text / final number changed,
+    right -> wrong and wrong -> right counts with an exact McNemar p."""
     import numpy as np
     r1, r2, lines = load_runs(d1), load_runs(d2), []
     for model in sorted(set(r1) & set(r2)):
-        lines += [f"## {model}: {d1} -> {d2}", "",
-                  "| kv | ppl | ppl | Δ [95% CI] | tokens changed | mean / max abs Δ NLL | top-1 changed |",
-                  "|---|---|---|---|---|---|---|"]
-        for kv in [k for k in r1[model] if k in r2[model]]:
+        lines += [f"## {model}: {d1} -> {d2}", ""]
+        p = [kv for kv in r1[model] if kv in r2[model] and ("nll" in r1[model][kv] or "nll" in r2[model][kv])]
+        if p:
+            lines += ["| kv | ppl | ppl | Δ [95% CI] | tokens changed | mean / max abs Δ NLL | top-1 changed |",
+                      "|---|---|---|---|---|---|---|"]
+        for kv in p:
             a, b = r1[model][kv], r2[model][kv]
             if "nll" not in a or "nll" not in b or a["nll"].shape != b["nll"].shape:
                 lines.append(f"| {kv} | not comparable (missing or different windows) | | | | | |")
@@ -210,7 +213,35 @@ def compare_runs(d1: str, d2: str, B: int = 10000) -> str:
                          f"{p1 * (math.exp(hi) - 1):+.4f}] | {100 * (d != 0).mean():.1f}% | "
                          f"{np.abs(d).mean():.3f} / {np.abs(d).max():.2f} | {flips} |")
         lines.append("")
+        g = [kv for kv in r1[model] if kv in r2[model] and "gsm8k" in r1[model][kv] and "gsm8k" in r2[model][kv]]
+        if g:
+            lines += ["| kv | GSM8K % | GSM8K % | answers whose text changed | final number changed | "
+                      "right -> wrong / wrong -> right | McNemar p |", "|---|---|---|---|---|---|---|"]
+        for kv in g:
+            t1, t2 = (_gsm8k_records(d, model, kv) for d in (d1, d2))
+            x, y = r1[model][kv]["gsm8k"].astype(bool), r2[model][kv]["gsm8k"].astype(bool)
+            n = min(len(x), len(y))
+            x, y = x[:n], y[:n]
+            b, c = int((x & ~y).sum()), int((~x & y).sum())
+            if t1 and t2 and len(t1) >= n and len(t2) >= n:
+                text = sum(t1[i]["text"] != t2[i]["text"] for i in range(n))
+                pred = sum(t1[i]["pred"] != t2[i]["pred"] for i in range(n))
+                txt, prd = f"{text} / {n} ({100 * text / n:.1f}%)", f"{pred} ({100 * pred / n:.1f}%)"
+            else:
+                txt = prd = "— (no saved answers)"
+            lines.append(f"| {kv} | {100 * x.mean():.2f} | {100 * y.mean():.2f} | {txt} | {prd} | {b} / {c} | "
+                         f"{mcnemar_exact(b, c):.3g} |")
+        if g:
+            lines.append("")
     return "\n".join(lines) if lines else f"no model in both {d1} and {d2}"
+
+
+def _gsm8k_records(d: str, model: str, kv: str) -> list:
+    p = os.path.join(d, slug(model), kv + ".gsm8k.jsonl.gz")
+    if not os.path.exists(p):
+        return []
+    with gzip.open(p, "rt") as f:
+        return sorted((json.loads(l) for l in f), key=lambda r: r["i"])
 
 
 GUARD_MIB = 64                     # other processes' growth during engine startup that marks a capacity as polluted
@@ -293,8 +324,10 @@ def report(d: str, B: int = 10000, base_kv: str = "auto") -> str:
             (r["meta"].get("split") is not None and bs is not None and r["meta"]["split"] != bs)))
         order = [k for k in KV_DEFAULT if k in rows and k not in off] + \
                 sorted(k for k in rows if k not in KV_DEFAULT and k not in off)
+        pw = bm.get("ppl_windows")
+        ppl_desc = "ppl off" if pw == 0 else f"ppl {pw if pw is not None else '?'} x {bm.get('win')} tokens"
         lines += [f"## {model}", f"vLLM {bm.get('vllm')}, weights {bm.get('quantization') or 'checkpoint dtype'}, "
-                  f"ppl {bm.get('ppl_windows')} x {bm.get('win')} tokens"
+                  + ppl_desc
                   + {"test": "", "pg19": " (PG-19 test books)"}.get(bm.get("split", "test"), f" ({bm.get('split')} split)") +
                   f", GSM8K n={bm.get('gsm8k_n')}, bootstrap B={B}", "",
                   f"| kv | KV tokens | x {base_kv} | ppl | Δppl vs {base_kv} [95% CI] | Δppl last ¼ | top-1 agree | "
@@ -375,6 +408,15 @@ def book_windows(books, win: int, n: int) -> list:
     return [b[:win] for b in books if len(b) >= win][:n]
 
 
+def gsm8k_skip(gsm8k_n: int, ppl: float | None, limit: float) -> str | None:
+    """Why GSM8K is not run, or None. ppl is None when perplexity was off (--ppl-windows 0): never a reason to skip."""
+    if gsm8k_n == 0:
+        return "off"
+    if ppl is not None and ppl > limit:
+        return f"skipped: ppl > {limit:g}"
+    return None
+
+
 def ppl_windows(tok, split: str, win: int, n: int) -> list:
     from datasets import load_dataset
     if split == "pg19":
@@ -424,13 +466,13 @@ def run_one(a):
     arrays = {}
 
     # 1. perplexity, per token
-    windows = ppl_windows(tok, a.split, a.win, a.ppl_windows)
+    windows = ppl_windows(tok, a.split, a.win, a.ppl_windows) if a.ppl_windows else []
     n = len(windows)
-    if n == 0:
+    if n == 0 and a.ppl_windows:
         raise SystemExit(f"no {a.split} text of {a.win} tokens")
     nll = np.zeros((n, a.win - 1), np.float32)
     top1 = np.zeros((n, a.win - 1), np.int32)
-    log(f"1/2 perplexity: {n} x {a.win} tokens, prefill chunks of {a.batched_tokens}")
+    log(f"1/2 perplexity: {n} x {a.win} tokens, prefill chunks of {a.batched_tokens}" if n else "1/2 perplexity: off")
     for s in range(0, n, 16):                         # 16 windows per call keeps prompt-logprob objects small
         wins = windows[s:s + 16]
         outs = llm.generate([TokensPrompt(prompt_token_ids=w) for w in wins],
@@ -441,16 +483,19 @@ def run_one(a):
                 d = pl[i]
                 nll[s + j, i - 1] = -d[w[i]].logprob
                 top1[s + j, i - 1] = max(d, key=lambda t: d[t].logprob)   # top-1 (rank-independent)
-    arrays.update(nll=nll, top1=top1)
-    meta.update(ppl=round(math.exp(float(nll.astype(np.float64).mean())), 4), ppl_windows=n)
-    log(f"   ppl = {meta['ppl']}")
+    if n:
+        arrays.update(nll=nll, top1=top1)
+        meta.update(ppl=round(math.exp(float(nll.astype(np.float64).mean())), 4), ppl_windows=n)
+        log(f"   ppl = {meta['ppl']}")
+    else:
+        meta.update(ppl=None, ppl_windows=0)
 
     # 2. GSM8K, zero-shot CoT, greedy
-    if a.gsm8k_n == 0:
-        meta["gsm8k_skipped"] = "off"
-    elif meta["ppl"] > a.skip_gsm8k_ppl:
-        meta["gsm8k_skipped"] = f"skipped: ppl > {a.skip_gsm8k_ppl:g}"
-        log(f"2/2 GSM8K {meta['gsm8k_skipped']}")
+    skip = gsm8k_skip(a.gsm8k_n, meta["ppl"], a.skip_gsm8k_ppl)
+    if skip:
+        meta["gsm8k_skipped"] = skip
+        if skip != "off":
+            log(f"2/2 GSM8K {skip}")
     else:
         ds = load_dataset("openai/gsm8k", "main", split="test")
         m = len(ds) if a.gsm8k_n < 0 else min(a.gsm8k_n, len(ds))
@@ -498,7 +543,7 @@ def main():
     ap.add_argument("--split", default="test", choices=["test", "train", "pg19"],
                     help="perplexity text: WikiText-2 test (~300k tokens, 2 windows at --win 130000) or train (~2M, "
                          "~16 windows at 130000); pg19 = PG-19 test books, one window per book (see top)")
-    ap.add_argument("--ppl-windows", type=int, default=128)
+    ap.add_argument("--ppl-windows", type=int, default=128, help="0 = perplexity off")
     ap.add_argument("--gsm8k-n", type=int, default=-1, help="-1 = all 1,319, 0 = off")
     ap.add_argument("--gsm8k-tokens", type=int, default=1024)
     ap.add_argument("--skip-gsm8k-ppl", type=float, default=50.0, help="skip GSM8K for collapsed formats")

@@ -51,6 +51,25 @@ def fit_cap(kv_tokens, seq_len):
     return max(1, kv_tokens // seq_len)
 
 
+MIN_RATIO = {"kush4": 2.0, "kush8": 1.2}           # vs auto's KV tokens at the same pinned budget
+
+
+def format_check(acc: dict) -> list:
+    """Problems with the capacity rows: a kushkash row that holds too few tokens against `auto` means the backend is
+    not compressing (it fell back to vLLM's own cache), and every ratio in the table would be ~1.0x for that reason.
+    Lowest measured: 2.86x (kush4, Qwen3-8B) and 1.33x (kush8, Qwen3-8B)."""
+    base = (acc.get("auto") or {}).get("kv_tokens")
+    if not base and any(kv in MIN_RATIO for kv in acc):
+        print("WARNING: no auto capacity row: cannot check that the kushkash backend is on", flush=True)
+    bad = []
+    for kv, r in acc.items():
+        need, got = MIN_RATIO.get(kv), r.get("kv_tokens")
+        if need and base and got and got < need * base:
+            bad.append(f"{kv} holds {got / base:.2f}x the tokens of auto (expected >= {need}x): is the kushkash "
+                       "backend really on?")
+    return bad
+
+
 def summarize(path, seq_len=4096):
     rows = load(path)
     acc = {r["kv"]: r for r in rows if r.get("phase") == "accuracy"}
@@ -72,6 +91,8 @@ def summarize(path, seq_len=4096):
              if len({r.get(k) for r in rows}) > 1]   # e.g. --reuse-accuracy from another run
     if mixed:
         print(f"WARNING: rows come from mixed runs: {'; '.join(mixed)}\n")
+    for b in format_check({k: r for k, r in acc.items() if "@" not in k}):
+        print(f"WARNING: {b}")
 
     def ratio(a, b, fmt="{:.2f}x"):
         return fmt.format(a / b) if a and b else ""
@@ -162,6 +183,9 @@ def main():
         run(["--kv", "auto,kush4,kush8", "--no-throughput"] + (["--quick"] if ARGS.quick else []) + budget, out)
         tag(out, "accuracy", meta)
     acc = {r["kv"]: r for r in load(out)}
+    bad = format_check({k: r for k, r in acc.items() if "@" not in k})
+    if bad:                                 # the cache is not compressed: do not spend 30+ minutes timing it
+        sys.exit("format check failed, no throughput runs:\n  " + "\n  ".join(bad))
     # pinned budget: capacity does not move with max_num_seqs, so the caps come straight from the capacity runs.
     # vLLM default gets both its default and the fitted max_num_seqs (best one counts); kushkash only the fitted one,
     # which won in every run so far (--sweep adds kush4 at the default and at cap+8 to re-check that)

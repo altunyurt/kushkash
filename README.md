@@ -706,8 +706,10 @@ Results that differ from the README's, or come from other GPUs and models, are w
 pytest tests/test_cpu.py                # runs anywhere: format, kernels vs a reference, HF generation (tiny models)
 pytest tests/test_ragged.py             # runs anywhere: vLLM-style mixed batches against ground truth
 pytest tests/test_vllm_backend_cpu.py   # needs vLLM importable: the vLLM backend driven on CPU
+pytest tests/test_packed_microbench_cpu.py   # needs vLLM importable: packed_microbench's correctness gate
 pytest tests/test_sglang_backend_cpu.py # runs anywhere (SGLang stubbed): the SGLang backend's bookkeeping
 pytest tests/test_quality_stats.py tests/test_rivals_cpu.py tests/test_niah_cpu.py   # runs anywhere: benchmark statistics and reports
+pytest tests/test_headline_cpu.py       # runs anywhere: headline.py's capacity format gate
 pytest tests/test_smoke_models.py       # runs anywhere: smoke_models.py config check and verdicts
 pytest tests/test_steady_cpu.py         # needs vLLM importable: whole-wave throughput window, fake engine
 pytest tests/test_sglang_gpu.py -s     # NVIDIA GPU + SGLang: radix-cache prefixes that end mid-page
