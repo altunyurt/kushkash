@@ -739,6 +739,8 @@ python bench/bench_decode.py --shape 128,4096 --only kush4 --profile   # one sha
 python bench/ppl_load.py --kv auto,kush4             # perplexity alone vs under serving load (same windows)
 python bench/smoke_models.py --check-only            # which models kushkash would refuse, from config.json (no GPU)
 python bench/smoke_models.py --delete-after          # does each model start and answer sanely with kushkash int4
+python bench/smoke_models.py --top 100 --check-only --out-dir top100   # the Hub's 100 most downloaded, by architecture
+python bench/smoke_models.py --top 50 --hub-filter awq --check-only --group arch+weights --out-dir top_awq
 ```
 
 In `vllm_compare.py`, `--kv` takes vLLM's own `kv_cache_dtype` values (such as `auto` or `fp8`) and `kush4` /

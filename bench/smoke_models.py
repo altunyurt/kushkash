@@ -22,6 +22,27 @@ Per model:
   python bench/smoke_models.py                                    # default list (sized for a 24 GB GPU)
   python bench/smoke_models.py --models Qwen/Qwen2.5-3B-Instruct,unsloth/Llama-3.2-3B-Instruct --delete-after
   python bench/smoke_models.py --report smoke                     # the table again
+  python bench/smoke_models.py --top 100 --check-only --out-dir top100        # 100 most downloaded text-generation
+  python bench/smoke_models.py --top 50 --sort trending_score --check-only --out-dir trending
+  python bench/smoke_models.py --top 100 --one-per-arch --min-params 1e9 --max-params 9e9 --out-dir top100 \
+      --skip-weights modelopt --skip-predicted-refusals --delete-after
+                                                                  # then smoke-run one model per architecture
+
+--top N takes the first N text-generation models on the Hugging Face Hub, by downloads unless --sort says otherwise
+(any order huggingface_hub's list_models supports: downloads, likes, trending_score, created_at, last_modified);
+rank, downloads, gated flag and parameter count are recorded. Gated repos need HF_TOKEN and an accepted license,
+or their config is not readable. --one-per-arch starts vLLM only for the highest-ranked model (in the --sort order)
+of each model_type that is predicted to run and has at most --max-params parameters (unknown size: skipped). The
+report ends with a per-architecture table: what the config check predicts for every model of that type, and the
+smoke verdict of the one that ran.
+
+Weight formats: every model is tagged bf16 / fp16 / fp32, a quantization method from its config (awq, gptq, fp8,
+bitsandbytes, compressed-tensors, ...) or gguf (the Hub's GGUF metadata; its architecture comes from there).
+--weights awq,gptq keeps only those formats; --hub-filter TAG narrows the Hub listing itself (e.g. awq, gptq, gguf),
+so --top 50 --hub-filter awq is the 50 most downloaded AWQ repos. --group arch+weights makes --one-per-arch and the
+summary table split each architecture by weight format. GGUF repos have no config.json and are not started (vLLM
+needs the base model's tokenizer and config for them): they are listed with their architecture only. The KV cache
+format does not depend on the weight format; what differs is the compute dtype and whether vLLM loads the weights.
 
 Resumable: a (model, kv) with a saved result is skipped. --delete-after removes each model from the Hugging Face
 cache once both runs are done (disk fills quickly with many models).
@@ -62,9 +83,10 @@ def config_check(cfg: dict) -> dict:
     """Predict from config.json whether kushkash starts. Returns {"refused": [reasons], "notes": [...], "kernel"}."""
     c = dict(cfg.get("text_config") or {}) or cfg
     mt = (c.get("model_type") or cfg.get("model_type") or "").lower()
-    heads = c.get("num_attention_heads")
-    kv = c.get("num_key_value_heads") or heads
-    D = c.get("head_dim") or (c["hidden_size"] // heads if heads and c.get("hidden_size") else None)
+    heads = c.get("num_attention_heads") or c.get("n_head") or c.get("num_heads")       # GPT-2 / BLOOM names
+    hidden = c.get("hidden_size") or c.get("n_embd") or c.get("n_embed") or c.get("d_model")
+    kv = c.get("num_key_value_heads") or (1 if c.get("multi_query") else None) or heads
+    D = c.get("head_dim") or (hidden // heads if heads and hidden else None)
     refused, notes = [], []
     if D not in (64, 128, 256):
         refused.append(f"head size {D}")
@@ -94,7 +116,138 @@ def config_check(cfg: dict) -> dict:
         notes.append(f"weights: {cfg['quantization_config'].get('quant_method', '?')}")
     G = heads // kv if heads and kv else None
     kernel = ("tensor cores (sm_80+)" if D in (128, 256) and G and G <= 8 else "CUDA cores") if D else "?"
-    return {"refused": refused, "notes": notes, "kernel": kernel, "head_size": D, "group": G, "model_type": mt}
+    w = weights_of(cfg)
+    if w.startswith("mlx"):
+        notes.append("MLX weights: vLLM cannot load them")
+    return {"refused": refused, "notes": notes, "kernel": kernel, "head_size": D, "group": G, "model_type": mt,
+            "weights": w, "params_cfg": estimate_params(c, heads, kv, D, hidden)}
+
+
+def estimate_params(c: dict, heads, kv, D, hidden) -> int | None:
+    """Rough parameter count from the config (attention, MLP or all experts, embeddings). A guard for --max-params:
+    the Hub's own count is sometimes far off (e.g. a 35B repo listed with 0.7M parameters)."""
+    L = c.get("num_hidden_layers") or c.get("n_layer") or c.get("num_layers")
+    V = c.get("vocab_size")
+    if not (L and hidden and heads and D and V):
+        return None
+    attn = 2 * hidden * heads * D + 2 * hidden * (kv or heads) * D
+    experts = c.get("num_experts") or c.get("n_routed_experts") or c.get("num_local_experts") or 0
+    if experts:
+        ffn = c.get("moe_intermediate_size") or c.get("intermediate_size") or 4 * hidden
+        mlp = 3 * hidden * ffn * (experts + (c.get("n_shared_experts") or 0))
+    else:
+        mlp = 3 * hidden * (c.get("intermediate_size") or c.get("n_inner") or 4 * hidden)
+    emb = V * hidden * (1 if c.get("tie_word_embeddings", True) else 2)
+    return int(L * (attn + mlp) + emb)
+
+
+def hub_sorts() -> list:
+    """Orders huggingface_hub's list_models accepts (its ModelSort_T), or a fixed list on versions without it."""
+    try:
+        import typing
+        from huggingface_hub.hf_api import ModelSort_T
+        return list(typing.get_args(ModelSort_T))
+    except Exception:                                                # older / newer huggingface_hub
+        return ["downloads", "likes", "trending_score", "created_at", "last_modified"]
+
+
+def top_models(n: int, hub_filter: str | None = None, sort: str = "downloads") -> dict:
+    """{repo id: {"rank", "downloads", "gated", "params"[, "weights", "model_type"]}} for the first n
+    text-generation models on the Hub in `sort` order, descending (optionally only those tagged hub_filter). GGUF
+    repos get weights "gguf" and the architecture from the Hub's GGUF metadata."""
+    from huggingface_hub import HfApi
+    out = {}
+    for i, m in enumerate(HfApi().list_models(pipeline_tag="text-generation", sort=sort, limit=n, filter=hub_filter,
+                                              expand=["downloads", "gated", "safetensors", "gguf", "siblings"])):
+        st, gg = getattr(m, "safetensors", None), getattr(m, "gguf", None)
+        out[m.id] = {"rank": i + 1, "downloads": getattr(m, "downloads", None),
+                     "gated": bool(getattr(m, "gated", False)), "params": getattr(st, "total", None) if st else None}
+        files = {getattr(f, "rfilename", "") for f in (getattr(m, "siblings", None) or [])}
+        if "hf_quant_config.json" in files:                         # NVIDIA ModelOpt keeps its quant config here
+            out[m.id]["weights_hint"] = "modelopt"
+        if gg:
+            out[m.id].update(weights="gguf", model_type=(gg.get("architecture") or "?").lower(),
+                             params=out[m.id]["params"] or gg.get("total"))
+    return out
+
+
+def weights_of(cfg: dict) -> str:
+    """Weight format from config.json: the quantization method, else the checkpoint dtype."""
+    mq = cfg.get("quantization")
+    if isinstance(mq, dict) and "bits" in mq:                       # MLX checkpoints
+        return f"mlx-{mq['bits']}bit"
+    qc = cfg.get("quantization_config") or (cfg.get("text_config") or {}).get("quantization_config")
+    if qc:
+        m = str(qc.get("quant_method") or "quantized").lower()
+        if m == "bitsandbytes":
+            m += "-4bit" if qc.get("load_in_4bit") else "-8bit" if qc.get("load_in_8bit") else ""
+        return m
+    dt = cfg.get("torch_dtype") or cfg.get("dtype") or (cfg.get("text_config") or {}).get("torch_dtype")
+    if not dt:
+        return "fp32 (default)"                                      # transformers' default when the config is silent
+    return {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(str(dt), str(dt))
+
+
+def order(c: dict) -> tuple:
+    """Sort key: Hub rank when known (the --sort order), then most downloaded."""
+    return (c.get("rank") or float("inf"), -(c.get("downloads") or 0))
+
+
+def group_key(c: dict, group: str) -> str:
+    mt = c.get("model_type") or "?"
+    return f"{mt} / {c.get('weights', '?')}" if group == "arch+weights" else mt
+
+
+def one_per_arch(checks: dict, max_params: float, group: str = "arch", min_params: float = 0) -> list:
+    """Highest-ranked model (Hub rank in the --sort order; else most downloaded) per model_type (or per model_type
+    and weight format) that is predicted to run, can be started (not GGUF / MLX) and has between min_params and
+    max_params parameters (the larger of the Hub's count and the config estimate)."""
+    best = {}
+    for m, c in checks.items():
+        p = c.get("params")
+        if not c.get("model_type") or predicted(c) != "runs" or p is None or p > max_params or p < min_params:
+            continue
+        mt = group_key(c, group)
+        if mt not in best or order(c) < order(checks[best[mt]]):
+            best[mt] = m
+    return sorted(best.values())
+
+
+def by_arch(d: str, checks: dict, group: str = "arch") -> str:
+    """One row per model_type (or model_type / weight format): prediction for its models, weight formats, kernel,
+    and the smoke verdict of those that ran."""
+    groups = {}
+    for m, c in checks.items():
+        groups.setdefault(group_key(c, group), []).append(m)
+    lines = ["| architecture (model_type) | models | weights | predicted | kernel | smoke-tested | verdict | "
+             "examples |",
+             "|---|---|---|---|---|---|---|---|"]
+    for mt in sorted(groups, key=lambda k: (-len(groups[k]), k)):
+        ms = sorted(groups[mt], key=lambda m: order(checks[m]))
+        pc = {}
+        for m in ms:
+            pc[predicted(checks[m])] = pc.get(predicted(checks[m]), 0) + 1
+        preds = [f"{p} ({n})" if len(pc) > 1 else p for p, n in sorted(pc.items(), key=lambda x: (-x[1], x[0]))]
+        wc = {}
+        for m in ms:
+            wc[checks[m].get("weights", "?")] = wc.get(checks[m].get("weights", "?"), 0) + 1
+        weights = ", ".join(f"{w} {n}" for w, n in sorted(wc.items(), key=lambda x: (-x[1], x[0])))
+        kernels = sorted({checks[m].get("kernel", "?") for m in ms if checks[m].get("kernel") not in (None, "?")})
+        ran = [m for m in ms if os.path.isdir(os.path.join(d, slug(m)))]
+        verdicts = sorted({verdict(os.path.join(d, slug(m)))["verdict"] for m in ran})
+        lines.append(f"| {mt} | {len(ms)} | {weights} | {' / '.join(preds)} | {', '.join(kernels) or '?'} | "
+                     f"{', '.join(ran) or '—'} | {', '.join(verdicts) or '—'} | {', '.join(ms[:3])} |")
+    return "\n".join(lines)
+
+
+def predicted(c: dict) -> str:
+    if c.get("refused"):
+        return "refused: " + "; ".join(c["refused"])
+    if c.get("weights") == "gguf":
+        return "GGUF: not started (see the base model's row)"
+    if str(c.get("weights", "")).startswith("mlx"):
+        return "MLX: vLLM cannot load it"
+    return "config not readable" if c.get("kernel") == "?" else "runs"
 
 
 def fetch_config(model: str) -> dict:
@@ -202,17 +355,26 @@ def verdict(model_dir: str) -> dict:
     return row
 
 
+def current(d: str) -> dict:
+    """Checks of the last run's models (listing.json): checks.json keeps every model ever checked in d, so a --top 50
+    run after a --top 100 run would otherwise also show the other 50, as checked by an older version."""
+    cp, lp = os.path.join(d, "checks.json"), os.path.join(d, "listing.json")
+    checks = json.load(open(cp)) if os.path.exists(cp) else {}
+    if os.path.exists(lp):
+        keep = json.load(open(lp))
+        checks = {m: checks[m] for m in keep if m in checks}
+    return checks
+
+
 def report(d: str, checks: dict | None = None) -> str:
     lines = ["| model | predicted | kernel | verdict | Δppl (8 x 1k) | same first 32 tokens | passkey bf16 / int4 | "
              "x tokens | why |", "|---|---|---|---|---|---|---|---|---|"]
-    checks = checks or {}
-    if os.path.exists(os.path.join(d, "checks.json")):
-        checks = {**json.load(open(os.path.join(d, "checks.json"))), **checks}
-    names = sorted(set(checks) | {m.replace("__", "/") for m in os.listdir(d)
-                                  if os.path.isdir(os.path.join(d, m))}) if os.path.isdir(d) else sorted(checks)
+    if checks is None:
+        checks = current(d)
+    names = sorted(checks, key=lambda m: order(checks[m]))
     for m in names:
         c = checks.get(m, {})
-        pred = ("refused: " + "; ".join(c["refused"])) if c.get("refused") else ("runs" if c else "?")
+        pred = predicted(c) if c else "?"
         v = verdict(os.path.join(d, slug(m))) if os.path.isdir(os.path.join(d, slug(m))) else {"verdict": "not run"}
         pk = v.get("passkey")
         cells = [m, pred, c.get("kernel", "?"), f"**{v['verdict']}**"]
@@ -237,6 +399,20 @@ def delete_from_cache(model: str):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--models", default=",".join(MODELS), help="comma list")
+    ap.add_argument("--top", type=int, default=0,
+                    help="the first N text-generation models on the Hub in --sort order (replaces --models)")
+    ap.add_argument("--one-per-arch", action="store_true",
+                    help="GPU runs only for the highest-ranked model of each architecture predicted to run")
+    ap.add_argument("--max-params", type=float, default=9e9, help="with --one-per-arch: largest model to start")
+    ap.add_argument("--min-params", type=float, default=0,
+                    help="with --one-per-arch: smallest model to pick (e.g. 1e9 skips 100M-parameter toys)")
+    ap.add_argument("--hub-filter", help="with --top: only Hub repos with this tag (e.g. awq, gptq, gguf)")
+    ap.add_argument("--sort", default="downloads", choices=hub_sorts(), help="with --top: Hub order (descending)")
+    ap.add_argument("--weights", help="comma list of weight formats to keep (bf16, fp16, awq, gptq, fp8, gguf, ...)")
+    ap.add_argument("--skip-weights",
+                    help="comma list of weight formats to drop (e.g. modelopt: NVFP4 needs a Blackwell GPU)")
+    ap.add_argument("--group", choices=["arch", "arch+weights"], default="arch",
+                    help="--one-per-arch and the summary: per architecture, or per architecture and weight format")
     ap.add_argument("--out-dir", default="smoke")
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--mem", type=float, default=0.85)
@@ -253,15 +429,21 @@ def main():
     ap.add_argument("--one", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
     if a.report:
-        print(report(a.report))
+        cur = current(a.report)
+        print(report(a.report, cur))
+        print("\n" + by_arch(a.report, cur, a.group))
         return
     if a.one:
         return run_one(a)
-    models = [m for m in a.models.split(",") if m]
     os.makedirs(a.out_dir, exist_ok=True)
     cpath = os.path.join(a.out_dir, "checks.json")
     checks = json.load(open(cpath)) if os.path.exists(cpath) else {}
-    for m in models:
+    hub = top_models(a.top, a.hub_filter, a.sort) if a.top else {}
+    models = list(hub) if a.top else [m for m in a.models.split(",") if m]
+    for m in models:                                                 # re-checked every run (configs are cached)
+        checks.pop(m, None)
+        if hub.get(m, {}).get("weights") == "gguf":
+            checks[m] = {"refused": [], "notes": ["GGUF repo: no config.json"], "kernel": "?"}
         if m not in checks:
             try:
                 checks[m] = config_check(fetch_config(m))
@@ -271,10 +453,30 @@ def main():
             c = checks[m]
             log(f"{m}: " + (("predicted refused: " + "; ".join(c["refused"])) if c["refused"] else "predicted runs")
                 + f", kernel {c['kernel']}" + (f" ({'; '.join(c['notes'])})" if c["notes"] else ""))
+    for m in models:
+        h = dict(hub.get(m, {}))
+        hint = h.pop("weights_hint", None)
+        checks[m].update(h)
+        if hint and checks[m].get("weights") in ("bf16", "fp16", "fp32", "?"):
+            checks[m]["weights"] = hint
+        sizes = [x for x in (checks[m].get("params"), checks[m].get("params_cfg")) if x]
+        checks[m]["params"] = max(sizes) if sizes else None
     json.dump(checks, open(cpath, "w"), indent=1)
+    with open(os.path.join(a.out_dir, "listing.json"), "w") as f:  # this run's models: reports show only these
+        json.dump(models, f)
+    if a.weights or a.skip_weights:
+        keep = {w.strip().lower() for w in (a.weights or "").split(",") if w.strip()}
+        drop = {w.strip().lower() for w in (a.skip_weights or "").split(",") if w.strip()}
+        models = [m for m in models if (not keep or checks[m].get("weights", "?").lower() in keep)
+                  and checks[m].get("weights", "?").lower() not in drop]
+        log(f"weight formats kept: {len(models)} models")
     if a.check_only:
-        print(report(a.out_dir, checks))
+        print(report(a.out_dir, {m: checks[m] for m in models}))
+        print("\n" + by_arch(a.out_dir, {m: checks[m] for m in models}, a.group))
         return
+    if a.one_per_arch:
+        models = one_per_arch({m: checks[m] for m in models}, a.max_params, a.group, a.min_params)
+        log(f"one per architecture ({len(models)}): " + ", ".join(models))
     from vllm_compare import wait_gpu_free
     for m in models:
         if a.skip_predicted_refusals and checks[m]["refused"]:
@@ -305,7 +507,9 @@ def main():
         log(f"{m}: {verdict(md)['verdict']}")
         if a.delete_after:
             delete_from_cache(m)
-    print(report(a.out_dir, checks))
+    cur = current(a.out_dir)
+    print(report(a.out_dir, cur))
+    print("\n" + by_arch(a.out_dir, cur, a.group))
 
 
 if __name__ == "__main__":
