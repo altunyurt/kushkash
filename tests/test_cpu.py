@@ -292,6 +292,44 @@ def test_rotate_rounds_once():
     check_rotate_rounds_once("cpu")
 
 
+def test_cublas_exact_sums_restores_flags():
+    """The flags go off for the GEMM's dtype only and come back exactly; a flag the caller already turned off
+    (with its split-K sub-flag, torch >= 2.9) is not touched."""
+    from _cublas import cublas_flags
+    from kushkash._ops import _cublas_exact_sums, undo_cublas
+    before = cublas_flags()
+    C = torch._C
+    try:
+        if isinstance(before["fp16_reduced_precision_reduction"], tuple):             # torch >= 2.9: (allow, split_k)
+            C._set_cublas_allow_fp16_reduced_precision_reduction(False, False)
+            undo_cublas(_cublas_exact_sums(torch.float16))
+            assert cublas_flags()["fp16_reduced_precision_reduction"] == (False, False)
+            C._set_cublas_allow_fp16_reduced_precision_reduction(True, True)
+        if "fp16_accumulation" in before:
+            C._set_cublas_allow_fp16_accumulation(True)
+        caller = cublas_flags()
+        undo = _cublas_exact_sums(torch.float16)
+        now = cublas_flags()
+        off = lambda v: (v[0] if isinstance(v, tuple) else v) is False
+        assert off(now["fp16_reduced_precision_reduction"])
+        assert now.get("fp16_accumulation") in (None, False)
+        assert now["bf16_reduced_precision_reduction"] == caller["bf16_reduced_precision_reduction"]   # fp16 only
+        undo_cublas(undo)
+        assert cublas_flags() == caller
+        assert _cublas_exact_sums(torch.float32) == []
+        undo = _cublas_exact_sums(torch.bfloat16)
+        assert off(cublas_flags()["bf16_reduced_precision_reduction"])
+        undo_cublas(undo)
+        assert cublas_flags() == caller
+        undo = _cublas_exact_sums(torch.bfloat16)                 # already off: nothing touched, nothing to undo
+        assert _cublas_exact_sums(torch.bfloat16) == []
+        undo_cublas(undo)
+    finally:
+        for n, v in before.items():
+            getattr(C, "_set_cublas_allow_" + n)(*(v if isinstance(v, tuple) else (v,)))
+    assert cublas_flags() == before
+
+
 def test_rotation_default(monkeypatch):
     """auto: on for 4-bit (measured), off for 8-bit (not measured); KUSHKASH_ROTATE and the argument override."""
     monkeypatch.delenv("KUSHKASH_ROTATE", raising=False)

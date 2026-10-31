@@ -458,6 +458,34 @@ def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a0 < b1 and b0 < a1
 
 
+_EXACT_SUMS = {torch.float16: ("fp16_reduced_precision_reduction", "fp16_accumulation"),
+               torch.bfloat16: ("bf16_reduced_precision_reduction",)}
+
+
+def _cublas_exact_sums(dtype: torch.dtype) -> list:
+    """Disallow cuBLAS sums in fp16 / bf16 for GEMMs in `dtype`; returns what to pass back to undo_cublas().
+    PyTorch's default lets cuBLAS add split-K partial sums in the output dtype: up to ~5 fp16 ulp off the
+    rounded-once product on an A100 (fp16, D 256). torch._C accessors restore the exact state on every torch
+    version (a bool before 2.9, (allow, split_k) after); only flags that are on are touched."""
+    undo = []
+    for name in _EXACT_SUMS.get(dtype, ()):
+        get = getattr(torch._C, "_get_cublas_allow_" + name, None)
+        put = getattr(torch._C, "_set_cublas_allow_" + name, None)
+        if get is None or put is None:                # older torch: no such flag
+            continue
+        state = get()
+        state = tuple(state) if isinstance(state, (tuple, list)) else (state,)   # (allow, split_k) on torch >= 2.9
+        if state[0]:
+            put(False, *state[1:])
+            undo.append((put, state))
+    return undo
+
+
+def undo_cublas(undo: list) -> None:
+    for put, state in reversed(undo):
+        put(*state)
+
+
 def rotate(x: torch.Tensor, h: torch.Tensor | None, dtype: torch.dtype | None = None,
            out: torch.Tensor | None = None) -> torch.Tensor:
     """x @ h over the last dim, returned contiguous in `dtype` (default x's). h None: x unchanged.
@@ -466,8 +494,9 @@ def rotate(x: torch.Tensor, h: torch.Tensor | None, dtype: torch.dtype | None = 
 
     One GEMM in the output dtype with the +-1 matrix (exact) and the 1/sqrt(D) factor applied as the GEMM's
     fp32 alpha, so the result is the exactly orthonormal product rounded once, with no fp32 copies of x
-    (a bf16 / fp16 H would not be orthonormal at D = 128: 1/sqrt(128) is not representable). H is symmetric
-    and H @ H = I, so the same call rotates back."""
+    (a bf16 / fp16 H would not be orthonormal at D = 128: 1/sqrt(128) is not representable). On CUDA, cuBLAS's
+    reduced-precision sums are switched off for this GEMM only (_cublas_exact_sums). H is symmetric and H @ H = I,
+    so the same call rotates back."""
     if h is None:
         y = x if dtype is None else x.to(dtype)
         return y if out is None else out.copy_(y.reshape(out.shape))
@@ -480,10 +509,13 @@ def rotate(x: torch.Tensor, h: torch.Tensor | None, dtype: torch.dtype | None = 
             raise ValueError("rotate(out=): out must be contiguous, in the output dtype, with x's element count")
         if _overlaps(out, x2):                        # the GEMM would read rows it has already overwritten
             raise ValueError("rotate(out=): out overlaps x")
-        torch.addmm(x2, x2, _signs(D, h.device, dtype), beta=0, alpha=1.0 / math.sqrt(D), out=out.view(-1, D))
-        return out
-    y = torch.addmm(x2, x2, _signs(D, h.device, dtype), beta=0, alpha=1.0 / math.sqrt(D))
-    return y.view(x.shape)
+    undo = _cublas_exact_sums(dtype) if x2.is_cuda else []
+    try:
+        y = torch.addmm(x2, x2, _signs(D, h.device, dtype), beta=0, alpha=1.0 / math.sqrt(D),
+                        out=None if out is None else out.view(-1, D))
+    finally:
+        undo_cublas(undo)
+    return out if out is not None else y.view(x.shape)
 
 
 def default_scale(head_dim: int) -> float:

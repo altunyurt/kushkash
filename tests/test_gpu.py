@@ -63,8 +63,12 @@ def test_decode_matches_reference(D, bits, G, dtype, B, N):
 
 
 def test_rotate_rounds_once_gpu():
-    """rotate() on CUDA: the exact orthonormal product rounded once (cuBLAS, fp32 accumulation and alpha)."""
+    """rotate() on CUDA: the exact orthonormal product rounded once (cuBLAS, fp32 accumulation and alpha). Fails on
+    an A100 (fp16, D 256: ~5 ulp) if cuBLAS may add split-K partials in fp16; rotate() must also leave the caller's
+    cuBLAS flags as they were."""
     from kushkash._ops import hadamard, rotate
+    from _cublas import cublas_flags
+    flags = cublas_flags()
     unit = {torch.float32: 2.0 ** -24, torch.float16: 2.0 ** -11, torch.bfloat16: 2.0 ** -8}
     for dt, u in unit.items():
         for D in (64, 128, 256):
@@ -77,6 +81,7 @@ def test_rotate_rounds_once_gpu():
             buf = torch.full((8, 4, D), float("nan"), device="cuda", dtype=dt)       # out= (vLLM output buffer)
             rotate(x, h, out=buf[:6])
             assert torch.equal(buf[:6], y) and bool(buf[6:].isnan().all()), (dt, D)   # same cuBLAS result, bit for bit
+    assert cublas_flags() == flags
 
 
 def test_rotated_cache_gpu_matches_cpu():
