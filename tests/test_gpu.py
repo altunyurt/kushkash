@@ -182,7 +182,9 @@ def test_generate_graph_auto_reports():
 @pytest.mark.parametrize("graph", [False, True])
 def test_generate_eos_async_stop(graph):
     """EOS stop without a per-token sync: tokens match the run without EOS up to the first EOS, everything after it
-    is EOS, and generation stops early (a step or two after EOS, once the async readback lands)."""
+    is EOS, and generation stops at most 2 * EOS_LAG steps after it (the host waits for a readback older than
+    EOS_LAG steps; unbounded, graph replays outran the GPU on an RTX PRO 6000 and never stopped early)."""
+    from kushkash._generate import EOS_LAG
     from transformers import LlamaConfig, LlamaForCausalLM
     cfg = LlamaConfig(vocab_size=512, hidden_size=512, intermediate_size=1024, num_hidden_layers=2,
                       num_attention_heads=8, num_key_value_heads=2, head_dim=64)
@@ -195,7 +197,7 @@ def test_generate_eos_async_stop(graph):
     out = kk.generate(model, ids, 60, bits=4, cuda_graph=graph, eos_token_id=eos)
     assert torch.equal(out[:, :k + 1], ref[:, :k + 1])
     assert bool((out[0, k + 1:] == eos).all())
-    assert out.shape[1] < ref.shape[1]                                 # stopped early
+    assert out.shape[1] <= k + 2 * EOS_LAG < ref.shape[1]               # stopped early, bounded
 
 
 @pytest.mark.parametrize("D", [64, 128, 256])

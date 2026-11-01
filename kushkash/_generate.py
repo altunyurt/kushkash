@@ -17,6 +17,7 @@ import torch
 from .hf import NAME, KushHFCache, enable
 
 WARMUP_STEPS = 2          # eager decode steps before capture (cuBLAS / allocator warm-up)
+EOS_LAG = 2               # EOS stop: the host runs at most this many steps ahead of the `done` readback
 
 
 def _pick(logits: torch.Tensor, do_sample: bool, temperature: float, top_k: int) -> torch.Tensor:
@@ -83,11 +84,15 @@ def generate(model, input_ids: torch.Tensor, max_new_tokens: int, *, bits: int =
     graph, static_logits, side = None, None, torch.cuda.Stream(dev) if use_graph else None
     done = torch.zeros(B, dtype=torch.bool, device=dev)
     # EOS stop test without a per-token sync: on CUDA `done` is copied to pinned memory asynchronously and
-    # read once that copy has finished (a step or two later); rows already done keep emitting EOS meanwhile
+    # read once that copy has finished; rows already done keep emitting EOS meanwhile. A readback older than
+    # EOS_LAG steps is waited for: graph replays launch in microseconds, so an unbounded host could queue every
+    # remaining step before the GPU reaches the EOS (seen on an RTX PRO 6000) and never stop early. The wait
+    # leaves EOS_LAG steps queued, so the GPU does not idle; generation stops <= 2 * EOS_LAG steps after EOS.
     gpu_done = eos.numel() and dev.type == "cuda"
     done_host = torch.zeros(B, dtype=torch.bool, pin_memory=True) if gpu_done else None
     done_ev = torch.cuda.Event() if gpu_done else None
     done_pending = False
+    done_at = 0                                     # step whose `done` the pending readback carries
     out, n = [tok], T0
     eager_ms, graph_ms = None, []
     for i in range(1, max_new_tokens):
@@ -97,7 +102,8 @@ def generate(model, input_ids: torch.Tensor, max_new_tokens: int, *, bits: int =
                 if bool(done.all()):
                     break
             else:
-                if done_pending and done_ev.query():
+                if done_pending and (done_ev.query() or i - done_at >= EOS_LAG):
+                    done_ev.synchronize()           # no-op if the copy has landed
                     done_pending = False
                     if bool(done_host.all()):
                         break
@@ -105,6 +111,7 @@ def generate(model, input_ids: torch.Tensor, max_new_tokens: int, *, bits: int =
                     done_host.copy_(done, non_blocking=True)
                     done_ev.record()
                     done_pending = True
+                    done_at = i
         static_ids.copy_(tok.view(B, 1))
         static_pos.fill_(n)
         if graph is not None:
