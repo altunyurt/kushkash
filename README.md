@@ -56,23 +56,28 @@ measured over the same mix of prompt processing and generation.
 | Cache type | Tokens held | Requests in flight | Output tokens/s | vs 16-bit | Time per step | Δ perplexity [95% CI] |
 |---|---|---|---|---|---|---|
 | 16-bit (vLLM default) | 567,440 (1x) | 137 | 2,251 | 1.00x | 61 ms | ppl 10.180 |
+| `turboquant_4bit_nc` | 2.90x | 398 | 1,535 | 0.68x | 260 ms | +0.113 [+0.103, +0.124] |
 | `int4_per_token_head` | **3.74x** | 517 | 3,081 | 1.37x | 169 ms | +0.070 [+0.039, +0.101] |
 | **kushkash int4** | 3.39x | 461 | **4,993** | **2.22x** | 93 ms | **+0.0006 [−0.005, +0.006]** |
 
 - `int4_per_token_head` holds 10% more tokens than kushkash int4, but each step takes 1.8x as long: kushkash int4
   serves 1.62x its output tokens/s.
-- Per request, kushkash int4 generates 10.8 tokens/s, `int4_per_token_head` 6.0 and the 16-bit cache 16.4: the
-  4-bit caches serve more requests at once, each a little slower.
-- Tokens held: measured in each throughput run, at the `--max-num-seqs` it used. All three ran at the same GPU
-  clock (2,415 MHz median). One run each; the run-to-run spread was not measured.
+- `turboquant_4bit_nc` holds 2.9x the tokens of the 16-bit cache but serves fewer output tokens/s than it (0.68x):
+  each step takes 2.8x as long as kushkash int4's, which serves 3.25x its output tokens/s. Its perplexity change is
+  the largest here (+0.113, against +0.0006 for kushkash int4).
+- Per request, kushkash int4 generates 10.8 tokens/s, `int4_per_token_head` 6.0, `turboquant_4bit_nc` 3.9 and the
+  16-bit cache 16.4: the 4-bit caches serve more requests at once, each slower.
+- Tokens held: measured in each throughput run, at the `--max-num-seqs` it used. GPU clock (median): 2,415 MHz for
+  three of them, 2,235 MHz for `turboquant_4bit_nc` (measured in a later run, at 600 W); at 2,415 MHz it would reach
+  about 0.74x (calculated). One run each; the run-to-run spread was not measured.
 - Perplexity: WikiText-2 (as in [section 4](#4-quality-compared-with-vllms-cache-formats)), same GPU and weights.
   GSM8K on these weights (L4): unchanged with kushkash int4 ([AWQ weights](#on-awq-4-bit-weights)).
 - One model, one GPU, one request shape. Shorter outputs make the prompt work a larger share of each wave.
-- Not included: `turboquant_4bit_nc` (not rerun with whole-wave measurement) and vLLM's `nvfp4` cache (vLLM 0.31
-  enables it only on compute capability 10.x, such as a B200; this GPU is 12.0).
+- Not included: vLLM's `nvfp4` cache (vLLM 0.31 enables it only on compute capability 10.x, such as a B200; this
+  GPU is 12.0).
 
-Reproduce with `python bench/rivals.py --kv auto,int4_per_token_head,kush4 --repeats 1 --tp-seconds 1` (about 40
-minutes on this GPU).
+Reproduce with `python bench/rivals.py --kv auto,turboquant_4bit_nc,int4_per_token_head,kush4 --repeats 1
+--tp-seconds 1` (about an hour on this GPU).
 
 ### Against vLLM's 16-bit cache (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31)
 
@@ -644,17 +649,19 @@ Each benchmark prints a table you can compare with the README's. Run one at a ti
 vLLM sizes its cache from the memory it finds free.
 
 1. **Throughput against the other 4-bit formats** ([section 3](#3-measured-serving-throughput), first table).
-   About 40 minutes on an RTX PRO 6000; any GPU that fits the model works, the ratios are what to compare.
+   About an hour on an RTX PRO 6000; any GPU that fits the model works, the ratios are what to compare.
 
    ```bash
-   python bench/rivals.py --model Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,kush4 --repeats 1 --tp-seconds 1
+   python bench/rivals.py --model Qwen/Qwen3-8B-AWQ --kv auto,turboquant_4bit_nc,int4_per_token_head,kush4 \
+       --repeats 1 --tp-seconds 1
    ```
 
 2. **Perplexity on the same weights** (section 3, last column). About 25 minutes on an L4. Leave out `--gsm8k-n 0`
    to add GSM8K ([AWQ weights](#on-awq-4-bit-weights)).
 
    ```bash
-   python bench/quality.py --models Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,kush4 --gsm8k-n 0 --out-dir q_awq
+   python bench/quality.py --models Qwen/Qwen3-8B-AWQ --kv auto,turboquant_4bit_nc,int4_per_token_head,kush4 \
+       --gsm8k-n 0 --out-dir q_awq
    ```
 
 3. **vLLM's 8-bit and per-token 4-bit caches breaking Qwen2.5** ([section 4](#4-quality-compared-with-vllms-cache-formats)),
@@ -745,7 +752,7 @@ python tests/test_vllm_gpu.py           # same, once per vLLM execution mode (ea
 Benchmarks (all print their results; nothing is uploaded anywhere):
 
 ```bash
-python bench/rivals.py --kv auto,int4_per_token_head,kush4 --repeats 1 --tp-seconds 1   # section 3, whole waves
+python bench/rivals.py --kv auto,turboquant_4bit_nc,int4_per_token_head,kush4 --repeats 1 --tp-seconds 1  # section 3
 python bench/headline.py --sweep                       # section 3, L4 table (--quantization fp8 for FP8 weights)
 python bench/quality.py --models Qwen/Qwen2.5-7B-Instruct,Qwen/Qwen3-8B --out-dir quality   # section 4
 python bench/quality.py --report quality
