@@ -172,15 +172,20 @@ Reproduce with `python bench/quality.py` (about 3.5 hours on an L4 for both mode
 ### On AWQ (4-bit) weights
 
 The same measurement on the AWQ versions of both models (L4, kushkash 0.5.11, same settings as above; GSM8K on all
-1,319 questions):
+1,319 questions; one run per format):
 
-- **Qwen3-8B-AWQ:** kushkash int4 holds 3.28x the tokens of the 16-bit cache. GSM8K 92.65% against 92.72%
-  (−0.08 points [−0.91, +0.76]; 33 answers differ, 17 lost and 16 gained), perplexity +0.0013 [−0.005, +0.007].
-  `int4_per_token_head` holds 3.67x: GSM8K −0.45 points [−1.59, +0.68], perplexity +0.075 [+0.048, +0.102].
-- **Qwen2.5-7B-Instruct-AWQ:** kushkash int4 holds 3.36x. GSM8K 91.81% against 91.05% (+0.76 points [−0.23, +1.74],
-  not a measurable difference), perplexity +0.010 [+0.007, +0.014], the same order as with bf16 weights (+0.007).
-  `int4_per_token_head` breaks down here too (ppl 11,757), so 4-bit weights do not change which formats work.
-- One run per format.
+| Model | Format | Tokens held | GSM8K | Δ GSM8K points | Answers lost / gained | Δ perplexity |
+|---|---|---|---|---|---|---|
+| Qwen3-8B-AWQ | 16-bit (vLLM default) | 90,192 (1x) | 92.72% | | | ppl 10.180 |
+| | `int4_per_token_head` | 3.67x | 92.27% | −0.45 [−1.59, +0.68] | 31 / 25 | +0.075 [+0.048, +0.102] |
+| | **kushkash int4** | 3.28x | 92.65% | −0.08 [−0.91, +0.76] | 17 / 16 | **+0.0013 [−0.005, +0.007]** |
+| Qwen2.5-7B-Instruct-AWQ | 16-bit (vLLM default) | 242,128 (1x) | 91.05% | | | ppl 7.873 |
+| | `int4_per_token_head` | 3.76x | not run | | | breaks down (ppl 11,757) |
+| | **kushkash int4** | **3.36x** | 91.81% | +0.76 [−0.23, +1.74] | 16 / 26 | **+0.010 [+0.007, +0.014]** |
+
+- No GSM8K difference is measurable: every interval includes 0.
+- `int4_per_token_head` breaks down on Qwen2.5 with 4-bit weights too: the weights do not change which formats work.
+- kushkash int4 on Qwen2.5: +0.010 with AWQ weights, +0.007 with bf16 weights (table above).
 
 Reproduce with `python bench/quality.py --models Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,kush4` (and the
 same with `Qwen/Qwen2.5-7B-Instruct-AWQ`).
