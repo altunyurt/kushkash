@@ -66,7 +66,7 @@ measured over the same mix of prompt processing and generation.
 - Tokens held: measured in each throughput run, at the `--max-num-seqs` it used. All three ran at the same GPU
   clock (2,415 MHz median). One run each; the run-to-run spread was not measured.
 - Perplexity: WikiText-2 (as in [section 4](#4-quality-compared-with-vllms-cache-formats)), same GPU and weights.
-  GSM8K not run on this model.
+  GSM8K on these weights (L4): unchanged with kushkash int4 ([AWQ weights](#on-awq-4-bit-weights)).
 - One model, one GPU, one request shape. Shorter outputs make the prompt work a larger share of each wave.
 - Not included: `turboquant_4bit_nc` (not rerun with whole-wave measurement) and vLLM's `nvfp4` cache (vLLM 0.31
   enables it only on compute capability 10.x, such as a B200; this GPU is 12.0).
@@ -168,6 +168,22 @@ default bf16 cache on the same inputs, token by token (perplexity) and question 
 
 Reproduce with `python bench/quality.py` (about 3.5 hours on an L4 for both models; `--report` prints these tables,
 `--base` compares against another format).
+
+### On AWQ (4-bit) weights
+
+The same measurement on the AWQ versions of both models (L4, kushkash 0.5.11, same settings as above; GSM8K on all
+1,319 questions):
+
+- **Qwen3-8B-AWQ:** kushkash int4 holds 3.28x the tokens of the 16-bit cache. GSM8K 92.65% against 92.72%
+  (−0.08 points [−0.91, +0.76]; 33 answers differ, 17 lost and 16 gained), perplexity +0.0013 [−0.005, +0.007].
+  `int4_per_token_head` holds 3.67x: GSM8K −0.45 points [−1.59, +0.68], perplexity +0.075 [+0.048, +0.102].
+- **Qwen2.5-7B-Instruct-AWQ:** kushkash int4 holds 3.36x. GSM8K 91.81% against 91.05% (+0.76 points [−0.23, +1.74],
+  not a measurable difference), perplexity +0.010 [+0.007, +0.014], the same order as with bf16 weights (+0.007).
+  `int4_per_token_head` breaks down here too (ppl 11,757), so 4-bit weights do not change which formats work.
+- One run per format.
+
+Reproduce with `python bench/quality.py --models Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,kush4` (and the
+same with `Qwen/Qwen2.5-7B-Instruct-AWQ`).
 
 ### Long context (Qwen2.5-7B-Instruct, NVIDIA L4, vLLM 0.31, kushkash 0.5.0)
 
@@ -457,7 +473,8 @@ runs one test step through kushkash, so the memory a step needs only while it ru
 - **Works with:** chunked prefill, prefix caching, preemption, CUDA graphs, `torch.compile`, CPU offloading (below),
   and FP8 weights (`--quantization fp8`; on an L4 with Qwen2.5-7B, the 4-bit cache gave 1.90x the sustained output
   tokens/s of vLLM's default cache on the same FP8 weights, same 10 GiB KV budget, measured over a fixed window
-  before v0.5.0; see [Limits](#14-limits-and-open-questions)) and AWQ weights.
+  before v0.5.0; see [Limits](#14-limits-and-open-questions)) and AWQ weights (quality:
+  [AWQ weights](#on-awq-4-bit-weights)).
 - **Needs:** vLLM 0.31.x with its default model runner, an NVIDIA GPU, and a decoder-only model with full
   attention, head size 64, 128 or 256, in fp16 or bf16.
 - **Refuses to start** (with an error saying why) for: speculative decoding, sliding-window attention, ALiBi, logit
@@ -628,7 +645,8 @@ vLLM sizes its cache from the memory it finds free.
    python bench/rivals.py --model Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,kush4 --repeats 1 --tp-seconds 1
    ```
 
-2. **Perplexity on the same weights** (section 3, last column). About 25 minutes on an L4.
+2. **Perplexity on the same weights** (section 3, last column). About 25 minutes on an L4. Leave out `--gsm8k-n 0`
+   to add GSM8K ([AWQ weights](#on-awq-4-bit-weights)).
 
    ```bash
    python bench/quality.py --models Qwen/Qwen3-8B-AWQ --kv auto,int4_per_token_head,kush4 --gsm8k-n 0 --out-dir q_awq
@@ -787,8 +805,8 @@ workspace (vLLM: 64 to 512 MiB by default; Hugging Face and `KUSHKASH_PREFILL=lo
 6. **All performance numbers are GPU numbers.** The CPU kernels exist and match the GPU's pages, but no CPU
    performance is claimed.
 7. **Not measured yet:** contexts beyond 128k, long context on more than two model families, Llama models through
-   SGLang, H100 / B200 (including vLLM's `nvfp4` cache), tensor parallelism, GSM8K on AWQ weights, the RAM tier under
-   concurrent sessions. The 64k / 128k numbers are one run per setting.
+   SGLang, H100 / B200 (including vLLM's `nvfp4` cache), tensor parallelism, the RAM tier under concurrent sessions.
+   The 64k / 128k numbers are one run per setting.
 
 Tried and ruled out (measured or reasoned): an 8-bit exact key buffer, low-rank values, per-layer bit widths,
 lower bits for older pages, 3 bits everywhere, page skipping, special treatment of the first tokens, and the
