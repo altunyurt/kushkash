@@ -626,3 +626,22 @@ def test_dequant_pages_matches_reference(bits):
                 ws.sv.fill_(float("nan"))
                 k2, v2 = kb._dequant_pages(ws, n, D, need_k=False)
                 assert k2 is None and torch.equal(v2, rv)
+
+
+@pytest.mark.parametrize("cap,want", [(75, False), (80, True), (89, True)])
+def test_flash_attn_needs_ampere(cap, want, monkeypatch):
+    """vLLM's FlashAttention 2 raises 'FlashAttention only supports Ampere GPUs or newer' on a T4 (sm_75): the
+    backend must only use it at compute capability 8.0+, and otherwise run every prefill row on the history path."""
+    import importlib
+
+    import vllm.platforms as vp
+    import vllm.v1.attention.backends.fa_utils as fu
+    monkeypatch.setattr(fu, "is_flash_attn_varlen_func_available", lambda: True)
+    monkeypatch.setattr(fu, "flash_attn_varlen_func", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(fu, "get_flash_attn_version", lambda *a, **k: 2, raising=False)
+    monkeypatch.setattr(vp.current_platform, "has_device_capability", lambda c, device_id=0: cap >= c)
+    try:
+        assert importlib.reload(kb)._HAS_FA is want
+    finally:
+        monkeypatch.undo()
+        importlib.reload(kb)

@@ -47,6 +47,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
@@ -54,7 +55,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
 from kushkash._ops import (PAGE, Ops, as_records, cached_kv, hadamard, history_attention, pages_touched,
                            record_bytes, rotate, rotation_enabled)
 
-_HAS_FA = is_flash_attn_varlen_func_available()
+# vLLM's FlashAttention 2 needs compute capability 8.0+; on older GPUs (T4, sm_75) prefill uses the history path
+# (memory-efficient SDPA with log-sum-exp, kushkash._ops.attn_lse) for every row, fresh or not.
+_HAS_FA = is_flash_attn_varlen_func_available() and current_platform.has_device_capability(80)
 if _HAS_FA:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func, get_flash_attn_version
 
