@@ -490,7 +490,11 @@ Limits:
 - **All sequences in a batch must have the same length.** Padded batches are rejected at prompt processing; decode
   steps are not re-checked.
 - **Sliding-window models are rejected** by `enable()` (a window at or past the model's maximum length is accepted).
-- One `KushHFCache` per generation, passed as `past_key_values` with `use_cache=True` to every forward pass.
+- One `KushHFCache` per conversation, passed as `past_key_values` with `use_cache=True` to every forward pass. A
+  later call must continue the tokens the cache holds (multi-turn: the earlier ids plus the new turn). A new prompt
+  passed to `generate()` no longer than the cache raises; a longer, different prompt, or any prompt passed to a
+  plain forward (it continues from the cache position), cannot be detected and gives wrong output (as with
+  `DynamicCache`). `cache.reset()` empties the cache for another prompt.
 - `KushHFCache(..., rotate=False)` turns the rotation off.
 - Without a PyTorch fused attention that returns log-sum-exp values, kushkash warns and uses a plain version whose
   memory grows with the context.

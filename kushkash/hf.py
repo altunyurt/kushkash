@@ -127,6 +127,23 @@ def _sdpa(q, k, v, scale):
     return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
 
 
+def _check_start(kv, position_ids) -> None:
+    """A multi-token chunk must start where the cache ends. A reused cache breaks this: generate() on a cache that
+    already holds another sequence feeds positions that do not continue it, and the output is silently wrong (as
+    with DynamicCache). A plain forward() without position_ids continues from the cache length, so it always passes.
+    Checked once per multi-token forward (layer 0; one host sync, like kush_mask), never on decode steps. Skipped on
+    an empty cache (nothing stale; a RoPE offset stays allowed) and without 2-D position_ids (multimodal 3-D rope
+    positions need not equal the length)."""
+    held = kv.length(0)
+    if held == 0 or position_ids is None or position_ids.dim() != 2:
+        return
+    if int(position_ids[0, 0]) != held:
+        raise RuntimeError(f"kushkash: this KushHFCache holds {held} tokens, but the new input does not start at "
+                           f"position {held}. A cache only continues the sequence it holds (multi-turn: pass the "
+                           f"earlier ids plus the new turn). Use a new KushHFCache, or cache.reset(), for another "
+                           f"prompt.")
+
+
 def kush_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
     """transformers attention function. query [B, Hq, T, D]; key/value: the new chunk [B, Hkv, T, D]."""
     cache: KushHFCache | None = getattr(_active, "cache", None)
@@ -137,6 +154,8 @@ def kush_attention(module, query, key, value, attention_mask, scaling=None, drop
     if scaling is not None:
         kv.scale = float(scaling)
     B, Hq, T, D = query.shape
+    if T > 1 and layer == 0:
+        _check_start(kv, kwargs.get("position_ids"))
     if T == 1:
         kv.write(layer, key, value)
         out = kv.attend(layer, query[:, :, 0]).unsqueeze(1)          # [B, 1, Hq, D]

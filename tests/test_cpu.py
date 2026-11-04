@@ -209,6 +209,29 @@ def test_forward_without_cache_raises():
             model(ids, use_cache=False)
 
 
+def test_reused_cache():
+    """A used cache must continue its own sequence: a second generate on another (or the same) prompt raises
+    instead of silently attending to the first sequence; multi-turn continuation and reset() still work."""
+    model = kk.enable(_tiny("llama"))
+    p, turn = torch.randint(1, 256, (1, 20)), torch.randint(1, 256, (1, 10))
+    g = dict(max_new_tokens=6, do_sample=False)
+    with torch.no_grad():
+        cache = kk.KushHFCache(model.config, bits=8)
+        first = model.generate(p, past_key_values=cache, **g)
+        with pytest.raises(RuntimeError, match="holds 25 tokens"):
+            model.generate(p, past_key_values=cache, **g)
+        assert cache.get_seq_length() == 25                                # the rejected call wrote nothing
+        nxt = model.generate(torch.cat([first, turn], 1), past_key_values=cache, **g)    # multi-turn
+        assert nxt.shape == (1, 26 + 10 + 6)
+        with pytest.raises(RuntimeError, match="KushHFCache"):
+            kk.generate(model, p, 4, cache=cache)
+        cache.reset()
+        assert torch.equal(model.generate(p, past_key_values=cache, **g), first)
+        cache.reset()                                                       # empty cache: a RoPE offset is allowed
+        model(p, position_ids=torch.arange(5, 25)[None], past_key_values=cache, use_cache=True)
+        assert cache.get_seq_length() == 20
+
+
 def test_cuda_init_failure_reports_the_error(monkeypatch):
     """A failing cuInit surfaces as the CUDA error, not as recursion through the error-string lookup."""
     import ctypes
