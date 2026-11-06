@@ -12,7 +12,7 @@ compressed cache directly. The kernels run on NVIDIA GPUs and on CPUs.
 | Perplexity | about +0.1%; no measurable growth up to 128k tokens, idle or under full load |
 | GSM8K accuracy | unchanged |
 | Serving throughput | 2.6x on an L4, 2.2x on an RTX PRO 6000 |
-| Not covered | hybrid, MLA and sliding-window models (refused), H100 / B200, tensor parallelism, models above 8B |
+| Not covered | hybrid, MLA and sliding-window models (refused), H100 / B200, tensor-parallel throughput, models above 8B |
 
 Outputs are not batch-invariant, with a 16-bit cache too: the same prompt can give slightly different text on a busy
 server, and kushkash int4 changes the top choice at about 1.7x as many positions ([under load](#under-serving-load)).
@@ -394,7 +394,7 @@ Both buffers come out of the memory vLLM would otherwise give to the KV cache.
 
 | | |
 |---|---|
-| **Works with** | chunked prefill, prefix caching, preemption, CUDA graphs, `torch.compile`, CPU offloading (below), FP8 weights (1.90x the 16-bit cache's throughput on an L4, Qwen2.5-7B; fixed-window measurement), AWQ weights ([quality](#on-awq-4-bit-weights)) |
+| **Works with** | chunked prefill, prefix caching, preemption, CUDA graphs, `torch.compile`, CPU offloading (below), tensor parallelism ([2 GPUs tested](#tensor-parallelism)), FP8 weights (1.90x the 16-bit cache's throughput on an L4, Qwen2.5-7B; fixed-window measurement), AWQ weights ([quality](#on-awq-4-bit-weights)) |
 | **Needs** | vLLM 0.31.x with its default model runner, an NVIDIA GPU, a decoder-only model with full attention, head size 64, 128 or 256, fp16 or bf16 |
 | **Refuses to start** (with an error saying why) | speculative decoding, sliding-window attention, ALiBi, logit soft-capping, attention sinks, MLA, cross-layer KV sharing, micro-batching (`--enable-dbo`, `--ubatch-size`) |
 
@@ -408,6 +408,28 @@ python -c "import json, os; from huggingface_hub import hf_hub_download as get
 c = json.load(open(get('Qwen/Qwen2.5-7B-Instruct-1M', 'config.json'))); c.pop('dual_chunk_attention_config')
 os.makedirs('q1m-config', exist_ok=True); json.dump(c, open('q1m-config/config.json', 'w'), indent=2)"
 vllm serve Qwen/Qwen2.5-7B-Instruct-1M --hf-config-path q1m-config --max-model-len 131072 ...
+```
+
+### Tensor parallelism
+
+Each GPU keeps the kushkash pages of its own KV heads; nothing to set beyond vLLM's `--tensor-parallel-size`.
+Qwen2.5-7B-Instruct on 2x T4 (Kaggle, fp16, vLLM 0.31, `--tensor-parallel-size 2`), perplexity as in
+[section 4](#4-quality-compared-with-vllms-cache-formats):
+
+| | 16-bit cache | kushkash int4 |
+|---|---|---|
+| KV tokens (one engine; each GPU holds its KV heads' share) | 197,216 | 666,336 (3.38x) |
+| Perplexity | 7.4764 | 7.4837 |
+| Δppl [95% CI] | — | +0.0073 [+0.0046, +0.0100] (one L4: +0.0074) |
+| Top-1 agreement | — | 98.17% |
+
+`tests/test_vllm_gpu.py` also checks passkey retrieval, determinism and capacity at 2 GPUs. **Not tested:** the
+tensor-core kernel under tensor parallelism (T4 uses the CUDA-core kernel), 4 or more GPUs (KV heads replicated when
+there are fewer than GPUs), throughput, the RAM tier together with tensor parallelism.
+
+```bash
+python bench/quality.py --models Qwen/Qwen2.5-7B-Instruct --kv auto,kush4 --gsm8k-n 0 --tensor-parallel 2 \
+    --out-dir quality-tp2     # a directory with 1-GPU results is refused
 ```
 
 ### System RAM as a second cache tier
@@ -619,7 +641,7 @@ Results that differ from the README's, or come from other GPUs and models, are w
 | `pytest tests/test_quality_stats.py tests/test_rivals_cpu.py tests/test_niah_cpu.py tests/test_headline_cpu.py tests/test_smoke_models.py` | nothing | benchmark statistics, reports and gates |
 | `pytest tests/test_vllm_backend_cpu.py tests/test_packed_microbench_cpu.py tests/test_steady_cpu.py` | vLLM importable | vLLM backend on CPU, benchmark gates, whole-wave window |
 | `pytest tests/test_gpu.py` | NVIDIA GPU | GPU vs CPU pages, decode vs reference, HF on GPU |
-| `pytest tests/test_vllm_gpu.py -s` (or `python tests/test_vllm_gpu.py` for every execution mode) | GPU + vLLM | end-to-end serving: passkey, prefix caching, RAM tier |
+| `pytest tests/test_vllm_gpu.py -s` (or `python tests/test_vllm_gpu.py` for every execution mode) | GPU + vLLM | end-to-end serving: passkey, prefix caching, RAM tier, tensor parallelism (2 / 4 GPUs, skipped with fewer) |
 | `pytest tests/test_vllm_memory_gpu.py` | GPU + vLLM | startup memory planning covers every step |
 | `pytest tests/test_sglang_gpu.py -s` | GPU + SGLang | radix-cache prefixes that end mid-page |
 
@@ -672,7 +694,8 @@ helps if attention can read it without unpacking all of it into a full-size copy
    server load with either cache ([under load](#under-serving-load)).
 6. **All performance numbers are GPU numbers.** The CPU kernels match the GPU's pages; no CPU performance is claimed.
 7. **Not measured yet:** contexts beyond 128k, long context on more than two model families, Llama through SGLang,
-   H100 / B200 (including vLLM's `nvfp4` cache), tensor parallelism, the RAM tier under concurrent sessions.
+   H100 / B200 (including vLLM's `nvfp4` cache), tensor-parallel throughput, the tensor-core kernel under tensor
+   parallelism, 4+ GPUs, the RAM tier under concurrent sessions.
 
 Tried and ruled out (measured or reasoned): an 8-bit exact key buffer, low-rank values, per-layer bit widths, lower
 bits for older pages, 2 and 3 bits (everywhere or per page), page skipping, special treatment of the first tokens,

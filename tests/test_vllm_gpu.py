@@ -143,6 +143,9 @@ if __name__ == "__main__":     # bisect: which vLLM execution mode breaks the ba
         ("default", {}),
         ("default, no async scheduling", dict(llm_kwargs={"async_scheduling": False})),
         ("default, KUSHKASH_SYNC=1", dict(env_extra={"KUSHKASH_SYNC": "1"})),
+    ] + [
+        (f"tensor parallel {n}", dict(llm_kwargs={"tensor_parallel_size": n}))
+        for n in (2, 4) if torch.cuda.device_count() >= n
     ]
     for name, kw in configs:
         try:
@@ -151,3 +154,19 @@ if __name__ == "__main__":     # bisect: which vLLM execution mode breaks the ba
             print(f"{name:32s} passkey {hits}/8   first: {r['texts'][0][:40]!r}", flush=True)
         except AssertionError as e:
             print(f"{name:32s} FAILED: {str(e)[-300:]}", flush=True)
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_vllm_tensor_parallel(tp):
+    """Tensor parallelism: each GPU holds its share of the KV heads (Qwen2.5-1.5B has 2: at tp 2 one per GPU, at tp 4
+    vLLM replicates them). Same passkey, determinism and capacity checks as test_vllm_backend, against auto at the
+    same tp (greedy text is not compared with tp 1: the all-reduce changes rounding)."""
+    if torch.cuda.device_count() < tp:
+        pytest.skip(f"needs {tp} GPUs")
+    ref = run("auto", llm_kwargs={"tensor_parallel_size": tp})
+    r = run("kush", bits=4, llm_kwargs={"tensor_parallel_size": tp})
+    hits = sum(k in t for k, t in zip(r["keys"] + r["keys"][:2], r["texts"]))
+    assert hits >= 7, r["texts"]
+    assert r["texts"][6:] == r["texts"][:2]
+    ratio = r["kv_tokens"] / ref["kv_tokens"]
+    assert ratio > 3.0, ratio

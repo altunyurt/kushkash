@@ -49,13 +49,15 @@ def run_one(a):
               enable_prefix_caching=False, enable_chunked_prefill=True, max_num_batched_tokens=a.batched_tokens,
               **({"max_num_seqs": a.max_num_seqs} if a.max_num_seqs else {}),
               **({"kv_cache_memory_bytes": int(a.kv_gib * 2**30)} if a.kv_gib else {}),
-              quantization=a.quantization, seed=0, disable_log_stats=False, **extra)   # stats: preemptions etc.
+              quantization=a.quantization, tensor_parallel_size=a.tensor_parallel, seed=0, disable_log_stats=False,
+              **extra)   # stats: preemptions etc.
     cc = llm.llm_engine.vllm_config.cache_config
     log(f"engine ready: KV capacity {cc.kv_cache_size_tokens} tokens")
     res = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "kv_tokens": cc.kv_cache_size_tokens,
            "attn_block": cc.effective_attention_block_size, "kv_gib": a.kv_gib,
            "max_num_seqs": llm.llm_engine.vllm_config.scheduler_config.max_num_seqs,
-           "quantization": a.quantization}                 # weights (None = checkpoint dtype)
+           "quantization": a.quantization,                 # weights (None = checkpoint dtype)
+           "tensor_parallel": a.tensor_parallel}           # kv_tokens: per engine (each GPU holds its heads' share)
     if a.kv.startswith("kush"):                       # Hadamard rotation in the cache (auto = on for 4-bit)
         from kushkash._ops import rotation_enabled
         res["rotate"] = rotation_enabled(int(a.kv[4:]))
@@ -145,6 +147,7 @@ def main():
     ap.add_argument("--one", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--max-len", type=int, default=17408)
     ap.add_argument("--mem", type=float, default=0.90)
+    ap.add_argument("--tensor-parallel", type=int, default=1, help="GPUs per engine (vLLM tensor_parallel_size)")
     ap.add_argument("--batched-tokens", type=int, default=256, help="prefill chunk (small = cache-heavy ppl)")
     ap.add_argument("--max-num-seqs", type=int, default=None,
                     help="vLLM max_num_seqs for all configs; per config: --kv auto@17,kush4@56")

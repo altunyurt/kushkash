@@ -106,7 +106,8 @@ def compare(args: list[str], tmp: str) -> list[dict]:
     if os.path.exists(tmp):
         os.remove(tmp)
     cmd = [sys.executable, os.path.join(HERE, "vllm_compare.py"), "--model", ARGS.model, "--out", tmp,
-           "--max-len", str(SEQ), "--batched-tokens", str(ARGS.batched_tokens), "--mem", str(ARGS.mem)] + args
+           "--max-len", str(SEQ), "--batched-tokens", str(ARGS.batched_tokens), "--mem", str(ARGS.mem),
+           "--tensor-parallel", str(getattr(ARGS, "tensor_parallel", 1))] + args
     if ARGS.quantization:
         cmd += ["--quantization", ARGS.quantization]
     subprocess.run(cmd, check=True)
@@ -140,6 +141,11 @@ def run():
     out, tmp = ARGS.out, ARGS.out + ".part"
     kvs = ARGS.kv.split(",")
     done = load(out)
+    tp = getattr(ARGS, "tensor_parallel", 1)
+    other = {r.get("tensor_parallel", 1) for r in done} - {tp}   # rows from before the option: 1 GPU
+    if other:
+        sys.exit(f"{out} holds rows measured with --tensor-parallel {sorted(other)}, this run asks for {tp}: "
+                 "use another --out")
     cap = {r["kv"]: r for r in done if r.get("phase") == "capacity"}
     for kv in kvs:                                   # 1. capacity at vLLM's default max_num_seqs, one engine each
         if kv not in cap:
@@ -241,6 +247,8 @@ if __name__ == "__main__":
     ap.add_argument("--tp-seconds", type=float, default=300,
                     help="minimum window; it closes at the next wave boundary (1 = exactly one wave per run)")
     ap.add_argument("--mem", type=float, default=0.90, help="gpu_memory_utilization (kushkash's buffers are charged)")
+    ap.add_argument("--tensor-parallel", type=int, default=1,
+                    help="GPUs per engine; clocks and memory checks read the first visible GPU only")
     ap.add_argument("--batched-tokens", type=int, default=8192)
     ap.add_argument("--quantization", default=None, help="weights, if the checkpoint does not say (AWQ checkpoints do)")
     ap.add_argument("--out", default="rivals.jsonl", help="results; rerunning resumes, skipping finished runs")

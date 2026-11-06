@@ -446,7 +446,7 @@ def run_one(a):
     log(f"{a.model} kv={a.kv}: loading")
     llm = LLM(model=a.model, max_model_len=a.max_len, gpu_memory_utilization=a.mem, enable_prefix_caching=False,
               enable_chunked_prefill=True, max_num_batched_tokens=a.batched_tokens, quantization=a.quantization,
-              seed=0, **extra)
+              tensor_parallel_size=a.tensor_parallel, seed=0, **extra)
     apps1 = compute_apps()
     guard = guard_status(apps0, apps1, own_pids()) if apps0 is not None and apps1 is not None \
         else {"status": "unavailable"}
@@ -455,7 +455,8 @@ def run_one(a):
             "this run's KV capacity is not comparable")
     cc = llm.llm_engine.vllm_config.cache_config
     meta = {"vllm": vllm.__version__, "model": a.model, "kv": a.kv, "kv_tokens": cc.kv_cache_size_tokens,
-            "quantization": a.quantization, "win": a.win, "split": a.split, "batched_tokens": a.batched_tokens,
+            "quantization": a.quantization, "tensor_parallel": a.tensor_parallel, "win": a.win, "split": a.split,
+            "batched_tokens": a.batched_tokens,
             "mem": a.mem, "max_len": a.max_len, "dual_chunk_dropped": "hf_overrides" in extra,
             "max_num_seqs": llm.llm_engine.vllm_config.scheduler_config.max_num_seqs, "gpu_guard": guard,
             "env": {k: v for k, v in os.environ.items() if k.startswith(("KUSHKASH_", "VLLM_", "PYTORCH_CUDA"))}}
@@ -538,6 +539,7 @@ def main():
     ap.add_argument("--quantization", default=None, help="weights, e.g. fp8")
     ap.add_argument("--max-len", type=int, default=4096)
     ap.add_argument("--mem", type=float, default=0.90)
+    ap.add_argument("--tensor-parallel", type=int, default=1, help="GPUs per engine (vLLM tensor_parallel_size)")
     ap.add_argument("--batched-tokens", type=int, default=256, help="prefill chunk (small = ppl reads the cache)")
     ap.add_argument("--win", type=int, default=2048)
     ap.add_argument("--split", default="test", choices=["test", "train", "pg19"],
@@ -569,6 +571,10 @@ def main():
         for kv in kvs:
             done = os.path.join(a.out_dir, slug(model), kv + ".json")
             if os.path.exists(done):
+                tp = json.load(open(done)).get("tensor_parallel", 1)      # rows from before the option: 1 GPU
+                if tp != a.tensor_parallel:
+                    sys.exit(f"{done} was measured with --tensor-parallel {tp}, this run asks for "
+                             f"{a.tensor_parallel}: use another --out-dir")
                 log(f"{model} {kv}: saved, skipped")
                 continue
             wait_gpu_free()
