@@ -112,7 +112,8 @@ def build_cases(tok, hay_ids: list, lengths: list, depths: int, per_cell: int, n
                         f"\n\nWhat is the special magic number for {keys[0]} mentioned in the text above? "
                         "Answer with the number only.")
                 prompt = tok.apply_chat_template([{"role": "user", "content": user}], tokenize=False,
-                                                 add_generation_prompt=True) + answer_prefix(keys[0])
+                                                 add_generation_prompt=True, enable_thinking=False)
+                prompt += answer_prefix(keys[0])
                 cases.append({"length": L, "depth": depth, "key": keys[0], "value": values[0], "prompt": prompt,
                               "answer": " " + values[0]})
     return cases

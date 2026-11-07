@@ -159,3 +159,40 @@ def test_format_check_stops_a_fallen_back_backend(stub, monkeypatch, capsys):
     with pytest.raises(SystemExit, match="kush4 holds 1.00x"):
         rv.run()
     assert not any("@" in c for c in calls)                                      # no throughput run started
+
+
+def test_max_seqs_caps_every_phase(stub):
+    """--max-seqs (hybrid models: vLLM allows at most one running request per Mamba state block): the capacity pass
+    runs at the cap instead of vLLM's default, and no throughput run asks for more."""
+    out, calls = stub
+    rv.ARGS.repeats, rv.ARGS.max_seqs = 1, 20
+    rv.run()
+    kvs = rv.KV_DEFAULT.split(",")
+    assert calls[:4] == [f"{kv}@20" for kv in kvs]
+    assert "auto@6" in calls[4:] and "kush4@19" in calls[4:] and "int4_per_token_head@20" in calls[4:]
+
+
+def test_request_lengths(stub):
+    """--prompt-len / --out-len: max_len and max_num_seqs follow the request length, the lengths are recorded, and
+    a results file from other lengths is refused instead of mixed."""
+    out, calls = stub
+    rv.ARGS.repeats, rv.ARGS.prompt_len, rv.ARGS.out_len = 1, 6144, 2048     # 8,192 tokens per request
+    rv.run()
+    assert "auto@3" in calls[4:] and "kush4@9" in calls[4:]                 # 28,544 // 8,192, 81,696 // 8,192
+    rows = rv.load(out)
+    assert {(r["prompt_len"], r["out_len"]) for r in rows} == {(6144, 2048)}
+    rv.ARGS.prompt_len = None                                               # back to 2,048 + 2,048: refused
+    with pytest.raises(SystemExit, match="lengths"):
+        rv.run()
+
+
+def test_max_seqs_is_part_of_the_resume_identity(stub):
+    """A results file measured with one --max-seqs is refused by a run with another (or none): the capacity pass,
+    run at the cap, would otherwise be reused."""
+    out, calls = stub
+    rv.ARGS.repeats, rv.ARGS.max_seqs = 1, 20
+    rv.run()
+    assert {r["max_seqs_cap"] for r in rv.load(out)} == {20}
+    rv.ARGS.max_seqs = None
+    with pytest.raises(SystemExit, match="max-seqs"):
+        rv.run()

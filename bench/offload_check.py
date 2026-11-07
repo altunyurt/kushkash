@@ -90,7 +90,8 @@ def passkey_prompts(rng, n, tokens, ask="What is the pass key? Answer with the n
         pos = rng.randint(0, reps - 1)
         body = FILL * pos + f" The pass key is {key}. Remember it. {key} is the pass key. " + FILL * (reps - pos)
         msg = [{"role": "user", "content": body + "\n" + ask}]
-        prompts.append(tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True))
+        prompts.append(tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True,
+                                               enable_thinking=False))
         keys.append(key)
     return prompts, keys
 

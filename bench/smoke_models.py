@@ -266,7 +266,8 @@ def passkey_prompt(tok, key: int, n_tokens: int = 3000) -> str:
 
 def chat(tok, text: str) -> str:
     if getattr(tok, "chat_template", None):
-        return tok.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True)
+        return tok.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True,
+                                       enable_thinking=False)
     return text
 
 

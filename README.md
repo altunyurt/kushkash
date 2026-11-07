@@ -12,7 +12,7 @@ compressed cache directly. The kernels run on NVIDIA GPUs and on CPUs.
 | Perplexity | about +0.1%; no measurable growth up to 128k tokens, idle or under full load |
 | GSM8K accuracy | unchanged |
 | Serving throughput | 2.6x on an L4, 2.2x on an RTX PRO 6000 |
-| Not covered | hybrid, MLA and sliding-window models (refused), H100 / B200, tensor-parallel throughput, models above 8B |
+| Not covered | MLA and sliding-window models (refused), hybrid models outside vLLM, Mamba-2 hybrids, H100 / B200, tensor-parallel throughput, non-hybrid models above 8B |
 
 Outputs are not batch-invariant, with a 16-bit cache too: the same prompt can give slightly different text on a busy
 server, and kushkash int4 changes the top choice at about 1.7x as many positions ([under load](#under-serving-load)).
@@ -394,8 +394,8 @@ Both buffers come out of the memory vLLM would otherwise give to the KV cache.
 
 | | |
 |---|---|
-| **Works with** | chunked prefill, prefix caching, preemption, CUDA graphs, `torch.compile`, CPU offloading (below), tensor parallelism ([2 GPUs tested](#tensor-parallelism)), FP8 weights (1.90x the 16-bit cache's throughput on an L4, Qwen2.5-7B; fixed-window measurement), AWQ weights ([quality](#on-awq-4-bit-weights)) |
-| **Needs** | vLLM 0.31.x with its default model runner, an NVIDIA GPU, a decoder-only model with full attention, head size 64, 128 or 256, fp16 or bf16 |
+| **Works with** | chunked prefill, prefix caching, preemption, CUDA graphs, `torch.compile`, CPU offloading (below), tensor parallelism ([2 GPUs tested](#tensor-parallelism)), [hybrid models](#hybrid-models-qwen35--36) (Gated DeltaNet + attention), FP8 weights (1.90x the 16-bit cache's throughput on an L4, Qwen2.5-7B; fixed-window measurement), AWQ weights ([quality](#on-awq-4-bit-weights)) |
+| **Needs** | vLLM 0.31.x with its default model runner, an NVIDIA GPU, a decoder-only model whose attention layers use full attention (other layers may be linear attention: [hybrids](#hybrid-models-qwen35--36)), head size 64, 128 or 256, fp16 or bf16 |
 | **Refuses to start** (with an error saying why) | speculative decoding, sliding-window attention, ALiBi, logit soft-capping, attention sinks, MLA, cross-layer KV sharing, micro-batching (`--enable-dbo`, `--ubatch-size`) |
 
 **Qwen2.5-*-1M models** carry `dual_chunk_attention_config`, which vLLM 0.31 has no backend for. Drop it by saving
@@ -431,6 +431,47 @@ there are fewer than GPUs), throughput, the RAM tier together with tensor parall
 python bench/quality.py --models Qwen/Qwen2.5-7B-Instruct --kv auto,kush4 --gsm8k-n 0 --tensor-parallel 2 \
     --out-dir quality-tp2     # a directory with 1-GPU results is refused
 ```
+
+### Hybrid models (Qwen3.5 / 3.6)
+
+Models that mix linear-attention layers (Gated DeltaNet) with attention layers run on vLLM with nothing to set.
+kushkash compresses the attention layers' cache; the linear layers keep a fixed-size state per request, which it does
+not touch. Measured on an RTX PRO 6000 (96 GB), bf16 weights, vLLM 0.31, one run each:
+
+| | Qwen3.6-35B-A3B (MoE) | Qwen3.6-27B (dense) |
+|---|---|---|
+| Layers: attention / total | 10 / 40 | 16 / 64 |
+| Δppl [95% CI] (as in [section 4](#4-quality-compared-with-vllms-cache-formats)) | +0.0053 [+0.0014, +0.0092] | -0.0078 [-0.0158, -0.0003] |
+| Passkey at 8k / 16k tokens (both caches) | 10/10, 10/10 | 10/10, 10/10 |
+| Prefix caching (`bench/prefix_check.py`, 11.7k-token shared prompt) | 10/10 keys on and off; 88,320 tokens from cache (16-bit: 104,544) | 10/10; 88,064 (16-bit: 98,784) |
+| Requests that fit, vs the 16-bit cache: 4k-token requests | 1.38x | not measured |
+| 18k-token requests | 2.30x | 2.66x |
+| 32k-token requests | 2.90x | 2.95x |
+| Output tok/s vs the 16-bit cache (16k prompt + 2k output, whole waves) | 1.63x | 1.65x |
+
+The gain grows with request length because vLLM sizes every cache block to one linear-layer state, and each
+request holds a few such state blocks whatever its length:
+
+```
+memory per request = 3 state blocks (fixed, not compressed) + attention blocks for its tokens
+Qwen3.6-35B-A3B block: 1,056 tokens (16-bit) or 3,680 tokens (kushkash int4)
+  4k request:  16-bit 3 + 4 = 7 blocks   kushkash 3 + 2 = 5   -> 1.4x the requests
+  32k request: 16-bit 3 + 32 = 35        kushkash 3 + 9 = 12  -> 2.9x
+```
+
+Throughput gains less than capacity here: with 16k prompts most of each step is prefill work, so more requests per
+step mean more compute (power and clock limits were reached). **Not tested:** Mamba-2 hybrids (Nemotron-H),
+prefix-cache eviction with many users, short-prompt throughput, SGLang and Hugging Face transformers (both still
+refuse hybrid models).
+
+```bash
+python bench/quality.py --models Qwen/Qwen3.6-35B-A3B --kv auto,kush4 --gsm8k-n 0 --max-len 32768
+python bench/rivals.py --model Qwen/Qwen3.6-35B-A3B --kv auto,kush4 --repeats 1 --tp-seconds 1 \
+    --max-seqs 768 --prompt-len 16384 --out-len 2048 --min-ratio 1.5
+python bench/prefix_check.py --model Qwen/Qwen3.6-35B-A3B
+```
+
+`--max-seqs`: vLLM refuses more running requests than it has state blocks (779 for this model on 96 GB).
 
 ### System RAM as a second cache tier
 
@@ -638,8 +679,8 @@ Results that differ from the README's, or come from other GPUs and models, are w
 | `pytest tests/test_cpu.py` | nothing | format, kernels vs a reference, HF generation (tiny models) |
 | `pytest tests/test_ragged.py` | nothing | vLLM-style mixed batches against ground truth |
 | `pytest tests/test_sglang_backend_cpu.py` | nothing (SGLang stubbed) | SGLang backend bookkeeping |
-| `pytest tests/test_quality_stats.py tests/test_rivals_cpu.py tests/test_niah_cpu.py tests/test_headline_cpu.py tests/test_smoke_models.py` | nothing | benchmark statistics, reports and gates |
-| `pytest tests/test_vllm_backend_cpu.py tests/test_packed_microbench_cpu.py tests/test_steady_cpu.py` | vLLM importable | vLLM backend on CPU, benchmark gates, whole-wave window |
+| `pytest tests/test_quality_stats.py tests/test_rivals_cpu.py tests/test_niah_cpu.py tests/test_headline_cpu.py tests/test_smoke_models.py tests/test_prefix_check_cpu.py` | nothing | benchmark statistics, reports and gates |
+| `pytest tests/test_vllm_backend_cpu.py tests/test_packed_microbench_cpu.py tests/test_steady_cpu.py tests/test_vllm_hybrid_cpu.py` | vLLM importable | vLLM backend on CPU, benchmark gates, whole-wave window, hybrid-model metadata |
 | `pytest tests/test_gpu.py` | NVIDIA GPU | GPU vs CPU pages, decode vs reference, HF on GPU |
 | `pytest tests/test_vllm_gpu.py -s` (or `python tests/test_vllm_gpu.py` for every execution mode) | GPU + vLLM | end-to-end serving: passkey, prefix caching, RAM tier, tensor parallelism (2 / 4 GPUs, skipped with fewer) |
 | `pytest tests/test_vllm_memory_gpu.py` | GPU + vLLM | startup memory planning covers every step |
@@ -651,6 +692,7 @@ Results that differ from the README's, or come from other GPUs and models, are w
 |---|---|
 | `python bench/vllm_compare.py --kv auto,kush4,kush8` | capacity, perplexity, passkey, throughput per cache type (`--kv` takes vLLM's `kv_cache_dtype` values plus `kush4` / `kush8`; `kush4@64` sets `max_num_seqs`) |
 | `python bench/offload_check.py` | RAM tier: offloaded pages are correct |
+| `python bench/prefix_check.py --model M` | prefix caching with one long shared prompt (hybrid models' large blocks): hits, right keys, repeats |
 | `python bench/packed_microbench.py --max-len 4096` | prefill attention per layer (no model) |
 | `python bench/bench_decode.py [--shape 128,4096 --only kush4 --profile]` | decode kernel time, optionally vs FlashInfer; `--profile` for Nsight Compute |
 | `python bench/bench_e2e.py --model Qwen/Qwen2.5-1.5B-Instruct --batch 4 --prompt 8192 --new 128` | Hugging Face: kushkash vs `DynamicCache` |

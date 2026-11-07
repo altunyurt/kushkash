@@ -547,7 +547,9 @@ class KushMetadataBuilder(AttentionMetadataBuilder[KushMetadata]):
               fast_build: bool = False) -> KushMetadata:
         cam = common_attn_metadata
         if cam.req_idx is None:
-            raise RuntimeError("kushkash needs vLLM's model runner V2 (unset VLLM_USE_V2_MODEL_RUNNER=0)")
+            raise RuntimeError("kushkash: vLLM passed no req_idx (request-state index) in the attention metadata. "
+                               "Model runner V1 never does (unset VLLM_USE_V2_MODEL_RUNNER=0); in V2 a model state "
+                               "kushkash does not patch (kushkash.vllm.patch_hybrid_req_idx covers hybrid models)")
         self._builds += 1
         self._poll_seq_lens_flag()
         nd, n_pre, _, _ = split_decodes_and_prefills(cam, decode_threshold=1)

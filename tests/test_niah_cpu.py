@@ -20,7 +20,7 @@ class CharTok:
     def decode(self, ids):
         return "".join(chr(i) for i in ids)
 
-    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True, **kw):
         return "<user>" + msgs[0]["content"] + "<assistant>"
 
 

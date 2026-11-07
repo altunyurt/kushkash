@@ -34,7 +34,16 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SEQ = 4096                                           # 2,048 prompt + 2,048 output tokens per request
+SEQ = 4096                                           # default: 2,048 prompt + 2,048 output tokens per request
+
+
+def lens() -> tuple[int, int]:
+    """(prompt, output) tokens per request: --prompt-len / --out-len, default 2,048 each."""
+    return getattr(ARGS, "prompt_len", None) or SEQ // 2, getattr(ARGS, "out_len", None) or SEQ // 2
+
+
+def seq_len() -> int:
+    return sum(lens())
 KV_DEFAULT = "auto,int4_per_token_head,turboquant_4bit_nc,kush4"
 
 
@@ -106,7 +115,7 @@ def compare(args: list[str], tmp: str) -> list[dict]:
     if os.path.exists(tmp):
         os.remove(tmp)
     cmd = [sys.executable, os.path.join(HERE, "vllm_compare.py"), "--model", ARGS.model, "--out", tmp,
-           "--max-len", str(SEQ), "--batched-tokens", str(ARGS.batched_tokens), "--mem", str(ARGS.mem),
+           "--max-len", str(seq_len()), "--batched-tokens", str(ARGS.batched_tokens), "--mem", str(ARGS.mem),
            "--tensor-parallel", str(getattr(ARGS, "tensor_parallel", 1))] + args
     if ARGS.quantization:
         cmd += ["--quantization", ARGS.quantization]
@@ -115,6 +124,7 @@ def compare(args: list[str], tmp: str) -> list[dict]:
 
 
 MIN_RATIO = {"kush4": 2.0, "kush8": 1.2}           # vs auto's KV tokens: below this the format is not really on
+# (hybrid models hold fixed per-request states; short requests there fall below 2.0x with the format on: --min-ratio)
 
 
 def format_check(cap: dict) -> list:
@@ -125,6 +135,8 @@ def format_check(cap: dict) -> list:
     bad = []
     for kv, r in cap.items():
         need, got = MIN_RATIO.get(kv), r.get("kv_tokens")
+        if need and getattr(ARGS, "min_ratio", None) is not None:
+            need = ARGS.min_ratio
         if need and base and got and got < need * base:
             bad.append(f"{kv} holds {got / base:.2f}x the tokens of auto (expected >= {need}x): is the kushkash "
                        "backend really on?")
@@ -146,18 +158,32 @@ def run():
     if other:
         sys.exit(f"{out} holds rows measured with --tensor-parallel {sorted(other)}, this run asks for {tp}: "
                  "use another --out")
+    other = {(r.get("prompt_len", SEQ // 2), r.get("out_len", SEQ // 2)) for r in done} - {lens()}
+    if other:
+        sys.exit(f"{out} holds rows measured with (prompt, output) lengths {sorted(other)}, this run asks for "
+                 f"{lens()}: use another --out")
+    cap_seqs = getattr(ARGS, "max_seqs", None)
+    other = {r.get("max_seqs_cap") for r in done} - {cap_seqs}          # rows from before the option: no cap
+    if other:
+        sys.exit(f"{out} holds rows measured with --max-seqs {sorted(other, key=str)}, this run asks for "
+                 f"{cap_seqs}: use another --out")
     cap = {r["kv"]: r for r in done if r.get("phase") == "capacity"}
     for kv in kvs:                                   # 1. capacity at vLLM's default max_num_seqs, one engine each
         if kv not in cap:
-            for r in compare(["--kv", kv, "--capacity-only"], tmp):
-                r.update(phase="capacity", mem=ARGS.mem)
+            cap_kv = f"{kv}@{ARGS.max_seqs}" if getattr(ARGS, "max_seqs", None) else kv
+            for r in compare(["--kv", cap_kv, "--capacity-only"], tmp):
+                r.update(phase="capacity", mem=ARGS.mem, prompt_len=lens()[0], out_len=lens()[1],
+                         max_seqs_cap=getattr(ARGS, "max_seqs", None))
                 append(out, r)
                 cap[kv] = r
     bad = format_check(cap)
     if bad:
         sys.exit("format check failed, no throughput runs:\n  " + "\n  ".join(bad))
-    seqs = {kv: max(1, cap[kv]["kv_tokens"] // SEQ) for kv in kvs}
-    print("max_num_seqs per format (KV tokens // 4,096): " + ", ".join(f"{k} {v}" for k, v in seqs.items()), flush=True)
+    seqs = {kv: max(1, cap[kv]["kv_tokens"] // seq_len()) for kv in kvs}
+    if getattr(ARGS, "max_seqs", None):                # hybrid models: one Mamba state block per running request
+        seqs = {kv: min(n, ARGS.max_seqs) for kv, n in seqs.items()}
+    print(f"max_num_seqs per format (KV tokens // {seq_len():,}): " + ", ".join(f"{k} {v}" for k, v in seqs.items()),
+          flush=True)
     have = {(r["kv"], r["rep"]) for r in done if r.get("phase") == "throughput"}
     tel = Telemetry()
     for rep in range(ARGS.repeats):                  # 2. throughput, every format once per repeat, rotated order
@@ -168,11 +194,12 @@ def run():
             tel.start()
             t0 = time.time()
             rows = compare(["--kv", f"{kv}@{seqs[kv]}", "--only-throughput", "--tp-seconds", str(ARGS.tp_seconds),
-                            "--tp-n", str(queue_len(seqs[kv])), "--tp-len", "2048", "--tp-out", "2048",
+                            "--tp-n", str(queue_len(seqs[kv])), "--tp-len", str(lens()[0]), "--tp-out", str(lens()[1]),
                             "--whole-waves"], tmp)
             g = tel.stop()
             for r in rows:
-                r.update(phase="throughput", rep=rep, mem=ARGS.mem, wall_s=round(time.time() - t0), **g)
+                r.update(phase="throughput", rep=rep, mem=ARGS.mem, wall_s=round(time.time() - t0),
+                         prompt_len=lens()[0], out_len=lens()[1], max_seqs_cap=getattr(ARGS, "max_seqs", None), **g)
                 append(out, r)
     summarize(out)
 
@@ -189,7 +216,8 @@ def summarize(path):
     reps = sorted({r["rep"] for r in tp})
     m = rows[-1]
     print(f"\nModel {m.get('model')}, weights {m.get('quantization') or 'checkpoint'}, vLLM {m.get('vllm')}, "
-          f"gpu_memory_utilization {m.get('mem')}, max_model_len {SEQ}, repeats {len(reps)}\n")
+          f"gpu_memory_utilization {m.get('mem')}, requests {m.get('prompt_len', SEQ // 2):,} + "
+          f"{m.get('out_len', SEQ // 2):,} tokens, repeats {len(reps)}\n")
     hdr = ["format", "KV tokens held", f"x {base}", "max_num_seqs", "out tok/s median", "range", f"x {base} (paired)",
            "in flight", "preemptions", "ms/step", "SM MHz median (min)"]
     print("| " + " | ".join(hdr) + " |\n|" + "---|" * len(hdr))
@@ -247,6 +275,11 @@ if __name__ == "__main__":
     ap.add_argument("--tp-seconds", type=float, default=300,
                     help="minimum window; it closes at the next wave boundary (1 = exactly one wave per run)")
     ap.add_argument("--mem", type=float, default=0.90, help="gpu_memory_utilization (kushkash's buffers are charged)")
+    ap.add_argument("--prompt-len", type=int, help="prompt tokens per request (default 2,048)")
+    ap.add_argument("--out-len", type=int, help="output tokens per request (default 2,048)")
+    ap.add_argument("--min-ratio", type=float, help="kushkash capacity check vs auto (default kush4 2.0, kush8 1.2)")
+    ap.add_argument("--max-seqs", type=int, help="cap max_num_seqs in every phase (hybrid models: vLLM refuses more "
+                    "running requests than it has Mamba state blocks, e.g. 779 for Qwen3.6-35B-A3B on 96 GB)")
     ap.add_argument("--tensor-parallel", type=int, default=1,
                     help="GPUs per engine; clocks and memory checks read the first visible GPU only")
     ap.add_argument("--batched-tokens", type=int, default=8192)

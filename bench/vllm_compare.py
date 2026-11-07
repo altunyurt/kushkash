@@ -91,7 +91,8 @@ def run_one(a):
                 pos = rng.randint(0, n_fill - 1)
                 body = filler * pos + f" The pass key is {key}. Remember it. {key} is the pass key. " + filler * (n_fill - pos)
                 msg = [{"role": "user", "content": body + "\nWhat is the pass key? Answer with the number only."}]
-                prompts.append(tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True))
+                prompts.append(tok.apply_chat_template(msg, tokenize=False, add_generation_prompt=True,
+                                                       enable_thinking=False))
                 keys.append(key)
             outs = llm.generate(prompts, SamplingParams(max_tokens=12, temperature=0), use_tqdm=False)
             res[f"passkey_{L // 1024}k"] = f"{sum(k in o.outputs[0].text for k, o in zip(keys, outs))}/{len(keys)}"
