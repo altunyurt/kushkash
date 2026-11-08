@@ -71,8 +71,12 @@ MODELS = [
     "microsoft/Phi-3.5-mini-instruct",              # expected: refused (head size 96)
     "unsloth/gemma-2-2b-it",                        # expected: refused (sliding window, soft-capping)
 ]
-HYBRID = {"jamba", "falcon_h1", "nemotron_h", "qwen3_next", "granitemoehybrid", "zamba", "zamba2", "bamba", "lfm2",
-          "mamba", "mamba2", "recurrent_gemma"}
+# Hybrids: attention layers mixed with Mamba / linear-attention layers. vLLM runs them with kushkash (v0.6.0); tested:
+# Qwen3.5 / 3.6 (layer_types "linear_attention"). The others are predicted to run, untested.
+HYBRID = {"jamba", "falcon_h1", "nemotron_h", "qwen3_next", "granitemoehybrid", "zamba", "zamba2", "bamba", "lfm2"}
+HYBRID_TESTED = {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
+RECURRENT = {"mamba", "mamba2", "recurrent_gemma", "rwkv", "rwkv5", "rwkv6", "rwkv7"}   # no full-attention KV to hold
+NONFULL_OK = {"full_attention", "linear_attention"}                                     # layer_types kushkash accepts
 PROMPTS = ["What is the capital of France? Answer in one sentence.",
            "Write a Python function that returns the n-th Fibonacci number.",
            "Explain in two sentences why the sky is blue.",
@@ -91,8 +95,15 @@ def config_check(cfg: dict) -> dict:
     if D not in (64, 128, 256):
         refused.append(f"head size {D}")
     lt = c.get("layer_types") or []
-    if any(t != "full_attention" for t in lt):
-        refused.append("non-full layers (" + ", ".join(sorted({t for t in lt if t != "full_attention"})) + ")")
+    if any(t not in NONFULL_OK for t in lt):
+        refused.append("non-full layers (" + ", ".join(sorted({t for t in lt if t not in NONFULL_OK})) + ")")
+    if lt and "full_attention" not in lt:
+        refused.append("no full-attention layers")              # nothing for kushkash to hold
+    hybrid = None
+    if "linear_attention" in lt or mt in HYBRID_TESTED:
+        hybrid = "tested" if mt in HYBRID_TESTED else "untested"
+    elif mt in HYBRID:
+        hybrid = "untested"
     sw = c.get("sliding_window")
     if sw and c.get("use_sliding_window", True) is not False:     # the backend refuses any window, binding or not
         refused.append(f"sliding window {sw}")
@@ -102,8 +113,8 @@ def config_check(cfg: dict) -> dict:
         refused.append("ALiBi")
     if c.get("kv_lora_rank"):
         refused.append("MLA")
-    if mt in HYBRID or mt.startswith("mamba"):
-        refused.append(f"hybrid / recurrent ({mt})")
+    if mt in RECURRENT or (mt.startswith("mamba") and mt not in HYBRID):
+        refused.append(f"recurrent, no attention layers ({mt})")
     if mt == "gpt_oss":
         refused.append("attention sinks")
     if c.get("attention_chunk_size"):
@@ -114,12 +125,15 @@ def config_check(cfg: dict) -> dict:
         notes.append("dual_chunk_attention_config dropped (plain RoPE)")
     if cfg.get("quantization_config"):
         notes.append(f"weights: {cfg['quantization_config'].get('quant_method', '?')}")
+    if hybrid and not refused:
+        notes.append(f"hybrid (Mamba / linear-attention layers), vLLM only: {hybrid}")
     G = heads // kv if heads and kv else None
     kernel = ("tensor cores (sm_80+)" if D in (128, 256) and G and G <= 8 else "CUDA cores") if D else "?"
     w = weights_of(cfg)
     if w.startswith("mlx"):
         notes.append("MLX weights: vLLM cannot load them")
     return {"refused": refused, "notes": notes, "kernel": kernel, "head_size": D, "group": G, "model_type": mt,
+            "hybrid": hybrid,
             "weights": w, "params_cfg": estimate_params(c, heads, kv, D, hidden)}
 
 
@@ -247,7 +261,9 @@ def predicted(c: dict) -> str:
         return "GGUF: not started (see the base model's row)"
     if str(c.get("weights", "")).startswith("mlx"):
         return "MLX: vLLM cannot load it"
-    return "config not readable" if c.get("kernel") == "?" else "runs"
+    if c.get("kernel") == "?":
+        return "config not readable"
+    return {"tested": "runs (hybrid)", "untested": "runs (hybrid, untested)"}.get(c.get("hybrid"), "runs")
 
 
 def fetch_config(model: str) -> dict:
@@ -290,7 +306,9 @@ def run_one(a):
         extra["enforce_eager"] = True
     t0 = time.time()
     llm = LLM(model=a.model, max_model_len=a.max_len, gpu_memory_utilization=a.mem, enable_prefix_caching=False,
-              enable_chunked_prefill=True, max_num_batched_tokens=256, seed=0, **extra)
+              enable_chunked_prefill=True, max_num_batched_tokens=256, max_num_seqs=16, seed=0, **extra)
+    # max_num_seqs 16: the smoke test sends a handful of prompts; hybrids refuse more running requests than they
+    # have state blocks, and vLLM's default (256-1024) can exceed that on a small GPU
     res = {"model": a.model, "kv": a.kv, "load_s": round(time.time() - t0, 1),
            "kv_tokens": llm.llm_engine.vllm_config.cache_config.kv_cache_size_tokens}
     greedy = SamplingParams(max_tokens=64, temperature=0.0)

@@ -20,7 +20,19 @@ def test_config_check():
               "max_position_embeddings": 8192}
     r = sm.config_check(gemma2)["refused"]
     assert any("sliding" in x for x in r) and any("soft" in x for x in r)
-    assert sm.config_check({**QWEN, "model_type": "qwen3_next"})["refused"]
+    # hybrids run on vLLM (v0.6.0): Qwen3.5 / 3.6 tested, other Mamba / linear-attention hybrids untested
+    q36 = {**QWEN, "model_type": "qwen3_5_moe_text", "layer_types": ["linear_attention"] * 3 + ["full_attention"]}
+    assert sm.config_check(q36)["refused"] == [] and sm.predicted(sm.config_check(q36)) == "runs (hybrid)"
+    nemo = {**QWEN, "model_type": "nemotron_h"}
+    assert sm.config_check(nemo)["refused"] == [] and sm.predicted(sm.config_check(nemo)) == "runs (hybrid, untested)"
+    assert sm.predicted(sm.config_check({**QWEN, "model_type": "qwen3_next"})) == "runs (hybrid, untested)"
+    assert sm.config_check({**QWEN, "model_type": "mamba2"})["refused"] == ["recurrent, no attention layers (mamba2)"]
+    assert sm.predicted(sm.config_check(QWEN)) == "runs"
+    for mt in ("qwen3_5", "unknown"):                         # all linear attention: no attention KV to hold
+        c = sm.config_check({**QWEN, "model_type": mt, "layer_types": ["linear_attention"] * 4})
+        assert c["refused"] == ["no full-attention layers"] and not any("hybrid" in n for n in c["notes"])
+    c = sm.config_check({**q36, "attention_chunk_size": 8192})       # refused for another reason: no hybrid note
+    assert c["refused"] == ["chunked attention"] and not any("hybrid" in n for n in c["notes"])
     assert "MLA" in sm.config_check({**QWEN, "kv_lora_rank": 512})["refused"]
     assert sm.config_check({**QWEN, "layer_types": ["full_attention", "sliding_attention"]})["refused"]
     assert sm.config_check({**QWEN, "head_dim": 96})["refused"] == ["head size 96"]
